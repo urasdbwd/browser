@@ -925,7 +925,7 @@ fn cacheLookup(self: *Client, transfer: *Transfer) !bool {
     var iter = req.headers.iterator();
     const req_headers = try iter.collect(arena.allocator());
 
-    const cached = cache.get(arena.allocator(), .{
+    const cached = try cache.get(arena.allocator(), .{
         .url = req.url,
         .timestamp = lp.datetime.timestamp(.real),
         .request_headers = req_headers.items,
