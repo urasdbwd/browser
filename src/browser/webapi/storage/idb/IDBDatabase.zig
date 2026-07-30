@@ -17,7 +17,6 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const lp = @import("lightpanda");
 
 const js = @import("../../../js/js.zig");
 
@@ -36,6 +35,8 @@ const Execution = js.Execution;
 const Allocator = std.mem.Allocator;
 
 const IDBDatabase = @This();
+
+pub const Proto = EventTarget;
 
 _proto: *EventTarget,
 _exec: *Execution,

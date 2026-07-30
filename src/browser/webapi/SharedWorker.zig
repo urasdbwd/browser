@@ -29,7 +29,6 @@
 // goes quiet (entanglement is severed; nothing dangles).
 
 const std = @import("std");
-const lp = @import("lightpanda");
 
 const js = @import("../js/js.zig");
 
@@ -41,9 +40,9 @@ const EventTarget = @import("EventTarget.zig");
 const MessagePort = @import("MessagePort.zig");
 const SharedWorkerGlobalScope = @import("SharedWorkerGlobalScope.zig");
 
-const log = lp.log;
-
 const SharedWorker = @This();
+
+pub const Proto = EventTarget;
 
 _proto: *EventTarget,
 _port: *MessagePort,

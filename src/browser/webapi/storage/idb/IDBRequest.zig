@@ -16,7 +16,6 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-const std = @import("std");
 const lp = @import("lightpanda");
 
 const js = @import("../../../js/js.zig");
@@ -41,6 +40,8 @@ const Execution = js.Execution;
 const FunctionSetter = idb.FunctionSetter;
 
 const IDBRequest = @This();
+
+pub const Proto = EventTarget;
 
 _proto: *EventTarget,
 _op: Operation = .none,

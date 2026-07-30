@@ -1,4 +1,4 @@
-// Copyright (C) 2023-2026 Lightpanda (Selecy SAS)
+// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
 //
 // Francis Bouvier <francis@lightpanda.io>
 // Pierre Tachoire <pierre@lightpanda.io>
@@ -24,6 +24,8 @@ const Element = @import("../../Element.zig");
 const Graphics = @import("Graphics.zig");
 
 const G = @This();
+
+pub const Proto = Graphics;
 _proto: *Graphics,
 
 pub fn asElement(self: *G) *Element {

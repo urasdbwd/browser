@@ -25,7 +25,6 @@ const Element = @import("../../Element.zig");
 
 const AnimatedEnumeration = @import("../../svg/AnimatedEnumeration.zig");
 const AnimatedLength = @import("../../svg/AnimatedLength.zig");
-const Length = @import("../../svg/Length.zig");
 
 const Graphics = @import("Graphics.zig");
 
@@ -33,6 +32,8 @@ pub const TextPositioning = @import("TextPositioning.zig");
 pub const TextPath = @import("TextPath.zig");
 
 const TextContent = @This();
+
+pub const Proto = Graphics;
 _proto: *Graphics,
 _type: Type,
 
@@ -63,7 +64,7 @@ fn text(self: *TextContent, frame: *Frame) []const u8 {
 }
 
 fn fontSize(self: *TextContent, frame: *Frame) f64 {
-    return Length.fontSizeForElement(self.asElement(), frame);
+    return frame._style_manager.computedFontSize(self.asElement());
 }
 
 fn getTextLength(self: *TextContent, frame: *Frame) !*AnimatedLength {

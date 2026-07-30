@@ -17,19 +17,18 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const lp = @import("lightpanda");
 
 const js = @import("../js/js.zig");
 const Frame = @import("../Frame.zig");
 
 const Node = @import("Node.zig");
+const DOMRect = @import("DOMRect.zig");
 const DocumentFragment = @import("DocumentFragment.zig");
 const AbstractRange = @import("AbstractRange.zig");
-const DOMRect = @import("DOMRect.zig");
-
-const String = lp.String;
 
 const Range = @This();
+
+pub const Proto = AbstractRange;
 
 _proto: *AbstractRange,
 
