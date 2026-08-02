@@ -90,18 +90,26 @@ fn clickHostWidget(frame: *Frame) void {
 }
 
 fn clickElement(frame: *Frame, el: *Node.Element) void {
-    const x: f64 = 28;
-    const y: f64 = 32;
-    user_input.triggerMouseMove(frame, x, y) catch {};
-    user_input.triggerMousePress(frame, x, y, user_input.mouse_button.main) catch {};
-    user_input.triggerMouseRelease(frame, x, y, user_input.mouse_button.main, 1) catch {};
     actions.click(el.asNode(), frame) catch |err| {
         log.debug(.browser, "turnstile click", .{ .err = err });
     };
 }
 
 fn queryOne(frame: *Frame, sel: []const u8) ?*Node.Element {
-    return Selector.querySelector(frame.document.asNode(), sel, frame) catch null;
+    if (Selector.querySelector(frame.document.asNode(), sel, frame) catch null) |el| {
+        return el;
+    }
+
+    // Challenge controls can live in closed shadow trees. They are hidden
+    // from page JavaScript but remain valid automation targets inside the
+    // browser, just like closed roots exposed through browser debugging APIs.
+    var roots = frame._element_shadow_roots.valueIterator();
+    while (roots.next()) |root| {
+        if (Selector.querySelector(root.*.asNode(), sel, frame) catch null) |el| {
+            return el;
+        }
+    }
+    return null;
 }
 
 fn promoteTokenTitle(frame: *Frame) void {

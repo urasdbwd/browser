@@ -464,6 +464,7 @@ pub fn solveTurnstile(self: *Runner, timeout_ms: u32) !void {
     const timer: std.Io.Timestamp = .now(lp.io, .boot);
     var last_click_ms: u32 = 0;
     var click_count: u32 = 0;
+    var widget_seen = false;
     // Let always-pass / non-interactive widgets resolve before we start clicking.
     const passive_ms: u32 = @min(8_000, timeout_ms / 3);
     const click_interval_ms: u32 = 1_500;
@@ -485,13 +486,16 @@ pub fn solveTurnstile(self: *Runner, timeout_ms: u32) !void {
             return;
         }
 
+        const has_widget = Turnstile.hasWidget(session);
+        widget_seen = widget_seen or has_widget;
+
         // After passive window, click challenge UI occasionally (not every tick).
         if (elapsed >= passive_ms and click_count < max_clicks) {
             if (elapsed -| last_click_ms >= click_interval_ms) {
                 // First interactive clicks stay inside challenge iframes only
                 // (aggressive=false). Later ones also tap the host iframe.
                 const aggressive = click_count >= 3;
-                if (Turnstile.hasWidget(session)) {
+                if (has_widget) {
                     Turnstile.interact(session, aggressive);
                     click_count += 1;
                     last_click_ms = elapsed;
@@ -509,6 +513,9 @@ pub fn solveTurnstile(self: *Runner, timeout_ms: u32) !void {
             const remaining = timeout_ms -| elapsed;
             switch (try self.tickForFrame(p.frame._frame_id, @min(remaining, 250), .{ .until = .done })) {
                 .done => {
+                    if (!widget_seen) {
+                        return;
+                    }
                     lp.io.sleep(.fromMilliseconds(@intCast(@min(remaining, 100))), .awake) catch {};
                 },
                 .ok => |ms| {

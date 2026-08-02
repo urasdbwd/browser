@@ -188,8 +188,8 @@ pub const FetchOpts = struct {
     dump_mode: ?Config.DumpFormat = null,
     writer: ?*std.Io.Writer = null,
     json: bool = false,
-    /// When true, after the normal wait phase, click Turnstile widgets and wait
-    /// for a response token (remaining wait budget).
+    /// When true, click Turnstile widgets before selector/script waits that may
+    /// depend on a response token.
     solve_captchas: bool = false,
 };
 /// Loads each url in `urls` in a fresh session and waits per `opts`.
@@ -242,8 +242,21 @@ pub fn fetch(app: *App, browser: *Browser, urls: []const [:0]const u8, opts: Fet
 
     var timer: std.Io.Timestamp = .now(io, .boot);
 
+    // Managed/interactive Turnstile: click checkbox UI and wait for token
+    // before selector/script waits that may depend on the challenge result.
+    // solveTurnstile returns early once an ordinary page is idle with no
+    // widget, so enabling this does not consume the full wait budget there.
+    if (opts.solve_captchas or app.config.solveCaptchas()) {
+        try runner.solveTurnstile(opts.wait_ms);
+    }
+
     if (opts.wait_until) |wu| {
-        try runner.waitForAll(opts.wait_ms, .{ .until = wu });
+        const elapsed: u32 = @intCast(timer.untilNow(io, .boot).toMilliseconds());
+        const remaining = opts.wait_ms -| elapsed;
+        if (remaining == 0) {
+            return error.Timeout;
+        }
+        try runner.waitForAll(remaining, .{ .until = wu });
     } else if (opts.wait_selector == null and opts.wait_script == null) {
         // We default to .done if both wait_selector and wait_script are null
         // This allows the caller to ONLY --wait-selector or ONLY --wait-script
@@ -274,16 +287,6 @@ pub fn fetch(app: *App, browser: *Browser, urls: []const [:0]const u8, opts: Fet
             if (p.replacement == null) {
                 try runner.waitForScript(p.frame._frame_id, wait_script, remaining);
             }
-        }
-    }
-
-    // Managed/interactive Turnstile: click checkbox UI and wait for token.
-    // Uses remaining wait budget; soft-fail if no token (page still dumps).
-    if (opts.solve_captchas or app.config.solveCaptchas()) {
-        const elapsed: u32 = @intCast(timer.untilNow(io, .boot).toMilliseconds());
-        const remaining = opts.wait_ms -| elapsed;
-        if (remaining > 0) {
-            try runner.solveTurnstile(remaining);
         }
     }
 
