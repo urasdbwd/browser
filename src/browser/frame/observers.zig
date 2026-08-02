@@ -50,6 +50,10 @@ pub const Mutation = struct {
 pub const Intersection = struct {
     // List of active IntersectionObservers
     observers: std.ArrayList(*IntersectionObserver) = .empty,
+    // Only detached targets waiting for their first intersection need a DOM
+    // mutation check. Most targets are reported immediately by observe(), so
+    // keep the count here instead of scanning every observer on every change.
+    tracked_targets: u32 = 0,
     check_scheduled: bool = false,
     delivery_scheduled: bool = false,
 };
@@ -107,6 +111,16 @@ pub fn unregisterIntersectionObserver(frame: *Frame, observer: *IntersectionObse
     }
 }
 
+pub fn trackIntersectionTarget(frame: *Frame) void {
+    frame._intersection.tracked_targets += 1;
+}
+
+pub fn untrackIntersectionTargets(frame: *Frame, count: usize) void {
+    const count_: u32 = @intCast(count);
+    std.debug.assert(frame._intersection.tracked_targets >= count_);
+    frame._intersection.tracked_targets -= count_;
+}
+
 pub fn registerResizeObserver(frame: *Frame, observer: *ResizeObserver) !void {
     observer.acquireRef();
     try frame._resize.observers.append(frame.arena, observer);
@@ -149,6 +163,12 @@ pub fn scheduleIntersectionDelivery(frame: *Frame) !void {
 }
 
 pub fn scheduleIntersectionChecks(frame: *Frame) void {
+    // observe() checks connected targets synchronously. A later DOM change can
+    // only affect the detached targets which are still tracked. Avoid queuing a
+    // JS microtask for the overwhelmingly common case of no such target.
+    if (frame._intersection.tracked_targets == 0) {
+        return;
+    }
     if (frame._intersection.check_scheduled) {
         return;
     }

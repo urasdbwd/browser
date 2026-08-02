@@ -27,14 +27,13 @@ const Self = @This();
 
 writer: *std.Io.Writer,
 mutex: std.Io.Mutex = .init,
-aw: std.Io.Writer.Allocating,
 
-pub fn init(allocator: std.mem.Allocator, writer: *std.Io.Writer) Self {
-    return .{ .writer = writer, .aw = .init(allocator) };
+pub fn init(_: std.mem.Allocator, writer: *std.Io.Writer) Self {
+    return .{ .writer = writer };
 }
 
 pub fn deinit(self: *Self) void {
-    self.aw.deinit();
+    _ = self;
 }
 
 /// Point subsequent responses at a different sink. The HTTP transport uses
@@ -48,10 +47,11 @@ pub fn sendResponse(self: *Self, response: anytype) !void {
     self.mutex.lockUncancelable(lp.io);
     defer self.mutex.unlock(lp.io);
 
-    self.aw.clearRetainingCapacity();
-    try std.json.Stringify.value(response, .{ .emit_null_optional_fields = false }, &self.aw.writer);
-    try self.aw.writer.writeByte('\n');
-    try self.writer.writeAll(self.aw.writer.buffered());
+    // Serialize into the final sink. The HTTP transport already supplies its
+    // per-request buffer, while stdio is buffered by the caller; staging here
+    // duplicated every response and retained the largest duplicate forever.
+    try std.json.Stringify.value(response, .{ .emit_null_optional_fields = false }, self.writer);
+    try self.writer.writeByte('\n');
     try self.writer.flush();
 }
 

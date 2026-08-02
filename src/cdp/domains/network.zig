@@ -294,6 +294,7 @@ fn getResponseBody(cmd: *CDP.Command) !void {
     const key = try keyFromRequestId(params.requestId);
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
     const resp = bc.captured_responses.getPtr(key) orelse return error.RequestNotFound;
+    if (resp.discarded) return error.ResponseBodyTooLarge;
 
     // must_encode trusts the declared charset; a server can declare UTF-8 and
     // still send invalid bytes.

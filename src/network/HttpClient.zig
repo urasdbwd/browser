@@ -390,8 +390,9 @@ fn isUrlBlocked(self: *const Client, url: []const u8, internal: bool) bool {
 }
 
 pub fn newHeaders(self: *const Client) !http.Headers {
-    const ua_header = self.user_agent_header_override orelse self.network.config.http_headers.user_agent_header;
-    return http.Headers.init(ua_header);
+    const headers = &self.network.config.http_headers;
+    const ua_header = self.user_agent_header_override orelse headers.user_agent_header;
+    return http.Headers.init(ua_header, headers.sec_ch_ua_header);
 }
 
 pub fn getUserAgent(self: *const Client) [:0]const u8 {
@@ -630,7 +631,7 @@ pub fn tickSync(self: *Client, timeout_ms: u32) !void {
 }
 
 fn hasPendingTeardown(self: *Client) bool {
-    return self.inbox.contains(isSyncWaitInterrupt);
+    return self.inbox.hasTeardown();
 }
 
 // Returns false iff the tick was a no-op. When false is returned, immediately
@@ -1316,24 +1317,6 @@ fn isFetchInterceptionMethod(method: []const u8) bool {
         std.mem.eql(u8, method, "Fetch.failRequest") or
         std.mem.eql(u8, method, "Fetch.fulfillRequest") or
         std.mem.eql(u8, method, "Fetch.continueWithAuth");
-}
-
-// True for inbox messages that mean "this page/connection is going away".
-// syncRequest uses this to bail out of a blocking-script wait promptly
-// rather than holding the worker for the per-request timeout while a
-// teardown command sits undispatched behind the sync_wait allowlist.
-fn isSyncWaitInterrupt(msg: *Inbox.Message) bool {
-    return switch (msg.payload) {
-        .close, .disconnect => true,
-        .ping => false,
-        .cdp => |c| isTeardownMethod(c.input.method),
-    };
-}
-
-fn isTeardownMethod(method: []const u8) bool {
-    return std.mem.eql(u8, method, "Target.closeTarget") or
-        std.mem.eql(u8, method, "Target.disposeBrowserContext") or
-        std.mem.eql(u8, method, "Page.close");
 }
 
 pub fn isRedirectStatus(status: u16) bool {
@@ -3182,60 +3165,6 @@ test "HttpClient: allowDuringSyncWait denies non-Fetch CDP methods" {
             } },
         };
         try testing.expect(!allowDuringSyncWait(&msg));
-    }
-}
-
-test "HttpClient: isSyncWaitInterrupt matches teardown methods, close and disconnect" {
-    const test_arena = try testing.test_app.arena_pool.acquire(.tiny, "HttpClient test");
-    defer test_arena.release();
-
-    var raw_buf: [16]u8 = undefined;
-
-    inline for ([_][]const u8{
-        "Target.closeTarget",
-        "Target.disposeBrowserContext",
-        "Page.close",
-    }) |method| {
-        var msg = Inbox.Message{
-            .arena = test_arena,
-            .payload = .{ .cdp = .{
-                .raw = &raw_buf,
-                .input = .{ .method = method },
-            } },
-        };
-        try testing.expect(isSyncWaitInterrupt(&msg));
-    }
-
-    var close_msg = Inbox.Message{ .arena = test_arena, .payload = .close };
-    try testing.expect(isSyncWaitInterrupt(&close_msg));
-
-    var disconnect_msg = Inbox.Message{ .arena = test_arena, .payload = .{ .disconnect = null } };
-    try testing.expect(isSyncWaitInterrupt(&disconnect_msg));
-}
-
-test "HttpClient: isSyncWaitInterrupt ignores ping and non-teardown CDP methods" {
-    const test_arena = try testing.test_app.arena_pool.acquire(.tiny, "HttpClient test");
-    defer test_arena.release();
-
-    var ping_msg = Inbox.Message{ .arena = test_arena, .payload = .{ .ping = "" } };
-    try testing.expect(!isSyncWaitInterrupt(&ping_msg));
-
-    var raw_buf: [16]u8 = undefined;
-    inline for ([_][]const u8{
-        "Page.navigate",
-        "Runtime.evaluate",
-        "Target.createTarget",
-        "Fetch.continueRequest",
-        "",
-    }) |method| {
-        var msg = Inbox.Message{
-            .arena = test_arena,
-            .payload = .{ .cdp = .{
-                .raw = &raw_buf,
-                .input = .{ .method = method },
-            } },
-        };
-        try testing.expect(!isSyncWaitInterrupt(&msg));
     }
 }
 

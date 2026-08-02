@@ -70,8 +70,13 @@
   testing.expectEqual(UNMASKED_VENDOR_WEBGL, 0x9245);
   testing.expectEqual(UNMASKED_RENDERER_WEBGL, 0x9246);
 
-  testing.expectEqual("", ctx.getParameter(UNMASKED_VENDOR_WEBGL));
-  testing.expectEqual("", ctx.getParameter(UNMASKED_RENDERER_WEBGL));
+  const vendor = ctx.getParameter(UNMASKED_VENDOR_WEBGL);
+  const renderer = ctx.getParameter(UNMASKED_RENDERER_WEBGL);
+  testing.expectEqual(true, typeof vendor === "string" && vendor.length > 0);
+  testing.expectEqual(true, typeof renderer === "string" && renderer.length > 0);
+  testing.expectEqual(false, /swiftshader|llvmpipe/i.test(vendor + renderer));
+  testing.expectEqual("Intel Inc.", vendor);
+  testing.expectEqual(true, renderer.includes("Intel"));
 }
 
 // WEBGL_lose_context

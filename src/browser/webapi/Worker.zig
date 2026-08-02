@@ -138,6 +138,14 @@ pub fn init(url: []const u8, options: ?WorkerOptions, frame: *Frame) !*Worker {
         frame.removeWorker(self);
         return err;
     };
+
+    // Blob/data workers are synthetic: the response is already buffered on
+    // submit. Deliver it now so the script runs before a challenge iframe
+    // reload can abortOwner-kill the pending transfer (observed as
+    // "worker fetch error … err=Abort" under Turnstile).
+    if (std.mem.startsWith(u8, resolved_url, "blob:") or std.mem.startsWith(u8, resolved_url, "data:")) {
+        _ = session.browser.http_client.tick(0) catch {};
+    }
     return self;
 }
 

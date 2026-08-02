@@ -34,6 +34,7 @@ const App = @import("../App.zig");
 const sys_net = @import("../sys/net.zig");
 
 const Server = @import("Server.zig");
+const ResponseBuffer = @import("ResponseBuffer.zig");
 const router = @import("router.zig");
 
 const log = lp.log;
@@ -43,9 +44,21 @@ const HttpServer = @This();
 
 const ns_per_ms = std.time.ns_per_ms;
 
-/// Cap on a single JSON-RPC request body. Generous: agent tool payloads
-/// (e.g. a `save` script) can be large, but this bounds a hostile client.
-const max_request_bytes = 16 * 1024 * 1024;
+// The browser worker enters V8 and needs recursion headroom. Connection
+// threads only parse HTTP and wait for the worker, so a much smaller stack is
+// sufficient. Zig's default is 16 MiB for both kinds of thread.
+const worker_stack_size = 4 * 1024 * 1024;
+const connection_stack_size = 256 * 1024;
+
+// Keep hot-path allocations reusable without allowing one unusually large
+// request or response to pin megabytes for the lifetime of a keep-alive
+// connection.
+const retained_arena_bytes = 64 * 1024;
+const retained_response_bytes = 64 * 1024;
+
+const response_too_large =
+    "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603," ++
+    "\"message\":\"Response too large\"}}\n";
 
 /// One unit of work handed from a connection thread to the browser worker.
 /// Allocated on the connection thread's stack — safe because that thread
@@ -123,6 +136,9 @@ const Queue = struct {
 
 allocator: std.mem.Allocator,
 app: *App,
+max_connections: u32,
+max_request_size: usize,
+max_response_size: usize,
 
 queue: Queue = .{},
 
@@ -146,9 +162,18 @@ pub fn init(allocator: std.mem.Allocator, app: *App) !*HttpServer {
     self.* = .{
         .allocator = allocator,
         .app = app,
+        .max_connections = app.config.maxConnections(),
+        .max_request_size = app.config.mcpMaxRequestSize(),
+        .max_response_size = app.config.mcpMaxResponseSize(),
     };
+    errdefer self.conns.deinit(allocator);
 
-    self.worker_thread = try std.Thread.spawn(.{}, worker, .{self});
+    // The configured cap is small (16 in MCP mode). Reserving the descriptor
+    // list once removes allocator calls from the accept path and makes every
+    // admitted socket trackable during shutdown.
+    try self.conns.ensureTotalCapacity(allocator, self.max_connections);
+
+    self.worker_thread = try std.Thread.spawn(.{ .stack_size = worker_stack_size }, worker, .{self});
     self.worker_ready.waitUncancelable(lp.io);
     if (!self.worker_ok) {
         self.worker_thread.join();
@@ -169,7 +194,7 @@ pub fn deinit(self: *HttpServer) void {
             sys_net.shutdown(socket, .both) catch {};
         }
     }
-    while (self.active_conns.load(.monotonic) > 0) {
+    while (self.active_conns.load(.acquire) > 0) {
         lp.io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
 
@@ -204,24 +229,36 @@ fn onAccept(ctx: *anyopaque, socket: posix.socket_t) void {
         return;
     };
 
+    if (!acquireConnectionSlot(&self.active_conns, self.max_connections)) {
+        _ = std.c.close(socket);
+        return;
+    }
+
     {
         self.conn_mutex.lockUncancelable(lp.io);
         defer self.conn_mutex.unlock(lp.io);
-        self.conns.append(self.allocator, socket) catch {
-            _ = std.c.close(socket);
-            return;
-        };
+        self.conns.appendAssumeCapacity(socket);
     }
-    _ = self.active_conns.fetchAdd(1, .monotonic);
 
-    const thread = std.Thread.spawn(.{}, handleConn, .{ self, socket }) catch |err| {
+    const thread = std.Thread.spawn(.{ .stack_size = connection_stack_size }, handleConn, .{ self, socket }) catch |err| {
         log.warn(.mcp, "mcp spawn", .{ .err = err });
-        _ = self.active_conns.fetchSub(1, .monotonic);
+        _ = self.active_conns.fetchSub(1, .release);
         self.unregister(socket);
         _ = std.c.close(socket);
         return;
     };
     thread.detach();
+}
+
+/// Reserve one connection slot without ever exceeding the configured cap.
+/// The accept loop is currently single-threaded, but keeping this atomic makes
+/// the invariant independent of that implementation detail.
+fn acquireConnectionSlot(active: *std.atomic.Value(u32), max: u32) bool {
+    var current = active.load(.monotonic);
+    while (current < max) {
+        current = active.cmpxchgWeak(current, current + 1, .monotonic, .monotonic) orelse return true;
+    }
+    return false;
 }
 
 fn unregister(self: *HttpServer, socket: posix.socket_t) void {
@@ -264,8 +301,9 @@ fn worker(self: *HttpServer) void {
             wait_ms = server.idle();
             continue;
         };
-        _ = arena.reset(.retain_capacity);
         process(server, arena.allocator(), job);
+        // Drop oversized transient allocations before the worker goes idle.
+        _ = arena.reset(.{ .retain_with_limit = retained_arena_bytes });
         job.done.set(lp.io);
         wait_ms = 0;
     }
@@ -281,6 +319,11 @@ fn process(server: *Server, arena: std.mem.Allocator, job: *Job) void {
 
     const chosen = resolveSession(server, arena, job) catch |err| {
         log.err(.mcp, "mcp session routing", .{ .err = err });
+        server.sendError(
+            .null,
+            .InternalError,
+            if (err == error.SessionLimitReached) "Session limit reached" else "Session routing failed",
+        ) catch |send_err| log.err(.mcp, "mcp session error response", .{ .err = send_err });
         return;
     };
     job.setAssigned(chosen);
@@ -319,15 +362,15 @@ fn isInitialize(arena: std.mem.Allocator, body: []const u8) bool {
 }
 
 fn handleConn(self: *HttpServer, socket: posix.socket_t) void {
-    defer _ = self.active_conns.fetchSub(1, .monotonic);
+    defer _ = self.active_conns.fetchSub(1, .release);
     const stream: std.Io.net.Stream = .{ .socket = .{ .handle = socket, .address = .{ .ip4 = .unspecified(0) } } };
     defer stream.close(lp.io);
     // Runs before close (defers are LIFO): deinit's shutdown sweep must
     // never see an fd that has been closed and possibly reused.
     defer self.unregister(socket);
 
-    var recv_buf: [16 * 1024]u8 = undefined;
-    var send_buf: [16 * 1024]u8 = undefined;
+    var recv_buf: [8 * 1024]u8 = undefined;
+    var send_buf: [8 * 1024]u8 = undefined;
     var stream_reader = stream.reader(lp.io, &recv_buf);
     var stream_writer = stream.writer(lp.io, &send_buf);
     var http_server = std.http.Server.init(&stream_reader.interface, &stream_writer.interface);
@@ -335,28 +378,33 @@ fn handleConn(self: *HttpServer, socket: posix.socket_t) void {
     var arena: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena.deinit();
     // Reused across requests (served serially), not reallocated per request.
-    var out: std.Io.Writer.Allocating = .init(self.allocator);
+    var out: ResponseBuffer = .init(self.allocator, self.max_response_size);
     defer out.deinit();
 
     while (true) {
         var request = http_server.receiveHead() catch return; // peer closed, bad head, or shutdown
-        _ = arena.reset(.retain_capacity);
-        out.clearRetainingCapacity();
-        self.serve(&out.writer, arena.allocator(), &request) catch return;
-        if (!request.head.keep_alive) return;
+        const keep_alive = self.serve(&out, arena.allocator(), &request) catch return;
+        // Trim before waiting for another keep-alive request. Otherwise a
+        // quiet client can pin its largest request and response indefinitely.
+        _ = arena.reset(.{ .retain_with_limit = retained_arena_bytes });
+        out.reset(retained_response_bytes);
+        if (!keep_alive) return;
     }
 }
 
 /// Handle one request: marshal it to the browser worker and write the reply.
 /// MCP Streamable HTTP — POST carries a JSON-RPC message; DELETE closes the
 /// session named by `Mcp-Session-Id`. std.http.Server owns the framing.
-fn serve(self: *HttpServer, out: *std.Io.Writer, arena: std.mem.Allocator, request: *std.http.Server.Request) !void {
+/// Returns whether the connection is safe to reuse after the response.
+fn serve(self: *HttpServer, out: *ResponseBuffer, arena: std.mem.Allocator, request: *std.http.Server.Request) !bool {
     const method = request.head.method;
     if (method != .POST and method != .DELETE) {
-        return request.respond("", .{ .status = .method_not_allowed, .keep_alive = false });
+        try request.respond("", .{ .status = .method_not_allowed, .keep_alive = false });
+        return false;
     }
     if (request.head.expect != null) {
-        return request.respond("", .{ .status = .expectation_failed, .keep_alive = false });
+        try request.respond("", .{ .status = .expectation_failed, .keep_alive = false });
+        return false;
     }
 
     // Read the session header and keep_alive before the body reader
@@ -364,21 +412,40 @@ fn serve(self: *HttpServer, out: *std.Io.Writer, arena: std.mem.Allocator, reque
     const session_id = try sessionHeader(arena, request);
     const keep_alive = request.head.keep_alive;
 
+    // Zig's HTTP server deliberately treats DELETE as bodyless. Reject a
+    // framed DELETE body and close the connection; otherwise unread bytes
+    // could be mistaken for the next keep-alive request.
+    if (method == .DELETE and
+        (request.head.transfer_encoding != .none or (request.head.content_length orelse 0) != 0))
+    {
+        try request.respond("", .{ .status = .bad_request, .keep_alive = false });
+        return false;
+    }
+
+    // A POST may legally arrive with chunked transfer framing plus a
+    // Content-Length header. That length does not describe the decoded body,
+    // so only use the exact-allocation path for non-chunked requests.
+    const content_length = if (request.head.transfer_encoding == .none)
+        request.head.content_length
+    else
+        null;
     var body_buf: [8 * 1024]u8 = undefined;
-    const body = request.readerExpectNone(&body_buf).allocRemaining(arena, .limited(max_request_bytes)) catch {
-        return request.respond("", .{ .status = .payload_too_large, .keep_alive = false });
+    const body_reader = request.readerExpectNone(&body_buf);
+    const body = readRequestBody(arena, body_reader, content_length, self.max_request_size) catch {
+        try request.respond("", .{ .status = .payload_too_large, .keep_alive = false });
+        return false;
     };
 
     var job: Job = .{
         .kind = if (method == .DELETE) .close else .rpc,
         .body = body,
         .session_id = session_id,
-        .out = out,
+        .out = &out.writer,
     };
     self.queue.push(&job);
     job.done.waitUncancelable(lp.io);
 
-    const resp = out.buffered();
+    const resp = if (out.failed) response_too_large else out.buffered();
     var headers: [2]std.http.Header = undefined;
     var n: usize = 0;
     headers[n] = .{ .name = "content-type", .value = "application/json" };
@@ -387,12 +454,39 @@ fn serve(self: *HttpServer, out: *std.Io.Writer, arena: std.mem.Allocator, reque
         headers[n] = .{ .name = "mcp-session-id", .value = job.assigned() };
         n += 1;
     }
-    return request.respond(resp, .{
+    const reuse = keep_alive and !out.failed;
+    try request.respond(resp, .{
         // An empty body means a notification (or a close): 202, no content.
         .status = if (resp.len == 0) .accepted else .ok,
-        .keep_alive = keep_alive,
+        .keep_alive = reuse,
         .extra_headers = headers[0..n],
     });
+    return reuse;
+}
+
+/// Read a request body with one allocation when Content-Length is known.
+/// `allocRemaining` grows geometrically; with an arena, superseded buffers
+/// cannot be reclaimed until reset and can nearly double peak body memory.
+fn readRequestBody(
+    arena: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    content_length: ?u64,
+    max_request_size: usize,
+) ![]const u8 {
+    if (content_length) |len64| {
+        const len = std.math.cast(usize, len64) orelse return error.StreamTooLong;
+        if (len > max_request_size) return error.StreamTooLong;
+        // Most MCP messages fit in the transfer buffer. The connection thread
+        // waits for the worker before reading again, so this borrowed slice is
+        // stable for the full lifetime of Job and avoids a heap allocation.
+        if (len <= reader.buffer.len) return try reader.take(len);
+
+        const body = try arena.alloc(u8, len);
+        try reader.readSliceAll(body);
+        return body;
+    }
+
+    return try reader.allocRemaining(arena, .limited(max_request_size));
 }
 
 /// Duplicate the `Mcp-Session-Id` request header into `arena`, or null.
@@ -413,4 +507,53 @@ test "HttpServer - initialize is detected for session minting" {
     try std.testing.expect(isInitialize(aa, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}"));
     try std.testing.expect(!isInitialize(aa, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"}"));
     try std.testing.expect(!isInitialize(aa, "not json"));
+}
+
+test "HttpServer - connection slots are bounded" {
+    var active: std.atomic.Value(u32) = .init(0);
+    try std.testing.expect(acquireConnectionSlot(&active, 2));
+    try std.testing.expect(acquireConnectionSlot(&active, 2));
+    try std.testing.expect(!acquireConnectionSlot(&active, 2));
+    try std.testing.expectEqual(2, active.load(.monotonic));
+
+    _ = active.fetchSub(1, .monotonic);
+    try std.testing.expect(acquireConnectionSlot(&active, 2));
+    try std.testing.expectEqual(2, active.load(.monotonic));
+}
+
+test "HttpServer - small known request body is borrowed" {
+    var transfer_buf: [32]u8 = undefined;
+    var reader: std.testing.Reader = .init(&transfer_buf, &.{.{ .buffer = "request body" }});
+
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    const body = try readRequestBody(arena.allocator(), &reader.interface, "request body".len, 1024);
+    try std.testing.expectEqualStrings("request body", body);
+    try std.testing.expectEqual(0, arena.queryCapacity());
+}
+
+test "HttpServer - large known request body uses exact allocation" {
+    const input = "x" ** 64;
+    var transfer_buf: [8]u8 = undefined;
+    var reader: std.testing.Reader = .init(&transfer_buf, &.{.{ .buffer = input }});
+
+    var backing: [input.len]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&backing);
+
+    const body = try readRequestBody(fba.allocator(), &reader.interface, input.len, 1024);
+    try std.testing.expectEqualStrings(input, body);
+    try std.testing.expectEqual(body.len, fba.end_index);
+}
+
+test "HttpServer - oversized known body is rejected before allocation" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader: std.Io.Reader = .fixed("");
+    try std.testing.expectError(
+        error.StreamTooLong,
+        readRequestBody(arena.allocator(), &reader, 1025, 1024),
+    );
+    try std.testing.expectEqual(0, arena.queryCapacity());
 }

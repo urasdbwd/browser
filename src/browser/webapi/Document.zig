@@ -1237,7 +1237,7 @@ pub fn getAdoptedStyleSheets(self: *Document, frame: *Frame) !js.Object.Global {
 }
 
 pub fn hasFocus(_: *Document) bool {
-    log.debug(.not_implemented, "Document.hasFocus", .{});
+    // Headless always reports focused — challenge scripts treat false as a bot tell.
     return true;
 }
 

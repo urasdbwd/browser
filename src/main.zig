@@ -179,6 +179,11 @@ fn run(allocator: Allocator, main_arena: Allocator, proc_args: std.process.Args)
                     .with_frames = opts.with_frames,
                 },
                 .json = opts.json,
+                .solve_captchas = switch (opts.solve_captchas) {
+                    .on => true,
+                    .off => false,
+                    .auto => opts.stealth,
+                },
             };
 
             var writer = std.Io.File.stdout().writerStreaming(lp.io, &.{});
@@ -199,6 +204,27 @@ fn run(allocator: Allocator, main_arena: Allocator, proc_args: std.process.Args)
 
             var worker_thread = try std.Thread.spawn(.{}, fetchThread, .{ app, &ft, urls, fetch_opts });
             worker_thread.join();
+        },
+        .render => |opts| {
+            log.debug(.app, "startup", .{
+                .mode = "render",
+                .snapshot = app.snapshot.fromEmbedded(),
+                .client_side = true,
+            });
+            const address = std.Io.net.IpAddress.parse(opts.host, opts.port) catch |err| {
+                log.fatal(.app, "invalid render server address", .{
+                    .err = err,
+                    .host = opts.host,
+                    .port = opts.port,
+                });
+                return err;
+            };
+            const render_server = try lp.render.HttpServer.init(allocator, app);
+            defer render_server.deinit();
+            render_server.run(address) catch |err| {
+                log.fatal(.app, "client render server error", .{ .err = err });
+                return err;
+            };
         },
         .mcp => |opts| {
             log.info(.mcp, "starting server", .{});
@@ -368,7 +394,11 @@ fn fetchThread(app: *App, ft: *FetchTerminator, urls: []const [:0]const u8, fetc
 fn mcpThread(allocator: std.mem.Allocator, app: *App) void {
     defer app.network.stop();
 
-    var stdout = std.Io.File.stdout().writerStreaming(lp.io, &.{});
+    // Bound stdio buffering to a small fixed stack allocation. Transport
+    // flushes once per JSON-RPC response, avoiding both syscall-per-fragment
+    // output and the old response-sized heap staging buffer.
+    var stdout_buf: [8 * 1024]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(lp.io, &stdout_buf);
     var mcp_server: *lp.mcp.Server = lp.mcp.Server.init(allocator, app, &stdout.interface) catch |err| {
         log.fatal(.mcp, "mcp init error", .{ .err = err });
         return;

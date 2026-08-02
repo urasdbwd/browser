@@ -507,6 +507,7 @@ pub fn waitForBackgroundTasks(self: *Env) void {
 }
 
 pub fn runIdleTasks(self: *const Env) void {
+    if (!self.platform.idle_tasks_enabled) return;
     v8.v8__Platform__RunIdleTasks(self.platform.handle, self.isolate.handle, 1);
 }
 

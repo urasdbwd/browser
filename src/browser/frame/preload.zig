@@ -33,7 +33,7 @@ const Allocator = std.mem.Allocator;
 // start prefetching <link rel="preload" as="script" href=...>`. element is the
 // hint <link> to fire load/error on, null when the hint came from the prescan.
 pub fn scriptHint(frame: *Frame, element: ?*Element.Html, href: []const u8) bool {
-    if (frame.isGoingAway() or frame._parse_mode == .fragment) {
+    if (!frame._session.speculative_loading_enabled or frame.isGoingAway() or frame._parse_mode == .fragment) {
         return false;
     }
 
@@ -50,7 +50,7 @@ pub fn scriptHint(frame: *Frame, element: ?*Element.Html, href: []const u8) bool
 // start prefetching <link rel="modulepreload" href=...>. element is the hint
 // <link> to fire load/error on, null when the hint came from the prescan.
 pub fn moduleHint(frame: *Frame, element: ?*Element.Html, href: []const u8) bool {
-    if (frame.isGoingAway() or frame._parse_mode == .fragment) {
+    if (!frame._session.speculative_loading_enabled or frame.isGoingAway() or frame._parse_mode == .fragment) {
         return false;
     }
 
@@ -75,7 +75,7 @@ pub fn moduleHint(frame: *Frame, element: ?*Element.Html, href: []const u8) bool
 // This essentially does the same thing as the <link preload/preloadModule> but
 // without needing anything special from the HTML.
 pub fn prescan(frame: *Frame, html: []const u8) void {
-    if (frame.isGoingAway() or frame._parse_mode == .fragment) {
+    if (!frame._session.speculative_loading_enabled or frame.isGoingAway() or frame._parse_mode == .fragment) {
         return;
     }
     const arena = frame.getArena(.small, "preload.prescan") catch return;
@@ -191,4 +191,8 @@ test "preload: prescan" {
     try testing.expectEqual(1, sm.base.imported_modules.count());
     const module = sm.base.imported_modules.get("http://127.0.0.1:9582/serve-count/unit_m.js") orelse return error.MissingModule;
     try testing.expectEqual(true, module.hint);
+
+    frame._session.speculative_loading_enabled = false;
+    prescan(frame, "<script src=/serve-count/disabled.js></script>");
+    try testing.expectEqual(2, sm.preloaded_scripts.count());
 }

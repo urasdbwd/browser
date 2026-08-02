@@ -495,6 +495,7 @@ pub const BrowserContext = struct {
     const CapturedResponse = struct {
         must_encode: bool,
         data: std.ArrayList(u8),
+        discarded: bool = false,
     };
 
     // Key for `captured_responses`. Documents are keyed by `loader_id`,
@@ -582,6 +583,10 @@ pub const BrowserContext = struct {
     // memory for an arbitrary amount of time, then that's where we're going
     // to store the,
     captured_responses: std.AutoHashMapUnmanaged(CapturedResponseKey, CapturedResponse),
+    // Logical bytes retained by captured_responses in this frame arena. When
+    // a response crosses the configured cap its existing arena allocation is
+    // still counted until navigation resets the whole arena.
+    captured_response_bytes: usize = 0,
 
     notification: *Notification,
 
@@ -634,6 +639,7 @@ pub const BrowserContext = struct {
             .notification_arena = cdp.notification_arena.allocator(),
             .intercept_state = try InterceptState.init(allocator),
             .captured_responses = .empty,
+            .captured_response_bytes = 0,
             .notification = notification,
         };
         self.node_search_list = Node.Search.List.init(allocator, &self.node_registry);
@@ -987,14 +993,49 @@ pub const BrowserContext = struct {
             .{ .kind = .request, .id = transfer.id };
     }
 
+    /// Start a fresh response-capture lifetime. The backing arena is dedicated
+    /// to capture metadata and bodies, so this releases the previous page's
+    /// memory while retaining only a small allocation for the next page.
+    pub fn resetCapturedResponses(self: *BrowserContext) void {
+        _ = self.cdp.frame_arena.reset(.{ .retain_with_limit = 512 * 1024 });
+        self.captured_responses = .empty;
+        self.captured_response_bytes = 0;
+    }
+
     pub fn onHttpResponseHeadersDone(ctx: *anyopaque, msg: *const Notification.ResponseHeaderDone) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
         defer self.resetNotificationArena();
+
+        // The response-header notification runs immediately before Frame's
+        // header callback commits a pending root page. Rotate here: no CDP
+        // command can interleave, the old page's capture data is no longer
+        // observable after this callback, and the new document entry is then
+        // inserted directly into the fresh arena. Child-frame documents must
+        // not rotate their top-level page's capture lifetime.
+        if (msg.transfer.req.resource_type == .document) {
+            if (self.mainFrame()) |frame| {
+                if (msg.transfer.req.frame_id == frame._frame_id) {
+                    self.resetCapturedResponses();
+                }
+            }
+        }
 
         const arena = self.frame_arena;
 
         // Prepare the captured response value.
         const key = keyFromTransfer(msg.transfer);
+        if (!self.captured_responses.contains(key)) {
+            if (self.cdp.app.config.cdpMaxCapturedResponses()) |limit| {
+                if (self.captured_responses.count() >= limit) {
+                    return @import("domains/network.zig").httpResponseHeaderDone(self.notification_arena, self, msg);
+                }
+            }
+            if (self.cdp.app.config.cdpMaxCapturedResponseSize()) |limit| {
+                if (self.captured_response_bytes >= limit) {
+                    return @import("domains/network.zig").httpResponseHeaderDone(self.notification_arena, self, msg);
+                }
+            }
+        }
         const gop = try self.captured_responses.getOrPut(arena, key);
         if (!gop.found_existing) {
             gop.value_ptr.* = .{
@@ -1031,9 +1072,33 @@ pub const BrowserContext = struct {
         const arena = self.frame_arena;
 
         const key = keyFromTransfer(msg.transfer);
-        const resp = self.captured_responses.getPtr(key) orelse lp.assert(false, "onHttpResponseData missing captured response", .{});
+        const resp = self.captured_responses.getPtr(key) orelse return;
+        return appendCapturedResponseData(
+            resp,
+            &self.captured_response_bytes,
+            arena,
+            msg.data,
+            self.cdp.app.config.cdpMaxCapturedResponseSize(),
+        );
+    }
 
-        return resp.data.appendSlice(arena, msg.data);
+    fn appendCapturedResponseData(
+        resp: *CapturedResponse,
+        total: *usize,
+        arena: std.mem.Allocator,
+        data: []const u8,
+        configured_limit: ?usize,
+    ) !void {
+        if (resp.discarded) return;
+
+        const limit = configured_limit orelse std.math.maxInt(usize);
+        if (data.len > limit or total.* > limit - data.len) {
+            resp.discarded = true;
+            return;
+        }
+
+        try resp.data.appendSlice(arena, data);
+        total.* += data.len;
     }
 
     pub fn onHttpRequestAuthRequired(ctx: *anyopaque, data: *const Notification.RequestAuthRequired) !void {
@@ -1501,4 +1566,50 @@ test "cdp: syncRequest short-circuits after disconnect" {
         .notification = undefined,
         .shutdown_callback = @import("../network/HttpClient.zig").noopShutdown,
     }, undefined));
+}
+
+test "cdp: pong does not allocate from the send arena" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const cdp = ctx.cdp();
+    _ = cdp.conn.send_arena.reset(.free_all);
+    try testing.expectEqual(0, cdp.conn.send_arena.queryCapacity());
+
+    try cdp.conn.sendPong("ping");
+    try testing.expectEqual(0, cdp.conn.send_arena.queryCapacity());
+
+    var frame: [6]u8 = undefined;
+    const n = try posix.read(ctx.socket, &frame);
+    try testing.expectEqual(frame.len, n);
+    try testing.expectEqualSlices(u8, &.{ 0x8a, 4, 'p', 'i', 'n', 'g' }, &frame);
+}
+
+test "cdp: captured response aggregate limit discards without overflow" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    var response: BrowserContext.CapturedResponse = .{
+        .must_encode = false,
+        .data = .empty,
+    };
+    var total: usize = 0;
+
+    try BrowserContext.appendCapturedResponseData(&response, &total, arena.allocator(), "four", 6);
+    try testing.expectEqual("four", response.data.items);
+    try testing.expectEqual(@as(usize, 4), total);
+
+    try BrowserContext.appendCapturedResponseData(&response, &total, arena.allocator(), "three", 6);
+    try testing.expect(response.discarded);
+    try testing.expectEqual("four", response.data.items);
+    try testing.expectEqual(@as(usize, 4), total);
+
+    var overflow_response: BrowserContext.CapturedResponse = .{
+        .must_encode = false,
+        .data = .empty,
+    };
+    var overflow_total: usize = std.math.maxInt(usize);
+    try BrowserContext.appendCapturedResponseData(&overflow_response, &overflow_total, arena.allocator(), "x", null);
+    try testing.expect(overflow_response.discarded);
+    try testing.expectEqual(std.math.maxInt(usize), overflow_total);
 }

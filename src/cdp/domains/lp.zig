@@ -93,12 +93,14 @@ fn configureLoading(cmd: *CDP.Command) !void {
         subFrame: ?bool = null,
         worker: ?bool = null,
         externalStylesheets: ?bool = null,
+        speculativePreloading: ?bool = null,
     })) orelse return error.InvalidParams;
 
     const bc = cmd.browser_context orelse return error.NoBrowserContext;
     if (params.subFrame) |v| bc.session.subframe_loading_enabled = v;
     if (params.worker) |v| bc.session.worker_loading_enabled = v;
     if (params.externalStylesheets) |v| bc.session.load_external_stylesheets = v;
+    if (params.speculativePreloading) |v| bc.session.speculative_loading_enabled = v;
     return cmd.sendResult(null, .{});
 }
 
@@ -756,7 +758,7 @@ test "cdp.lp: handleJavaScriptDialog controls confirm/prompt/alert return values
     try testing.expectEqual(false, c_after_alert.toBool());
 }
 
-test "cdp.lp: configureLoading toggles subFrame and worker independently" {
+test "cdp.lp: configureLoading toggles loading features independently" {
     var ctx = try testing.context();
     defer ctx.deinit();
 
@@ -766,6 +768,7 @@ test "cdp.lp: configureLoading toggles subFrame and worker independently" {
     // Defaults: both loading types enabled.
     try testing.expectEqual(true, bc.session.subframe_loading_enabled);
     try testing.expectEqual(true, bc.session.worker_loading_enabled);
+    try testing.expectEqual(true, bc.session.speculative_loading_enabled);
 
     // subFrame-only: leaves worker untouched.
     try ctx.processMessage(.{
@@ -796,6 +799,16 @@ test "cdp.lp: configureLoading toggles subFrame and worker independently" {
     try ctx.expectSentResult(null, .{ .id = 3 });
     try testing.expectEqual(true, bc.session.subframe_loading_enabled);
     try testing.expectEqual(true, bc.session.worker_loading_enabled);
+    try testing.expectEqual(true, bc.session.speculative_loading_enabled);
+
+    try ctx.processMessage(.{
+        .id = 4,
+        .method = "LP.configureLoading",
+        .params = .{ .speculativePreloading = false },
+    });
+    try ctx.expectSentResult(null, .{ .id = 4 });
+    try testing.expectEqual(false, bc.session.speculative_loading_enabled);
+    try testing.expectEqual(false, bc.session.load_external_stylesheets);
 }
 
 test "cdp.lp: configureLoading toggles externalStylesheets independently" {

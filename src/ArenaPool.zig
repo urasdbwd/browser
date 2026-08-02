@@ -51,6 +51,15 @@ pub const Config = struct {
         max: u16,
         retain: usize,
     };
+
+    /// Keep a small amount of reuse for CPU efficiency without retaining the
+    /// multi-megabyte burst capacity of the throughput-oriented defaults.
+    pub const pi: Config = .{
+        .tiny = .{ .max = 64, .retain = 1024 },
+        .small = .{ .max = 32, .retain = 4 * 1024 },
+        .medium = .{ .max = 8, .retain = 16 * 1024 },
+        .large = .{ .max = 2, .retain = 64 * 1024 },
+    };
 };
 
 tiny: Bucket,
@@ -307,6 +316,74 @@ test "ArenaPool: respects per-bucket max limits" {
     m2.release();
     m3.release();
     try testing.expectEqual(2, pool.medium.free_list_len);
+}
+
+test "ArenaPool: pi config bounds retained idle capacity" {
+    var pool = ArenaPool.init(testing.allocator, Config.pi);
+    defer pool.deinit();
+
+    const configured_limit =
+        @as(usize, pool.tiny.free_list_max) * pool.tiny.retain_bytes +
+        @as(usize, pool.small.free_list_max) * pool.small.retain_bytes +
+        @as(usize, pool.medium.free_list_max) * pool.medium.retain_bytes +
+        @as(usize, pool.large.free_list_max) * pool.large.retain_bytes;
+
+    try testing.expectEqual(@as(usize, 448 * 1024), configured_limit);
+
+    const Helper = struct {
+        fn fill(pool_: *ArenaPool, bucket_size: BucketSize, count: usize, allocation_size: usize) !void {
+            const entries = try testing.allocator.alloc(*Arena, count);
+            defer testing.allocator.free(entries);
+
+            for (entries) |*entry| {
+                entry.* = try pool_.acquire(bucket_size, "pi-retention");
+                _ = try entry.*.alloc(u8, allocation_size);
+            }
+            for (entries) |entry| entry.release();
+        }
+
+        fn retainedCapacity(bucket: *const Bucket) usize {
+            var total: usize = 0;
+            var entry = bucket.free_list;
+            while (entry) |arena| : (entry = arena.next) total += arena._arena.queryCapacity();
+            return total;
+        }
+
+        fn retainedBacking(bucket: *const Bucket) usize {
+            var total: usize = 0;
+            var entry = bucket.free_list;
+            while (entry) |arena| : (entry = arena.next) total += arena.bytes;
+            return total;
+        }
+    };
+
+    try Helper.fill(&pool, .tiny, pool.tiny.free_list_max, pool.tiny.retain_bytes * 2);
+    try Helper.fill(&pool, .small, pool.small.free_list_max, pool.small.retain_bytes * 2);
+    try Helper.fill(&pool, .medium, pool.medium.free_list_max, pool.medium.retain_bytes * 2);
+    try Helper.fill(&pool, .large, pool.large.free_list_max, pool.large.retain_bytes * 2);
+
+    const retained_capacity =
+        Helper.retainedCapacity(&pool.tiny) +
+        Helper.retainedCapacity(&pool.small) +
+        Helper.retainedCapacity(&pool.medium) +
+        Helper.retainedCapacity(&pool.large);
+    try testing.expect(retained_capacity > 0);
+    try testing.expect(retained_capacity <= configured_limit);
+
+    // ArenaAllocator's capacity excludes its per-arena linked-list node. Keep
+    // the actual backing allocation bounded too, with conservative headroom
+    // for allocator metadata/alignment on 32- and 64-bit targets.
+    const retained_backing =
+        Helper.retainedBacking(&pool.tiny) +
+        Helper.retainedBacking(&pool.small) +
+        Helper.retainedBacking(&pool.medium) +
+        Helper.retainedBacking(&pool.large);
+    const retained_arenas =
+        @as(usize, pool.tiny.free_list_len) +
+        @as(usize, pool.small.free_list_len) +
+        @as(usize, pool.medium.free_list_len) +
+        @as(usize, pool.large.free_list_len);
+    try testing.expect(retained_backing <= configured_limit + retained_arenas * 64);
 }
 
 test "ArenaPool: reset clears memory without releasing" {

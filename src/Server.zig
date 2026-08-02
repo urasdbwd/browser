@@ -32,6 +32,11 @@ const Allocator = std.mem.Allocator;
 
 const Server = @This();
 
+// Zig reserves 16 MiB for every thread by default. A CDP worker does run V8,
+// so keep considerably more headroom than a plain socket thread while still
+// avoiding 256 MiB of virtual address space at the default 16 connections.
+const worker_stack_size = 4 * 1024 * 1024;
+
 app: *App,
 max_connections: usize,
 json_version_response: []const u8,
@@ -53,10 +58,16 @@ pub fn init(app: *App, address: sys_net.IpAddress) !*Server {
         .max_connections = app.config.maxConnections(),
     };
     errdefer self.cdp_pool.deinit(app.allocator);
+    errdefer self.cdps.deinit(app.allocator);
+
+    // The admission counter guarantees this is the maximum number of tracked
+    // CDPs. Reserve once so connection setup never allocates under cdp_mutex.
+    try self.cdps.ensureTotalCapacity(app.allocator, self.max_connections);
 
     // Bind first so /json/version can advertise the OS-assigned port (--port 0).
     var bound_address = address;
     try app.network.bind(&bound_address, self, onAccept);
+    errdefer app.network.unbind();
     log.note(.app, "server running", .{ .address = bound_address });
 
     self.json_version_response = try buildJSONVersionResponse(app, bound_address.getPort());
@@ -83,7 +94,7 @@ pub fn shutdown(self: *Server) void {
 pub fn deinit(self: *Server) void {
     self.shutdown();
 
-    while (self.active_threads.load(.monotonic) > 0) {
+    while (self.active_threads.load(.acquire) > 0) {
         lp.io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
 
@@ -167,14 +178,14 @@ fn spawnWorker(self: *Server, socket: posix.socket_t) !void {
         lp.metrics.cdp_connection_limit.incr();
         return error.MaxThreadsReached;
     }
-    errdefer _ = self.active_threads.fetchSub(1, .monotonic);
+    errdefer _ = self.active_threads.fetchSub(1, .release);
 
-    const thread = try std.Thread.spawn(.{}, handleConnection, .{ self, socket });
+    const thread = try std.Thread.spawn(.{ .stack_size = worker_stack_size }, handleConnection, .{ self, socket });
     thread.detach();
 }
 
 fn handleConnection(self: *Server, socket: posix.socket_t) void {
-    defer _ = self.active_threads.fetchSub(1, .monotonic);
+    defer _ = self.active_threads.fetchSub(1, .release);
     defer _ = std.c.close(socket);
 
     const cdp = blk: {
@@ -204,7 +215,7 @@ fn handleConnection(self: *Server, socket: posix.socket_t) void {
         // track the connection
         self.cdp_mutex.lockUncancelable(lp.io);
         defer self.cdp_mutex.unlock(lp.io);
-        self.cdps.append(self.app.allocator, cdp) catch {};
+        self.cdps.appendAssumeCapacity(cdp);
     }
 
     defer {

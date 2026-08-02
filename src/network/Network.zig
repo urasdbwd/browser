@@ -659,7 +659,7 @@ fn acceptConnections(self: *Network) void {
     const listener = self.listener orelse return;
 
     while (true) {
-        const socket = sys_net.accept(listener.socket, null, null, posix.SOCK.NONBLOCK) catch |err| {
+        const socket = sys_net.accept(listener.socket, null, null, posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC) catch |err| {
             switch (err) {
                 error.WouldBlock => break,
                 error.SocketNotListening => {

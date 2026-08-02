@@ -117,6 +117,11 @@ _console_capture: bool = false,
 // (synchronous fetch + parse + register on `document.styleSheets`).
 load_external_stylesheets: bool = false,
 
+// The raw-HTML prescan and <link rel=preload> support intentionally trade
+// extra concurrent transfers and a second parse pass for lower page latency.
+// The Pi profile disables that trade; LP.configureLoading can restore it.
+speculative_loading_enabled: bool = true,
+
 /// Caller-supplied cancellation probe. `Runner._wait` polls it between
 /// ticks; once `check` returns true the wait returns `error.Cancelled`.
 /// The agent installs this so SIGINT can abort an in-flight tool call
@@ -183,6 +188,7 @@ pub fn init(self: *Session, browser: *Browser, notification: *Notification) !voi
         .worker_loading_enabled = !browser.app.config.disableWorkers(),
         ._console_messages = .init(allocator),
         .load_external_stylesheets = browser.app.config.enableExternalStylesheets(),
+        .speculative_loading_enabled = browser.app.config.speculativePreloading(),
     };
     errdefer self._console_messages.deinit();
 }

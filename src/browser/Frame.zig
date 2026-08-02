@@ -457,7 +457,7 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
     document._frame = self;
 
     if (comptime builtin.is_test == false) {
-        if (parent == null) {
+        if (parent == null and browser.env.platform.idle_tasks_enabled) {
             // HTML test runner manually calls these as necessary
             try self.js.scheduler.add(session.browser, struct {
                 fn runIdleTasks(ctx: *anyopaque) !?u32 {

@@ -52,6 +52,7 @@ const Selection = @import("Selection.zig");
 const Timers = @import("Timers.zig");
 const Scheduler = @import("Scheduler.zig");
 const Notification = @import("../../Notification.zig");
+const Chrome = @import("Chrome.zig");
 
 const log = lp.log;
 const IS_DEBUG = builtin.mode == .Debug;
@@ -73,6 +74,7 @@ _css: CSS = .init,
 _crypto: Crypto = .init,
 _console: Console = .init,
 _navigator: Navigator = .init,
+_chrome: Chrome = .{},
 _model_context: ModelContext = .init,
 _screen: *Screen,
 _visual_viewport: *VisualViewport,
@@ -925,6 +927,20 @@ pub fn getInnerHeight(_: *const Window, frame: *Frame) u32 {
     return frame._page.getViewport().height;
 }
 
+// outer* includes browser chrome; non-zero is the headless tell scanners check.
+// Match inner for width; add a modest chrome height for realism.
+pub fn getOuterWidth(self: *const Window, frame: *Frame) u32 {
+    return self.getInnerWidth(frame);
+}
+
+pub fn getOuterHeight(self: *const Window, frame: *Frame) u32 {
+    return self.getInnerHeight(frame) + 85;
+}
+
+pub fn getChrome(self: *Window) *Chrome {
+    return &self._chrome;
+}
+
 const ScrollToOpts = union(enum) {
     x: i32,
     opts: Opts,
@@ -1178,6 +1194,7 @@ pub const JsApi = struct {
     pub const window = bridge.accessor(Window.getWindow, null, .{});
     pub const parent = bridge.accessor(Window.getParent, Window.setParent, .{});
     pub const navigator = bridge.accessor(Window.getNavigator, null, .{});
+    pub const chrome = bridge.accessor(Window.getChrome, null, .{});
     pub const scheduler = bridge.accessor(Window.getScheduler, null, .{});
     pub const screen = bridge.accessor(Window.getScreen, Window.setScreen, .{});
     pub const visualViewport = bridge.accessor(Window.getVisualViewport, Window.setVisualViewport, .{});
@@ -1251,6 +1268,8 @@ pub const JsApi = struct {
     // the attribute rather than throwing.
     pub const innerWidth = bridge.accessor(Window.getInnerWidth, Window.setInnerWidth, .{});
     pub const innerHeight = bridge.accessor(Window.getInnerHeight, Window.setInnerHeight, .{});
+    pub const outerWidth = bridge.accessor(Window.getOuterWidth, null, .{});
+    pub const outerHeight = bridge.accessor(Window.getOuterHeight, null, .{});
     pub const devicePixelRatio = bridge.property(1, .{ .template = false, .readonly = false });
 
     pub const opener = bridge.accessor(Window.getOpener, Window.setOpener, .{});

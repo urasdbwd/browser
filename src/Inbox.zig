@@ -21,21 +21,26 @@
 // arrange that themselves (e.g. curl_multi_wakeup on the consumer's
 // curl multi handle).
 //
-// Backed by a DoublyLinkedList so that pop is O(1) and the
-// allowlist-during-sync-wait drain can cherry-pick messages out of
-// the middle in O(1) given a node pointer.
+// Intrusive singly-linked FIFO. The allowlist-during-sync-wait drain already
+// walks from the head to find a matching message, so retaining a back-link in
+// every queued message only wastes memory. A tail pointer keeps push O(1), and
+// carrying the previous pointer during that walk keeps removal O(1) once found.
 
 const std = @import("std");
 const lp = @import("lightpanda");
 
 const CDP = @import("cdp/CDP.zig");
 
-const DoublyLinkedList = std.DoublyLinkedList;
-
 const Inbox = @This();
 
 mutex: std.Io.Mutex = .init,
-queue: DoublyLinkedList = .{},
+first: ?*Message = null,
+last: ?*Message = null,
+
+// Number of queued commands/control frames that interrupt nested network waits.
+// Maintaining it on push/pop makes the hot-path check O(1) instead of rescanning
+// all queued CDP commands on every tick.
+pending_teardowns: usize = 0,
 
 // One-way latch, set by the worker's drainInbox the first time it
 // observes a .disconnect (or .close) and never cleared. Ensures that, on
@@ -47,8 +52,7 @@ terminated: bool = false,
 pub fn deinit(self: *Inbox) void {
     self.mutex.lockUncancelable(lp.io);
     defer self.mutex.unlock(lp.io);
-    while (self.queue.popFirst()) |node| {
-        const msg: *Message = @fieldParentPtr("node", node);
+    while (self.popUnlocked()) |msg| {
         msg.deinit();
     }
 }
@@ -58,29 +62,59 @@ pub fn push(self: *Inbox, arena: *lp.Arena, payload: Message.Payload) void {
         error.OutOfMemory => @panic("OOM"),
     };
 
+    const is_teardown = isTeardown(payload);
     msg.* = .{ .payload = payload, .arena = arena };
     self.mutex.lockUncancelable(lp.io);
     defer self.mutex.unlock(lp.io);
-    self.queue.append(&msg.node);
+
+    if (is_teardown) self.pending_teardowns += 1;
+
+    if (self.last) |last| {
+        last.next = msg;
+    } else {
+        self.first = msg;
+    }
+    self.last = msg;
 }
 
 pub fn pop(self: *Inbox) ?*Message {
     self.mutex.lockUncancelable(lp.io);
     defer self.mutex.unlock(lp.io);
-    const node = self.queue.popFirst() orelse return null;
-    return @fieldParentPtr("node", node);
+    return self.popUnlocked();
 }
 
-// Peek for a message matching `predicate` without removing it. Used by
-// syncRequest to notice a queued teardown command (which sync_wait can't
-// safely dispatch mid-parse) so it can abort the blocking fetch instead
-// of stalling for the full per-request timeout.
+fn popUnlocked(self: *Inbox) ?*Message {
+    const msg = self.first orelse return null;
+    self.first = msg.next;
+    if (self.first == null) self.last = null;
+    msg.next = null;
+    if (self.pending_teardowns != 0 and isTeardown(msg.payload)) self.pending_teardowns -= 1;
+    return msg;
+}
+
+pub fn hasTeardown(self: *Inbox) bool {
+    self.mutex.lockUncancelable(lp.io);
+    defer self.mutex.unlock(lp.io);
+    return self.pending_teardowns != 0;
+}
+
+fn isTeardown(payload: Message.Payload) bool {
+    return switch (payload) {
+        .close, .disconnect => true,
+        .ping => false,
+        .cdp => |c| std.mem.eql(u8, c.input.method, "Target.closeTarget") or
+            std.mem.eql(u8, c.input.method, "Target.disposeBrowserContext") or
+            std.mem.eql(u8, c.input.method, "Page.close"),
+    };
+}
+
+// Generic peek for a message matching `predicate` without removing it. Teardown
+// checks should use hasTeardown(), which avoids this O(n) traversal.
 pub fn contains(self: *Inbox, predicate: *const fn (*Message) bool) bool {
     self.mutex.lockUncancelable(lp.io);
     defer self.mutex.unlock(lp.io);
-    var it = self.queue.first;
-    while (it) |node| : (it = node.next) {
-        const msg: *Message = @fieldParentPtr("node", node);
+    var it = self.first;
+    while (it) |msg| : (it = msg.next) {
         if (predicate(msg)) return true;
     }
     return false;
@@ -94,13 +128,21 @@ pub fn contains(self: *Inbox, predicate: *const fn (*Message) bool) bool {
 pub fn popIf(self: *Inbox, predicate: *const fn (*Message) bool) ?*Message {
     self.mutex.lockUncancelable(lp.io);
     defer self.mutex.unlock(lp.io);
-    var it = self.queue.first;
-    while (it) |node| : (it = node.next) {
-        const msg: *Message = @fieldParentPtr("node", node);
+    var previous: ?*Message = null;
+    var it = self.first;
+    while (it) |msg| : (it = msg.next) {
         if (predicate(msg)) {
-            self.queue.remove(node);
+            if (previous) |prev| {
+                prev.next = msg.next;
+            } else {
+                self.first = msg.next;
+            }
+            if (self.last == msg) self.last = previous;
+            msg.next = null;
+            if (self.pending_teardowns != 0 and isTeardown(msg.payload)) self.pending_teardowns -= 1;
             return msg;
         }
+        previous = msg;
     }
     return null;
 }
@@ -108,7 +150,7 @@ pub fn popIf(self: *Inbox, predicate: *const fn (*Message) bool) ?*Message {
 pub const Message = struct {
     arena: *lp.Arena,
     payload: Payload,
-    node: DoublyLinkedList.Node = .{},
+    next: ?*Message = null,
 
     pub const Payload = union(enum) {
         // A CDP text/binary frame, parsed on the Network thread. `raw`
@@ -214,6 +256,10 @@ fn testAlwaysFalse(_: *Message) bool {
 
 fn testIsPing(msg: *Message) bool {
     return msg.payload == .ping;
+}
+
+fn testIsDisconnect(msg: *Message) bool {
+    return msg.payload == .disconnect;
 }
 
 test "Inbox: popIf on empty queue returns null" {
@@ -339,4 +385,103 @@ test "Inbox: popIf picks first match in FIFO order" {
     const m = inbox.popIf(testIsPing).?;
     defer m.deinit();
     try testing.expectEqual("first", m.payload.ping);
+}
+
+test "Inbox: popIf removes tail without breaking the next push" {
+    const arena_pool = &testing.test_app.arena_pool;
+    var inbox = Inbox{};
+    defer inbox.deinit();
+
+    {
+        const arena = try arena_pool.acquire(.tiny, "popif tail test");
+        inbox.push(arena, .{ .ping = try arena.dupe(u8, "first") });
+    }
+    {
+        const arena = try arena_pool.acquire(.tiny, "popif tail test");
+        inbox.push(arena, .{ .disconnect = null });
+    }
+
+    const removed = inbox.popIf(testIsDisconnect).?;
+    removed.deinit();
+
+    // This append must follow `first`, not the detached former tail.
+    {
+        const arena = try arena_pool.acquire(.tiny, "popif tail test");
+        inbox.push(arena, .{ .ping = try arena.dupe(u8, "second") });
+    }
+
+    {
+        const msg = inbox.pop().?;
+        defer msg.deinit();
+        try testing.expectEqual("first", msg.payload.ping);
+    }
+    {
+        const msg = inbox.pop().?;
+        defer msg.deinit();
+        try testing.expectEqual("second", msg.payload.ping);
+    }
+    try testing.expect(inbox.pop() == null);
+}
+
+test "Inbox: teardown count tracks queued control frames and CDP commands" {
+    const arena_pool = &testing.test_app.arena_pool;
+    var inbox = Inbox{};
+    defer inbox.deinit();
+
+    try testing.expect(!inbox.hasTeardown());
+
+    inline for ([_][]const u8{
+        "Runtime.evaluate",
+        "Target.closeTarget",
+        "Page.close",
+    }) |method| {
+        const arena = try arena_pool.acquire(.tiny, "teardown count test");
+        inbox.push(arena, .{ .cdp = .{
+            .raw = try arena.dupe(u8, "{}"),
+            .input = .{ .method = method },
+        } });
+    }
+    try testing.expect(inbox.hasTeardown());
+
+    // The ordinary command at the head is not counted.
+    {
+        const msg = inbox.pop().?;
+        defer msg.deinit();
+        try testing.expectEqual("Runtime.evaluate", msg.payload.cdp.input.method);
+    }
+    try testing.expect(inbox.hasTeardown());
+
+    // Removing one of two teardown commands keeps the flag set.
+    {
+        const msg = inbox.pop().?;
+        defer msg.deinit();
+        try testing.expectEqual("Target.closeTarget", msg.payload.cdp.input.method);
+    }
+    try testing.expect(inbox.hasTeardown());
+
+    {
+        const msg = inbox.pop().?;
+        defer msg.deinit();
+        try testing.expectEqual("Page.close", msg.payload.cdp.input.method);
+    }
+    try testing.expect(!inbox.hasTeardown());
+}
+
+test "Inbox: teardown classification preserves sync-wait behavior" {
+    try testing.expect(isTeardown(.close));
+    try testing.expect(isTeardown(.{ .disconnect = null }));
+    try testing.expect(!isTeardown(.{ .ping = "" }));
+
+    var raw: [0]u8 = .{};
+    inline for ([_]struct { method: []const u8, expected: bool }{
+        .{ .method = "Target.closeTarget", .expected = true },
+        .{ .method = "Target.disposeBrowserContext", .expected = true },
+        .{ .method = "Page.close", .expected = true },
+        .{ .method = "Runtime.evaluate", .expected = false },
+    }) |case| {
+        try testing.expectEqual(case.expected, isTeardown(.{ .cdp = .{
+            .raw = &raw,
+            .input = .{ .method = case.method },
+        } }));
+    }
 }

@@ -61,3 +61,36 @@
     });
   }
 </script>
+
+<script id=lazyPendingTargets>
+  {
+    // A settled observer must not hide another observer's detached target
+    // from the lazy frame-level mutation check.
+    const settled = document.createElement('div');
+    document.body.appendChild(settled);
+    let settledCount = 0;
+    const settledObserver = new IntersectionObserver(() => settledCount++);
+    settledObserver.observe(settled);
+
+    const pending = document.createElement('div');
+    let pendingCount = 0;
+    const pendingObserver = new IntersectionObserver(() => pendingCount++);
+    pendingObserver.observe(pending);
+
+    document.body.appendChild(pending);
+    testing.onload(() => {
+      testing.expectEqual(1, settledCount);
+      testing.expectEqual(1, pendingCount);
+
+      // Once both targets have been reported, unrelated mutations must not
+      // produce more entries. They also take the zero-work scheduling path.
+      document.body.appendChild(document.createElement('span'));
+      testing.onload(() => {
+        testing.expectEqual(1, settledCount);
+        testing.expectEqual(1, pendingCount);
+        settledObserver.disconnect();
+        pendingObserver.disconnect();
+      });
+    });
+  }
+</script>

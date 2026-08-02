@@ -34,6 +34,8 @@ pub const Page = @import("browser/Page.zig");
 pub const Frame = @import("browser/Frame.zig");
 pub const Browser = @import("browser/Browser.zig");
 pub const Session = @import("browser/Session.zig");
+pub const Fingerprint = @import("browser/Fingerprint.zig");
+pub const Turnstile = @import("browser/Turnstile.zig");
 
 pub const js = @import("browser/js/js.zig");
 pub const dump = @import("browser/dump.zig");
@@ -49,6 +51,7 @@ pub const tools = @import("browser/tools.zig");
 pub const HttpClient = @import("network/HttpClient.zig");
 
 pub const mcp = @import("mcp.zig");
+pub const render = @import("render.zig");
 pub const Agent = @import("agent/Agent.zig");
 pub const Command = @import("script/command.zig").Command;
 pub const Recorder = @import("script/Recorder.zig");
@@ -185,6 +188,9 @@ pub const FetchOpts = struct {
     dump_mode: ?Config.DumpFormat = null,
     writer: ?*std.Io.Writer = null,
     json: bool = false,
+    /// When true, after the normal wait phase, click Turnstile widgets and wait
+    /// for a response token (remaining wait budget).
+    solve_captchas: bool = false,
 };
 /// Loads each url in `urls` in a fresh session and waits per `opts`.
 ///
@@ -268,6 +274,16 @@ pub fn fetch(app: *App, browser: *Browser, urls: []const [:0]const u8, opts: Fet
             if (p.replacement == null) {
                 try runner.waitForScript(p.frame._frame_id, wait_script, remaining);
             }
+        }
+    }
+
+    // Managed/interactive Turnstile: click checkbox UI and wait for token.
+    // Uses remaining wait budget; soft-fail if no token (page still dumps).
+    if (opts.solve_captchas or app.config.solveCaptchas()) {
+        const elapsed: u32 = @intCast(timer.untilNow(io, .boot).toMilliseconds());
+        const remaining = opts.wait_ms -| elapsed;
+        if (remaining > 0) {
+            try runner.solveTurnstile(remaining);
         }
     }
 

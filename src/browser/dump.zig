@@ -30,11 +30,12 @@ pub const Opts = struct {
     strip: Opts.Strip = .{},
     shadow: Opts.Shadow = .rendered,
 
-    pub const Strip = packed struct(u4) {
+    pub const Strip = packed struct(u5) {
         js: bool = false,
         ui: bool = false,
         css: bool = false,
         invisible: bool = false,
+        meta: bool = false,
     };
 
     pub const Shadow = enum {
@@ -63,22 +64,29 @@ pub fn root(doc: *Node.Document, opts: Opts, writer: *std.Io.Writer, frame: *Fra
             try writer.writeAll("<!DOCTYPE html>");
         }
 
-        if (opts.with_base) {
-            const parent = if (html_doc.getHead()) |head| head.asNode() else doc.asNode();
-            const base = try doc.createElement("base", null, frame);
-            try base.setAttributeSafe(comptime .wrap("base"), .wrap(frame.base()), frame);
-            _ = try parent.insertBefore(base.asNode(), parent.firstChild(), frame);
-        }
+        _ = html_doc;
     }
 
-    return deep(doc.asNode(), opts, writer, frame);
+    var state: RootState = .{ .inject_base = opts.with_base };
+    return _deep(doc.asNode(), opts, false, writer, frame, &state);
 }
 
 pub fn deep(node: *Node, opts: Opts, writer: *std.Io.Writer, frame: *Frame) error{WriteFailed}!void {
-    return _deep(node, opts, false, writer, frame);
+    return _deep(node, opts, false, writer, frame, null);
 }
 
-fn _deep(node: *Node, opts: Opts, comptime force_slot: bool, writer: *std.Io.Writer, frame: *Frame) error{WriteFailed}!void {
+const RootState = struct {
+    inject_base: bool,
+};
+
+fn _deep(
+    node: *Node,
+    opts: Opts,
+    comptime force_slot: bool,
+    writer: *std.Io.Writer,
+    frame: *Frame,
+    root_state: ?*RootState,
+) error{WriteFailed}!void {
     switch (node._type) {
         .cdata => |cd| {
             if (node.is(Node.CData.Comment)) |_| {
@@ -117,16 +125,24 @@ fn _deep(node: *Node, opts: Opts, comptime force_slot: bool, writer: *std.Io.Wri
             }
 
             try el.format(writer);
+            if (root_state) |state| {
+                if (state.inject_base and std.mem.eql(u8, el.getTagNameDump(), "head")) {
+                    try writer.writeAll("<base href=\"");
+                    try writeEscapedAttributeValue(frame.base(), writer);
+                    try writer.writeAll("\">");
+                    state.inject_base = false;
+                }
+            }
 
             if (opts.shadow == .rendered) {
                 if (el.is(Slot)) |slot| {
-                    try dumpSlotContent(slot, opts, writer, frame);
+                    try dumpSlotContent(slot, opts, writer, frame, root_state);
                     return writer.writeAll("</slot>");
                 }
             }
             if (opts.shadow != .skip) {
                 if (frame._element_shadow_roots.get(el)) |shadow| {
-                    try children(shadow.asNode(), opts, writer, frame);
+                    try _children(shadow.asNode(), opts, writer, frame, root_state);
                     // In rendered mode, light DOM is only shown through slots, not directly
                     if (opts.shadow == .rendered) {
                         // Skip rendering light DOM children
@@ -155,7 +171,7 @@ fn _deep(node: *Node, opts: Opts, comptime force_slot: bool, writer: *std.Io.Wri
                     }
                 }
             } else {
-                try children(node, opts, writer, frame);
+                try _children(node, opts, writer, frame, root_state);
             }
 
             if (!isVoidElement(el)) {
@@ -164,7 +180,7 @@ fn _deep(node: *Node, opts: Opts, comptime force_slot: bool, writer: *std.Io.Wri
                 try writer.writeByte('>');
             }
         },
-        .document => try children(node, opts, writer, frame),
+        .document => try _children(node, opts, writer, frame, root_state),
         .document_type => |dt| {
             try writer.writeAll("<!DOCTYPE ");
             try writer.writeAll(dt.getName());
@@ -188,7 +204,7 @@ fn _deep(node: *Node, opts: Opts, comptime force_slot: bool, writer: *std.Io.Wri
             }
             try writer.writeAll(">\n");
         },
-        .document_fragment => try children(node, opts, writer, frame),
+        .document_fragment => try _children(node, opts, writer, frame, root_state),
         .attribute => {
             // Not called normally, but can be called via XMLSerializer.serializeToString
             // in which case it should return an empty string
@@ -198,9 +214,13 @@ fn _deep(node: *Node, opts: Opts, comptime force_slot: bool, writer: *std.Io.Wri
 }
 
 pub fn children(parent: *Node, opts: Opts, writer: *std.Io.Writer, frame: *Frame) !void {
+    return _children(parent, opts, writer, frame, null);
+}
+
+fn _children(parent: *Node, opts: Opts, writer: *std.Io.Writer, frame: *Frame, root_state: ?*RootState) !void {
     var it = parent.childrenIterator();
     while (it.next()) |child| {
-        try deep(child, opts, writer, frame);
+        try _deep(child, opts, false, writer, frame, root_state);
     }
 }
 
@@ -244,22 +264,22 @@ pub fn toJSON(node: *Node, writer: *std.json.Stringify) !void {
     try writer.endObject();
 }
 
-fn dumpSlotContent(slot: *Slot, opts: Opts, writer: *std.Io.Writer, frame: *Frame) !void {
+fn dumpSlotContent(slot: *Slot, opts: Opts, writer: *std.Io.Writer, frame: *Frame, root_state: ?*RootState) !void {
     const assigned = slot.assignedNodes(null, frame) catch return;
 
     if (assigned.len > 0) {
         for (assigned) |assigned_node| {
-            try _deep(assigned_node, opts, true, writer, frame);
+            try _deep(assigned_node, opts, true, writer, frame, root_state);
         }
     } else {
-        try children(slot.asNode(), opts, writer, frame);
+        try _children(slot.asNode(), opts, writer, frame, root_state);
     }
 }
 
 fn isVoidElement(el: *const Node.Element) bool {
     return switch (el._type) {
         .html => |html| switch (html._type) {
-            .br, .hr, .img, .input, .link, .meta => true,
+            .base, .br, .hr, .img, .input, .link, .meta => true,
             else => false,
         },
         .svg => false,
@@ -268,7 +288,7 @@ fn isVoidElement(el: *const Node.Element) bool {
 
 fn shouldStripElement(el: *Node.Element, opts: Opts, frame: *Frame) bool {
     // Fast path: with no strip flags set (every innerHTML/outerHTML call)
-    if (@as(u4, @bitCast(opts.strip)) == 0) {
+    if (@as(u5, @bitCast(opts.strip)) == 0) {
         return false;
     }
 
@@ -280,15 +300,22 @@ fn shouldStripElement(el: *Node.Element, opts: Opts, frame: *Frame) bool {
 
         if (std.mem.eql(u8, tag_name, "link")) {
             if (el.getAttributeSafe(comptime .wrap("as"))) |as| {
-                if (std.mem.eql(u8, as, "script")) return true;
+                if (std.ascii.eqlIgnoreCase(as, "script")) return true;
             }
             if (el.getAttributeSafe(comptime .wrap("rel"))) |rel| {
-                if (std.mem.eql(u8, rel, "modulepreload") or std.mem.eql(u8, rel, "preload")) {
+                if (hasAsciiToken(rel, "modulepreload")) return true;
+                if (hasAsciiToken(rel, "preload")) {
                     if (el.getAttributeSafe(comptime .wrap("as"))) |as| {
-                        if (std.mem.eql(u8, as, "script")) return true;
+                        if (std.ascii.eqlIgnoreCase(as, "script")) return true;
                     }
                 }
             }
+        }
+    }
+
+    if (opts.strip.meta and std.mem.eql(u8, tag_name, "meta")) {
+        if (el.getAttributeSafe(comptime .wrap("http-equiv"))) |raw| {
+            if (isUnsafeHttpEquiv(raw)) return true;
         }
     }
 
@@ -317,6 +344,20 @@ fn shouldStripElement(el: *Node.Element, opts: Opts, frame: *Frame) bool {
     }
 
     return false;
+}
+
+fn hasAsciiToken(value: []const u8, wanted: []const u8) bool {
+    var tokens = std.mem.tokenizeAny(u8, value, &std.ascii.whitespace);
+    while (tokens.next()) |token| {
+        if (std.ascii.eqlIgnoreCase(token, wanted)) return true;
+    }
+    return false;
+}
+
+fn isUnsafeHttpEquiv(raw: []const u8) bool {
+    const value = std.mem.trim(u8, raw, &std.ascii.whitespace);
+    return std.ascii.eqlIgnoreCase(value, "refresh") or
+        std.ascii.startsWithIgnoreCase(value, "content-security-policy");
 }
 
 fn shouldEscapeText(node_: ?*Node) bool {
@@ -358,6 +399,22 @@ fn writeEscapedText(text: []const u8, writer: *std.Io.Writer) !void {
     }
 }
 
+fn writeEscapedAttributeValue(value: []const u8, writer: *std.Io.Writer) !void {
+    var remaining = value;
+    while (std.mem.indexOfAny(u8, remaining, "&\"<>")) |offset| {
+        try writer.writeAll(remaining[0..offset]);
+        try writer.writeAll(switch (remaining[offset]) {
+            '&' => "&amp;",
+            '"' => "&quot;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            else => unreachable,
+        });
+        remaining = remaining[offset + 1 ..];
+    }
+    try writer.writeAll(remaining);
+}
+
 fn writeEscapedByte(input: []const u8, index: usize, writer: *std.Io.Writer) ![]const u8 {
     switch (input[index]) {
         '&' => try writer.writeAll("&amp;"),
@@ -378,9 +435,6 @@ fn writeEscapedByte(input: []const u8, index: usize, writer: *std.Io.Writer) ![]
 
 const testing = @import("../testing.zig");
 
-// A fresh page per assertion: `with_base` mutates the document (it inserts a
-// <base> element), so reusing one frame across opts would leak that mutation
-// into later dumps.
 fn expectDump(opts: Opts, expected: []const u8) !void {
     var page = try testing.pageTest("dump.html", .{});
     defer page.close();
@@ -402,8 +456,21 @@ test "dump: default dumps the whole document" {
 test "dump: with_base injects a <base> element" {
     try expectDump(.{ .with_base = true },
         \\<!DOCTYPE html>
-        \\<html><head><base base="http://127.0.0.1:9582/src/browser/tests/dump.html"></base><style>.hidden{display:none}</style><link rel="stylesheet" href="data:text/css,"><script>var a=1;</script></head><body><h1>Title</h1><p class="hidden">secret</p><img><svg></svg><noscript>nojs</noscript><p>visible &amp; well</p></body></html>
+        \\<html><head><base href="http://127.0.0.1:9582/src/browser/tests/dump.html"><style>.hidden{display:none}</style><link rel="stylesheet" href="data:text/css,"><script>var a=1;</script></head><body><h1>Title</h1><p class="hidden">secret</p><img><svg></svg><noscript>nojs</noscript><p>visible &amp; well</p></body></html>
     );
+}
+
+test "dump: with_base does not mutate the document" {
+    var page = try testing.pageTest("dump.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    var first: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    try root(frame.document, .{ .with_base = true }, &first.writer, frame);
+
+    var second: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    try root(frame.document, .{}, &second.writer, frame);
+    try testing.expect(std.mem.indexOf(u8, second.written(), "<base") == null);
 }
 
 test "dump: strip.js removes script and noscript" {
@@ -411,6 +478,19 @@ test "dump: strip.js removes script and noscript" {
         \\<!DOCTYPE html>
         \\<html><head><style>.hidden{display:none}</style><link rel="stylesheet" href="data:text/css,"></head><body><h1>Title</h1><p class="hidden">secret</p><img><svg></svg><p>visible &amp; well</p></body></html>
     );
+}
+
+test "dump: rel tokens are case insensitive" {
+    try testing.expect(hasAsciiToken("alternate MODULEPRELOAD", "modulepreload"));
+    try testing.expect(hasAsciiToken("preload stylesheet", "preload"));
+    try testing.expect(!hasAsciiToken("prefetch", "preload"));
+}
+
+test "dump: render handoff strips navigation and CSP meta policies" {
+    try testing.expect(isUnsafeHttpEquiv(" Refresh "));
+    try testing.expect(isUnsafeHttpEquiv("CONTENT-SECURITY-POLICY"));
+    try testing.expect(isUnsafeHttpEquiv("content-security-policy-report-only"));
+    try testing.expect(!isUnsafeHttpEquiv("content-type"));
 }
 
 test "dump: strip.css removes style and stylesheet links" {

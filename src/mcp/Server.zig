@@ -38,6 +38,8 @@ allocator: std.mem.Allocator,
 app: *App,
 
 sessions: std.StringHashMapUnmanaged(*Session) = .empty,
+/// Hard cap because every entry owns a separate V8 isolate and heap.
+max_sessions: usize,
 /// Monotonic counter backing auto-generated session ids (`s1`, `s2`, …).
 session_seq: u32 = 0,
 /// When several sessions (each its own V8 isolate) share one thread, V8's
@@ -60,6 +62,7 @@ pub fn init(allocator: std.mem.Allocator, app: *App, writer: *std.Io.Writer) !*S
     self.* = .{
         .allocator = allocator,
         .app = app,
+        .max_sessions = app.config.mcpMaxSessions(),
         .transport = .init(allocator, writer),
     };
     errdefer self.transport.deinit();
@@ -81,6 +84,7 @@ pub fn deinit(self: *Self) void {
 /// duped, so the caller keeps ownership of its slice.
 pub fn createSession(self: *Self, id: []const u8) !*Session {
     if (self.sessions.get(id)) |existing| return existing;
+    if (self.sessions.count() >= self.max_sessions) return error.SessionLimitReached;
 
     const owned_id = try self.allocator.dupe(u8, id);
     errdefer self.allocator.free(owned_id);
@@ -263,6 +267,9 @@ test "MCP.Server - Integration: synchronous smoke test" {
     defer server.deinit();
 
     try router.processRequests(server, &in_reader, null);
+
+    server.max_sessions = 1;
+    try testing.expectError(error.SessionLimitReached, server.createSession("second"));
 
     try testing.expectJson(.{ .jsonrpc = "2.0", .id = 1, .result = .{ .protocolVersion = "2024-11-05" } }, out_alloc.writer.buffered());
 }

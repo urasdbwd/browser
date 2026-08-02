@@ -524,19 +524,14 @@ pub fn frameCreated(bc: *CDP.BrowserContext, frame: *Frame) !void {
     const in_commit = bc.inCommit();
 
     if (!in_commit) {
-        _ = bc.cdp.frame_arena.reset(.{ .retain_with_limit = 1024 * 512 });
+        // Only retain captured responses until a navigation event. In CDP
+        // terms, this is called a "renderer" and the cache duration can be
+        // controlled via Network.configureDurableMessages (unsupported).
+        bc.resetCapturedResponses();
     }
 
     for (bc.isolated_worlds.items) |isolated_world| {
         _ = try isolated_world.createContext(frame);
-    }
-
-    if (!in_commit) {
-        // Only retain captured responses until a navigation event. In CDP
-        // terms, this is called a "renderer" and the cache-duration can be
-        // controlled via Network.configureDurableMessages (which we don't
-        // support).
-        bc.captured_responses = .empty;
     }
 }
 
@@ -1593,6 +1588,54 @@ test "cdp.frame: navigate to about:blank replaces a non-blank document" {
     defer ls.deinit();
     const v = try ls.local.exec("window.location.href === 'about:blank'", null);
     try testing.expect(v.toBool());
+}
+
+test "cdp.frame: root navigation rotates captured response lifetime" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const cdp = ctx.cdp();
+    _ = try cdp.createBrowserContext();
+    const bc = &cdp.browser_context.?;
+    bc.id = "BID-CAPTURE";
+    bc.session_id = "SID-CAPTURE";
+    bc.target_id = "TID-CAPTURE-00".*;
+
+    try ctx.processMessage(.{ .id = 80, .method = "Network.enable" });
+    try ctx.expectSentResult(null, .{ .id = 80 });
+
+    const page = try bc.session.createPage();
+    try page.navigate("http://127.0.0.1:9582/redirect-target", .{});
+    try testing.waitForPage(bc);
+
+    const first_loader = (bc.mainFrame() orelse unreachable)._loader_id;
+    const first_key: CDP.BrowserContext.CapturedResponseKey = .{ .kind = .loader, .id = first_loader };
+    const first = bc.captured_responses.get(first_key) orelse return error.MissingFirstCapture;
+    try testing.expectEqualSlices(u8, "<!DOCTYPE html><title>landed</title>", first.data.items);
+    try testing.expectEqual(first.data.items.len, bc.captured_response_bytes);
+
+    // A normal second root navigation uses Session.commitPendingPage. Its
+    // response cache and byte budget must replace, not accumulate with, page 1.
+    try ctx.processMessage(.{
+        .id = 81,
+        .method = "Page.navigate",
+        .params = .{ .url = "http://127.0.0.1:9582/303-no-location" },
+    });
+    try testing.waitForPage(bc);
+
+    const second_loader = (bc.mainFrame() orelse unreachable)._loader_id;
+    const second_key: CDP.BrowserContext.CapturedResponseKey = .{ .kind = .loader, .id = second_loader };
+    try testing.expect(second_loader != first_loader);
+    try testing.expect(!bc.captured_responses.contains(first_key));
+    try testing.expectEqual(1, bc.captured_responses.count());
+
+    const second = bc.captured_responses.get(second_key) orelse return error.MissingSecondCapture;
+    try testing.expectEqualSlices(
+        u8,
+        "<!DOCTYPE html><title>landed</title><p>see other body</p>",
+        second.data.items,
+    );
+    try testing.expectEqual(second.data.items.len, bc.captured_response_bytes);
 }
 
 test "cdp.frame: anchor click sends Referer matching the originating page" {

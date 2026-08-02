@@ -113,7 +113,7 @@ pub const Header = struct {
 pub const Headers = struct {
     headers: ?*libcurl.CurlSList,
 
-    pub fn init(user_agent: [:0]const u8) !Headers {
+    pub fn init(user_agent: [:0]const u8, sec_ch_ua: [:0]const u8) !Headers {
         const header_list = libcurl.curl_slist_append(null, user_agent);
         if (header_list == null) {
             return error.OutOfMemory;
@@ -121,8 +121,8 @@ pub const Headers = struct {
         // libcurl leaves the list intact when curl_slist_append fails, so we own it.
         errdefer libcurl.curl_slist_free_all(header_list);
 
-        // Always add sec-CH-UA header
-        const with_sec_ch_ua = libcurl.curl_slist_append(header_list, Config.HttpHeaders.sec_ch_ua);
+        // Always add sec-CH-UA header (stealth uses Chrome brands).
+        const with_sec_ch_ua = libcurl.curl_slist_append(header_list, sec_ch_ua);
         if (with_sec_ch_ua == null) {
             return error.OutOfMemory;
         }
@@ -686,7 +686,7 @@ pub const Connection = struct {
     }
 
     pub fn request(self: *const Connection, http_headers: *const Config.HttpHeaders) !u16 {
-        var header_list = try Headers.init(http_headers.user_agent_header);
+        var header_list = try Headers.init(http_headers.user_agent_header, http_headers.sec_ch_ua_header);
         defer header_list.deinit();
         try self.secretHeaders(&header_list, http_headers);
         try self.setHeaders(&header_list);
@@ -996,7 +996,7 @@ fn findHeader(headers: Headers, name: []const u8) struct { count: usize, value: 
 }
 
 test "Headers.set replaces an existing header instead of duplicating it" {
-    var headers = try Headers.init("User-Agent: Lightpanda/1.0");
+    var headers = try Headers.init("User-Agent: Lightpanda/1.0", Config.HttpHeaders.sec_ch_ua_default);
     defer headers.deinit();
 
     try headers.set("User-Agent: Custom/1.0");
@@ -1007,7 +1007,7 @@ test "Headers.set replaces an existing header instead of duplicating it" {
 }
 
 test "Headers.set matches header names case-insensitively" {
-    var headers = try Headers.init("User-Agent: Lightpanda/1.0");
+    var headers = try Headers.init("User-Agent: Lightpanda/1.0", Config.HttpHeaders.sec_ch_ua_default);
     defer headers.deinit();
 
     try headers.set("user-agent: Custom/1.0");
@@ -1018,7 +1018,7 @@ test "Headers.set matches header names case-insensitively" {
 }
 
 test "Headers.set adds a new header and preserves defaults" {
-    var headers = try Headers.init("User-Agent: Lightpanda/1.0");
+    var headers = try Headers.init("User-Agent: Lightpanda/1.0", Config.HttpHeaders.sec_ch_ua_default);
     defer headers.deinit();
 
     try headers.set("X-Custom: yes");

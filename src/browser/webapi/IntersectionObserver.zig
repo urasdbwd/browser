@@ -137,6 +137,7 @@ pub fn observe(self: *IntersectionObserver, target: *Element, frame: *Frame) !vo
     }
 
     try self._tracked.put(self._arena.allocator(), target, {});
+    Frame.observers.trackIntersectionTarget(frame);
 
     // Check intersection for this new target and schedule delivery
     try self.checkIntersection(target, frame);
@@ -150,7 +151,9 @@ pub fn unobserve(self: *IntersectionObserver, target: *Element, frame: *Frame) v
     for (self._observing.items, 0..) |elem, i| {
         if (elem == target) {
             _ = self._observing.swapRemove(i);
-            _ = self._tracked.remove(target);
+            if (self._tracked.remove(target)) {
+                Frame.observers.untrackIntersectionTargets(frame, 1);
+            }
 
             // Remove any pending entries for this target.
             // Entries will be cleaned up by V8 GC via the finalizer.
@@ -177,6 +180,7 @@ pub fn disconnect(self: *IntersectionObserver, frame: *Frame) void {
         entry.deinit(frame._page);
     }
     self._pending_entries.clearRetainingCapacity();
+    Frame.observers.untrackIntersectionTargets(frame, self._tracked.count());
     self._tracked.clearRetainingCapacity();
 
     if (self._observing.items.len > 0) {
@@ -280,6 +284,7 @@ fn checkIntersection(self: *IntersectionObserver, target: *Element, frame: *Fram
     };
     try self._pending_entries.append(self._arena.allocator(), entry);
     _ = self._tracked.removeByPtr(tracked.key_ptr);
+    Frame.observers.untrackIntersectionTargets(frame, 1);
 }
 
 pub fn checkIntersections(self: *IntersectionObserver, frame: *Frame) !void {

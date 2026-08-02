@@ -20,6 +20,7 @@ const std = @import("std");
 const lp = @import("lightpanda");
 const crypto = @import("../sys/libcrypto.zig");
 
+const AppConfig = @import("../Config.zig");
 const Http = @import("../network/http.zig");
 
 const WebBotAuth = @This();
@@ -260,7 +261,7 @@ test "signRequest: adds headers with correct names" {
     };
     defer auth.deinit(allocator);
 
-    var headers = try Http.Headers.init("User-Agent: Test-Agent");
+    var headers = try Http.Headers.init("User-Agent: Test-Agent", AppConfig.HttpHeaders.sec_ch_ua_default);
     defer headers.deinit();
 
     try auth.signRequest(allocator, &headers, "example.com");

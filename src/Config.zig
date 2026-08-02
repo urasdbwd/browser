@@ -20,6 +20,7 @@ const std = @import("std");
 const zenai = @import("zenai");
 const lp = @import("lightpanda");
 const builtin = @import("builtin");
+const build_config = @import("build_config");
 
 const cli = @import("cli.zig");
 const dump = @import("browser/dump.zig");
@@ -39,6 +40,16 @@ pub const CDP_KEEPALIVE_CNT: c_int = 3;
 pub const CDP_TCP_USER_TIMEOUT_MS: c_int = 10_000;
 
 const Config = @This();
+
+/// Runtime limits tuned either for desktop throughput or for small ARM boards.
+/// The Pi profile deliberately trades Web API breadth and concurrency for a
+/// lower retained memory and bounded major defaults; clients can still opt
+/// individual features back in through LP.configureLoading after a CDP
+/// session is created.
+pub const ResourceProfile = enum {
+    standard,
+    pi,
+};
 
 fn logFilterScopesValidator(allocator: Allocator, args: *std.process.Args.Iterator, list: *std.ArrayList(log.FilterRule)) !void {
     const str = args.next() orelse return error.InvalidOption;
@@ -176,8 +187,17 @@ fn caPathValidator(
     }
 }
 
+/// Managed-mode Turnstile auto-click / token wait.
+pub const SolveCaptchas = enum {
+    /// On when `--stealth` is set; otherwise off.
+    auto,
+    on,
+    off,
+};
+
 /// Common CLI args.
 const CommonOptions = .{
+    .{ .name = "resource_profile", .type = ?ResourceProfile },
     .{ .name = "obey_robots", .type = bool },
     .{ .name = "proxy_bearer_token", .type = ?[:0]const u8 },
     .{ .name = "http_proxy", .type = ?[:0]const u8 },
@@ -197,6 +217,21 @@ const CommonOptions = .{
     .{ .name = "web_bot_auth_keyid", .type = ?[]const u8 },
     .{ .name = "web_bot_auth_domain", .type = ?[]const u8 },
     .{ .name = "user_agent", .type = ?[]const u8 },
+    // Chrome-aligned fingerprint for challenge widgets (Turnstile managed mode,
+    // etc.). Sets a Chrome UA, Sec-Ch-Ua brands, and navigator.userAgentData.
+    // Auto-generates a random fingerprint seed (CloakBrowser-style) unless
+    // --fingerprint is set. Enables interactive Turnstile click-solve by default.
+    .{ .name = "stealth", .type = bool },
+    // Deterministic fingerprint seed (CloakBrowser --fingerprint=N). Same seed
+    // → same GPU/screen/hw/canvas/audio identity. Alone activates the fingerprint
+    // profile; pair with --stealth for Chrome UA + captcha auto-interact.
+    .{ .name = "fingerprint", .type = ?u64 },
+    // Platform reported to JS: windows|macos|linux. Default with --stealth: windows
+    // (common CloakBrowser wrapper default on non-Mac hosts).
+    .{ .name = "fingerprint_platform", .type = ?[]const u8 },
+    // Click managed Turnstile checkboxes and wait for a token after load.
+    // auto (default) = on when --stealth; on/off force either way.
+    .{ .name = "solve_captchas", .type = SolveCaptchas, .default = .auto },
     .{ .name = "block_private_networks", .type = bool },
     .{ .name = "block_cidrs", .type = ?[]const u8 },
     .{ .name = "block_urls", .type = ?[]const u8 },
@@ -209,6 +244,8 @@ const CommonOptions = .{
     .{ .name = "enable_external_stylesheets", .type = bool },
     .{ .name = "v8_flags_unsafe", .type = ?[]const u8 },
     .{ .name = "v8_max_heap_mb", .type = ?u32 },
+    .{ .name = "v8_thread_pool_size", .type = ?u8 },
+    .{ .name = "disable_v8_idle_tasks", .type = bool },
     .{ .name = "watchdog_ms", .type = ?u32 },
     .{
         .name = "ca_cert",
@@ -313,9 +350,11 @@ const Commands = cli.Builder(.{
             .{ .name = "port", .type = u16, .default = 9222 },
             .{ .name = "advertise_host", .type = ?[]const u8 },
             .{ .name = "timeout", .type = ?u31 },
-            .{ .name = "cdp_max_connections", .type = u16, .default = 16 },
-            .{ .name = "cdp_max_pending_connections", .type = u16, .default = 128 },
-            .{ .name = "cdp_max_message_size", .type = u32, .default = 1024 * 1024 },
+            .{ .name = "cdp_max_connections", .type = ?u16 },
+            .{ .name = "cdp_max_pending_connections", .type = ?u16 },
+            .{ .name = "cdp_max_message_size", .type = ?u32 },
+            .{ .name = "cdp_max_captured_response_size", .type = ?usize },
+            .{ .name = "cdp_max_captured_responses", .type = ?usize },
             // Don't widen this without growing the reader buffer in the HTTP path.
             .{ .name = "cdp_max_http_message_size", .type = u14, .default = 4096 },
             .{ .name = "disable_metrics", .type = bool },
@@ -356,11 +395,31 @@ const Commands = cli.Builder(.{
         .shared_options = CommonOptions,
     },
     .{
+        .name = "render",
+        .options = .{
+            .{ .name = "host", .type = []const u8, .default = "127.0.0.1" },
+            .{ .name = "port", .type = u16, .default = 9223 },
+            .{ .name = "auth_token", .type = ?[]const u8 },
+            .{ .name = "cors_origin", .type = ?[]const u8 },
+            .{ .name = "allow_private_networks", .type = bool },
+            .{ .name = "max_connections", .type = ?u16 },
+            .{ .name = "max_request_size", .type = ?usize },
+            .{ .name = "max_response_size", .type = ?usize },
+            .{ .name = "max_wait_ms", .type = ?u32 },
+            .{ .name = "client_timeout_ms", .type = ?u32 },
+        },
+        .shared_options = CommonOptions,
+    },
+    .{
         .name = "mcp",
         .options = .{
             .{ .name = "port", .type = ?u16 },
             .{ .name = "host", .type = []const u8, .default = "127.0.0.1" },
             .{ .name = "cdp_port", .type = ?u16 },
+            .{ .name = "max_connections", .type = ?u16 },
+            .{ .name = "max_request_size", .type = ?usize },
+            .{ .name = "max_response_size", .type = ?usize },
+            .{ .name = "max_sessions", .type = ?u16 },
         },
         .shared_options = CommonOptions,
     },
@@ -404,6 +463,9 @@ mode: Mode,
 command: RunMode,
 exec_name: []const u8,
 http_headers: HttpHeaders,
+/// CloakBrowser-style fingerprint profile (seed → GPU/screen/hw). Always set;
+/// stock profile when stealth is off and no seed given.
+fingerprint_profile: Fingerprint.Profile = .stock,
 
 fn modeNeedsHttp(mode: Mode) bool {
     return switch (mode) {
@@ -413,17 +475,41 @@ fn modeNeedsHttp(mode: Mode) bool {
     };
 }
 
+const Fingerprint = @import("browser/Fingerprint.zig");
+
 pub fn init(allocator: Allocator, exec_name: []const u8, mode: Mode) !Config {
     var config = Config{
         .mode = mode,
         .command = std.meta.activeTag(mode),
         .exec_name = exec_name,
         .http_headers = undefined,
+        .fingerprint_profile = .stock,
     };
     if (modeNeedsHttp(mode)) {
         config.http_headers = try HttpHeaders.init(allocator, &config);
+        config.fingerprint_profile = resolveFingerprintProfile(&config);
     }
     return config;
+}
+
+/// Build profile from --stealth / --fingerprint / --fingerprint-platform.
+fn resolveFingerprintProfile(config: *const Config) Fingerprint.Profile {
+    const has_seed = config.fingerprintSeed() != null;
+    const is_stealth = config.stealth() or has_seed;
+    if (!is_stealth) return .stock;
+
+    const platform: Fingerprint.Platform = blk: {
+        if (config.fingerprintPlatform()) |s| {
+            break :blk Fingerprint.Platform.fromString(s) orelse .windows;
+        }
+        // CloakBrowser wrapper default on non-Mac: spoof Windows.
+        break :blk if (builtin.os.tag == .macos) .macos else .windows;
+    };
+
+    if (config.fingerprintSeed()) |seed| {
+        return Fingerprint.Profile.fromSeed(seed, platform);
+    }
+    return Fingerprint.Profile.random(platform);
 }
 
 pub fn deinit(self: *const Config, allocator: Allocator) void {
@@ -435,15 +521,30 @@ pub fn deinit(self: *const Config, allocator: Allocator) void {
 pub fn interactive(self: *const Config) bool {
     return switch (self.mode) {
         .fetch => false,
-        .serve, .mcp => true,
+        .serve, .render, .mcp => true,
         .agent => |opts| opts.script_file == null,
         else => unreachable,
     };
 }
 
+pub fn resourceProfile(self: *const Config) ResourceProfile {
+    return switch (self.mode) {
+        .render => |opts| opts.resource_profile orelse .pi,
+        inline .serve, .fetch, .mcp, .agent => |opts| opts.resource_profile orelse
+            if (build_config.low_resource_default) .pi else .standard,
+        else => unreachable,
+    };
+}
+
+/// Render-handoff mode deliberately leaves CSS parsing, layout and paint to
+/// the attached real browser.
+pub fn clientSideRendering(self: *const Config) bool {
+    return self.mode == .render;
+}
+
 pub fn tlsVerifyHost(self: *const Config) bool {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| !opts.insecure_disable_tls_host_verification,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| !opts.insecure_disable_tls_host_verification,
         // `version --check` talks to the release endpoint; always verify.
         .version => true,
         else => unreachable,
@@ -452,29 +553,30 @@ pub fn tlsVerifyHost(self: *const Config) bool {
 
 pub fn obeyRobots(self: *const Config) bool {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.obey_robots,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.obey_robots,
         else => unreachable,
     };
 }
 
 pub fn disableSubframes(self: *const Config) bool {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.disable_subframes,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.disable_subframes or self.resourceProfile() == .pi,
         else => unreachable,
     };
 }
 
 pub fn disableWorkers(self: *const Config) bool {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.disable_workers,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.disable_workers or self.resourceProfile() == .pi,
         else => unreachable,
     };
 }
 
 pub fn watchdogMs(self: *const Config) ?u32 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| {
-            const ms = opts.watchdog_ms orelse 30000;
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| {
+            const default_ms: u32 = if (self.resourceProfile() == .pi) 10_000 else 30_000;
+            const ms = opts.watchdog_ms orelse default_ms;
             return if (ms == 0) null else ms;
         },
         else => unreachable,
@@ -483,28 +585,48 @@ pub fn watchdogMs(self: *const Config) ?u32 {
 
 pub fn enableExternalStylesheets(self: *const Config) bool {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.enable_external_stylesheets,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.enable_external_stylesheets,
         else => unreachable,
     };
 }
 
 pub fn v8Flags(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.v8_flags_unsafe,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.v8_flags_unsafe,
         else => unreachable,
     };
 }
 
 pub fn v8MaxHeapMb(self: *const Config) ?u32 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.v8_max_heap_mb,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.v8_max_heap_mb orelse
+            if (self.resourceProfile() == .pi) 64 else null,
+        else => unreachable,
+    };
+}
+
+pub fn speculativePreloading(self: *const Config) bool {
+    return self.resourceProfile() != .pi;
+}
+
+pub fn v8ThreadPoolSize(self: *const Config) u8 {
+    return switch (self.mode) {
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.v8_thread_pool_size orelse
+            if (self.resourceProfile() == .pi) 1 else 0,
+        else => unreachable,
+    };
+}
+
+pub fn v8IdleTasks(self: *const Config) bool {
+    return switch (self.mode) {
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| !opts.disable_v8_idle_tasks and self.resourceProfile() != .pi,
         else => unreachable,
     };
 }
 
 pub fn httpProxy(self: *const Config) ?[:0]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_proxy,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.http_proxy,
         .version => null,
         else => unreachable,
     };
@@ -512,28 +634,30 @@ pub fn httpProxy(self: *const Config) ?[:0]const u8 {
 
 pub fn proxyBearerToken(self: *const Config) ?[:0]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.proxy_bearer_token,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.proxy_bearer_token,
         else => null,
     };
 }
 
 pub fn httpMaxConcurrent(self: *const Config) u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_max_concurrent orelse 40,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.http_max_concurrent orelse
+            if (self.resourceProfile() == .pi) 8 else 40,
         else => unreachable,
     };
 }
 
 pub fn httpMaxHostOpen(self: *const Config) u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_max_host_open orelse 6,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.http_max_host_open orelse
+            if (self.resourceProfile() == .pi) 2 else 6,
         else => unreachable,
     };
 }
 
 pub fn httpConnectTimeout(self: *const Config) u31 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_connect_timeout orelse 0,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.http_connect_timeout orelse 0,
         .version => 0,
         else => unreachable,
     };
@@ -541,7 +665,7 @@ pub fn httpConnectTimeout(self: *const Config) u31 {
 
 pub fn httpTimeout(self: *const Config) u31 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_timeout orelse 5000,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.http_timeout orelse 5000,
         .version => 5000,
         else => unreachable,
     };
@@ -553,14 +677,16 @@ pub fn httpMaxRedirects(_: *const Config) u8 {
 
 pub fn httpMaxResponseSize(self: *const Config) ?usize {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_max_response_size,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.http_max_response_size orelse
+            if (self.resourceProfile() == .pi) 32 * 1024 * 1024 else null,
         else => unreachable,
     };
 }
 
 pub fn wsMaxConcurrent(self: *const Config) u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.ws_max_concurrent orelse 8,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.ws_max_concurrent orelse
+            if (self.resourceProfile() == .pi) 2 else 8,
         else => unreachable,
     };
 }
@@ -572,7 +698,7 @@ pub fn logLevel(self: *const Config) ?log.Level {
             .low, .medium => .err,
             .high => null,
         },
-        inline .serve, .fetch, .mcp => |opts| opts.log_level,
+        inline .serve, .fetch, .render, .mcp => |opts| opts.log_level,
         else => unreachable,
     };
 }
@@ -602,49 +728,82 @@ fn stderrIsTty() bool {
 
 pub fn logFormat(self: *const Config) ?log.Format {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.log_format,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.log_format,
         else => unreachable,
     };
 }
 
 pub fn logFilterScopes(self: *const Config) std.ArrayList(log.FilterRule) {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.log_filter_scopes,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.log_filter_scopes,
         else => unreachable,
     };
 }
 
 pub fn userAgentSuffix(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.user_agent_suffix,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.user_agent_suffix,
         else => null,
     };
 }
 
 pub fn userAgent(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.user_agent,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.user_agent,
         else => null,
+    };
+}
+
+pub fn stealth(self: *const Config) bool {
+    return switch (self.mode) {
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.stealth,
+        else => false,
+    };
+}
+
+pub fn fingerprintSeed(self: *const Config) ?u64 {
+    return switch (self.mode) {
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.fingerprint,
+        else => null,
+    };
+}
+
+pub fn fingerprintPlatform(self: *const Config) ?[]const u8 {
+    return switch (self.mode) {
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.fingerprint_platform,
+        else => null,
+    };
+}
+
+/// Auto-click managed Turnstile and wait for tokens. Defaults to on with --stealth.
+pub fn solveCaptchas(self: *const Config) bool {
+    return switch (self.mode) {
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| switch (opts.solve_captchas) {
+            .on => true,
+            .off => false,
+            .auto => opts.stealth,
+        },
+        else => false,
     };
 }
 
 pub fn httpCacheDir(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_cache_dir,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.http_cache_dir,
         else => null,
     };
 }
 
 pub fn cookieFile(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.cookie,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.cookie,
         else => null,
     };
 }
 
 pub fn cookieJarFile(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
-        inline .fetch, .mcp, .agent => |opts| opts.cookie_jar,
+        inline .fetch, .render, .mcp, .agent => |opts| opts.cookie_jar,
         else => null,
     };
 }
@@ -652,6 +811,7 @@ pub fn cookieJarFile(self: *const Config) ?[]const u8 {
 pub fn port(self: *const Config) u16 {
     return switch (self.mode) {
         .serve => |opts| opts.port,
+        .render => |opts| opts.port,
         .mcp => |opts| opts.cdp_port orelse 0,
         else => unreachable,
     };
@@ -660,6 +820,7 @@ pub fn port(self: *const Config) u16 {
 pub fn advertiseHost(self: *const Config) []const u8 {
     return switch (self.mode) {
         .serve => |opts| opts.advertise_host orelse opts.host,
+        .render => |opts| opts.host,
         .mcp => "127.0.0.1",
         else => unreachable,
     };
@@ -667,7 +828,7 @@ pub fn advertiseHost(self: *const Config) []const u8 {
 
 pub fn webBotAuth(self: *const Config) ?WebBotAuthConfig {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| WebBotAuthConfig{
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| WebBotAuthConfig{
             .key_file = opts.web_bot_auth_key_file orelse return null,
             .keyid = opts.web_bot_auth_keyid orelse return null,
             .domain = opts.web_bot_auth_domain orelse return null,
@@ -678,6 +839,7 @@ pub fn webBotAuth(self: *const Config) ?WebBotAuthConfig {
 
 pub fn blockPrivateNetworks(self: *const Config) bool {
     return switch (self.mode) {
+        .render => |opts| !opts.allow_private_networks or opts.block_private_networks,
         inline .serve, .fetch, .mcp, .agent => |opts| opts.block_private_networks,
         else => unreachable,
     };
@@ -685,14 +847,14 @@ pub fn blockPrivateNetworks(self: *const Config) bool {
 
 pub fn blockCidrs(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.block_cidrs,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.block_cidrs,
         else => unreachable,
     };
 }
 
 pub fn blockedUrlPatterns(self: *const Config) ?std.mem.SplitIterator(u8, .scalar) {
     const patterns = switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.block_urls,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.block_urls,
         else => unreachable,
     } orelse return null;
     return std.mem.splitScalar(u8, patterns, ',');
@@ -700,8 +862,15 @@ pub fn blockedUrlPatterns(self: *const Config) ?std.mem.SplitIterator(u8, .scala
 
 pub fn maxConnections(self: *const Config) u16 {
     return switch (self.mode) {
-        .serve => |opts| opts.cdp_max_connections,
-        .mcp => 16,
+        .serve => |opts| opts.cdp_max_connections orelse if (self.resourceProfile() == .pi) 2 else 16,
+        .render => |opts| blk: {
+            const default: u16 = if (self.resourceProfile() == .pi) 2 else 8;
+            break :blk @max(opts.max_connections orelse default, 1);
+        },
+        .mcp => |opts| blk: {
+            const default: u16 = if (self.resourceProfile() == .pi) 2 else 16;
+            break :blk @max(opts.max_connections orelse default, 1);
+        },
         .fetch, .agent => 0,
         else => unreachable,
     };
@@ -709,15 +878,115 @@ pub fn maxConnections(self: *const Config) u16 {
 
 pub fn maxPendingConnections(self: *const Config) u31 {
     return switch (self.mode) {
-        .serve => |opts| opts.cdp_max_pending_connections,
-        .mcp => 128,
+        .serve => |opts| opts.cdp_max_pending_connections orelse if (self.resourceProfile() == .pi) 16 else 128,
+        .render => if (self.resourceProfile() == .pi) 8 else 64,
+        .mcp => if (self.resourceProfile() == .pi) 16 else 128,
         else => unreachable,
     };
 }
 
+pub fn renderCorsOrigin(self: *const Config) ?[]const u8 {
+    return switch (self.mode) {
+        .render => |opts| opts.cors_origin,
+        else => null,
+    };
+}
+
+pub fn renderAuthToken(self: *const Config) ?[]const u8 {
+    return switch (self.mode) {
+        .render => |opts| opts.auth_token,
+        else => null,
+    };
+}
+
+pub fn renderMaxRequestSize(self: *const Config) usize {
+    return switch (self.mode) {
+        .render => |opts| opts.max_request_size orelse 16 * 1024,
+        else => unreachable,
+    };
+}
+
+pub fn renderMaxResponseSize(self: *const Config) usize {
+    return switch (self.mode) {
+        .render => |opts| opts.max_response_size orelse
+            if (self.resourceProfile() == .pi) 4 * 1024 * 1024 else 16 * 1024 * 1024,
+        else => unreachable,
+    };
+}
+
+pub fn renderMaxWaitMs(self: *const Config) u32 {
+    return switch (self.mode) {
+        .render => |opts| blk: {
+            const default: u32 = if (self.resourceProfile() == .pi) 10_000 else 30_000;
+            break :blk @max(opts.max_wait_ms orelse default, 1);
+        },
+        else => unreachable,
+    };
+}
+
+pub fn renderClientTimeoutMs(self: *const Config) u32 {
+    return switch (self.mode) {
+        .render => |opts| blk: {
+            const default: u32 = if (self.resourceProfile() == .pi) 15_000 else 30_000;
+            break :blk @max(opts.client_timeout_ms orelse default, 1);
+        },
+        else => unreachable,
+    };
+}
+
+pub fn mcpMaxSessions(self: *const Config) u16 {
+    const profile = self.resourceProfile();
+    const configured = switch (self.mode) {
+        .mcp => |opts| opts.max_sessions,
+        .serve, .fetch, .render, .agent => null,
+        else => unreachable,
+    };
+    const default: u16 = if (profile == .pi) 2 else 16;
+    return @max(configured orelse default, 1);
+}
+
+pub fn mcpMaxResponseSize(self: *const Config) usize {
+    const configured = switch (self.mode) {
+        .mcp => |opts| opts.max_response_size,
+        .serve, .fetch, .render, .agent => null,
+        else => unreachable,
+    };
+    return configured orelse if (self.resourceProfile() == .pi) 4 * 1024 * 1024 else 16 * 1024 * 1024;
+}
+
+pub fn mcpMaxRequestSize(self: *const Config) usize {
+    const configured = switch (self.mode) {
+        .mcp => |opts| opts.max_request_size,
+        .serve, .fetch, .render, .agent => null,
+        else => unreachable,
+    };
+    return configured orelse if (self.resourceProfile() == .pi) 4 * 1024 * 1024 else 16 * 1024 * 1024;
+}
+
 pub fn cdpMaxMessageSize(self: *const Config) u32 {
     return switch (self.mode) {
-        .serve => |opts| opts.cdp_max_message_size,
+        .serve => |opts| opts.cdp_max_message_size orelse if (self.resourceProfile() == .pi) 256 * 1024 else 1024 * 1024,
+        .mcp => if (self.resourceProfile() == .pi) 256 * 1024 else 1024 * 1024,
+        else => unreachable,
+    };
+}
+
+pub fn cdpMaxCapturedResponseSize(self: *const Config) ?usize {
+    return switch (self.mode) {
+        .serve => |opts| opts.cdp_max_captured_response_size orelse
+            if (self.resourceProfile() == .pi) 8 * 1024 * 1024 else null,
+        .mcp => if (self.resourceProfile() == .pi) 8 * 1024 * 1024 else null,
+        .fetch, .render, .agent => null,
+        else => unreachable,
+    };
+}
+
+pub fn cdpMaxCapturedResponses(self: *const Config) ?usize {
+    return switch (self.mode) {
+        .serve => |opts| opts.cdp_max_captured_responses orelse
+            if (self.resourceProfile() == .pi) 256 else null,
+        .mcp => if (self.resourceProfile() == .pi) 256 else null,
+        .fetch, .render, .agent => null,
         else => unreachable,
     };
 }
@@ -725,6 +994,7 @@ pub fn cdpMaxMessageSize(self: *const Config) u32 {
 pub fn metricsEndpointEnabled(self: *const Config) bool {
     return switch (self.mode) {
         .serve => |opts| !opts.disable_metrics,
+        .mcp => false,
         else => unreachable,
     };
 }
@@ -739,20 +1009,21 @@ pub fn dumpMetricsOnExit(self: *const Config) bool {
 pub fn cdpMaxHTTPMessageSize(self: *const Config) u14 {
     return switch (self.mode) {
         .serve => |opts| opts.cdp_max_http_message_size,
+        .mcp => 4096,
         else => unreachable,
     };
 }
 
 pub fn storageEngine(self: *const Config) ?Storage.EngineType {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.storage_engine,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.storage_engine,
         else => unreachable,
     };
 }
 
 pub fn storageSqlitePath(self: *const Config) ?[:0]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.storage_sqlite_path,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.storage_sqlite_path,
         else => unreachable,
     };
 }
@@ -761,7 +1032,7 @@ pub fn storageSqlitePath(self: *const Config) ?[:0]const u8 {
 /// if any was loaded during argument parsing. The caller takes ownership.
 pub fn customCertStore(self: *const Config) ?*crypto.X509_STORE {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| {
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| {
             const store = opts.cert.store orelse return null;
             // Validators guarantee a created store loaded something.
             lp.assert(opts.cert.count > 0, "empty custom cert store", .{});
@@ -792,26 +1063,52 @@ pub const WaitUntil = enum {
 pub const HttpHeaders = struct {
     const user_agent_base: [:0]const u8 = "Lightpanda/1.0";
 
-    const Brand = struct {
+    /// Chrome-aligned UA used when `--stealth` is set (challenge widgets
+    /// fingerprint this string against Sec-Ch-Ua / userAgentData).
+    pub const stealth_user_agent: [:0]const u8 = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+    pub const stealth_chrome_version: [:0]const u8 = "131";
+    pub const stealth_ua_full_version: [:0]const u8 = "131.0.6778.86";
+
+    pub const Brand = struct {
         brand: [:0]const u8,
         version: [:0]const u8,
     };
 
-    /// Source of truth for client-hints brand data. Both the Sec-Ch-Ua
-    /// HTTP header and navigator.userAgentData.brands derive from this
-    /// list, so the two sides cannot drift.
-    pub const brands = [_]Brand{
+    /// Default product brands (non-stealth).
+    pub const brands_default = [_]Brand{
         .{ .brand = "Lightpanda", .version = "1" },
     };
 
-    pub const sec_ch_ua: [:0]const u8 = blk: {
+    /// Chrome GREASE + Chromium + Google Chrome brands (stealth).
+    pub const brands_stealth = [_]Brand{
+        .{ .brand = "Not/A)Brand", .version = "8" },
+        .{ .brand = "Chromium", .version = stealth_chrome_version },
+        .{ .brand = "Google Chrome", .version = stealth_chrome_version },
+    };
+
+    /// Source of truth alias for non-stealth compile-time consumers.
+    pub const brands = brands_default;
+
+    pub const sec_ch_ua_default: [:0]const u8 = blk: {
         var out: [:0]const u8 = "Sec-Ch-Ua:";
-        for (brands, 0..) |b, i| {
+        for (brands_default, 0..) |b, i| {
             const sep = if (i == 0) " " else ", ";
             out = out ++ sep ++ "\"" ++ b.brand ++ "\";v=\"" ++ b.version ++ "\"";
         }
         break :blk out;
     };
+
+    pub const sec_ch_ua_stealth: [:0]const u8 = blk: {
+        var out: [:0]const u8 = "Sec-Ch-Ua:";
+        for (brands_stealth, 0..) |b, i| {
+            const sep = if (i == 0) " " else ", ";
+            out = out ++ sep ++ "\"" ++ b.brand ++ "\";v=\"" ++ b.version ++ "\"";
+        }
+        break :blk out;
+    };
+
+    // Back-compat name: non-stealth Sec-Ch-Ua.
+    pub const sec_ch_ua: [:0]const u8 = sec_ch_ua_default;
 
     // Some bot-protection frontends (e.g. Akamai on canada.ca) RST the HTTP/2
     // stream when a client sends Accept-Encoding without Accept-Language,
@@ -824,20 +1121,32 @@ pub const HttpHeaders = struct {
 
     user_agent: [:0]const u8, // User agent value (e.g. "Lightpanda/1.0")
     user_agent_header: [:0]const u8,
+    /// Sec-Ch-Ua header line (includes "Sec-Ch-Ua: " prefix).
+    sec_ch_ua_header: [:0]const u8,
+    /// Brand list for navigator.userAgentData (same source as Sec-Ch-Ua).
+    brand_list: []const Brand,
+    stealth: bool = false,
 
     proxy_bearer_header: ?[:0]const u8,
 
     pub fn init(allocator: Allocator, config: *const Config) !HttpHeaders {
+        const is_stealth = config.stealth();
+
         const user_agent: [:0]const u8 = if (config.userAgent()) |ua|
             try allocator.dupeZ(u8, ua)
+        else if (is_stealth)
+            stealth_user_agent
         else if (config.userAgentSuffix()) |suffix|
             try std.fmt.allocPrintSentinel(allocator, "{s} {s}", .{ user_agent_base, suffix }, 0)
         else
             user_agent_base;
-        errdefer if (config.userAgent() != null or config.userAgentSuffix() != null) allocator.free(user_agent);
+        errdefer if (config.userAgent() != null or (!is_stealth and config.userAgentSuffix() != null)) allocator.free(user_agent);
 
         const user_agent_header = try std.fmt.allocPrintSentinel(allocator, "User-Agent: {s}", .{user_agent}, 0);
         errdefer allocator.free(user_agent_header);
+
+        const brand_list: []const Brand = if (is_stealth) &brands_stealth else &brands_default;
+        const sec_ch_ua_header: [:0]const u8 = if (is_stealth) sec_ch_ua_stealth else sec_ch_ua_default;
 
         const proxy_bearer_header: ?[:0]const u8 = if (config.proxyBearerToken()) |token|
             try std.fmt.allocPrintSentinel(allocator, "Proxy-Authorization: Bearer {s}", .{token}, 0)
@@ -847,6 +1156,9 @@ pub const HttpHeaders = struct {
         return .{
             .user_agent = user_agent,
             .user_agent_header = user_agent_header,
+            .sec_ch_ua_header = sec_ch_ua_header,
+            .brand_list = brand_list,
+            .stealth = is_stealth,
             .proxy_bearer_header = proxy_bearer_header,
         };
     }
@@ -856,7 +1168,7 @@ pub const HttpHeaders = struct {
             allocator.free(hdr);
         }
         allocator.free(self.user_agent_header);
-        if (self.user_agent.ptr != user_agent_base.ptr) {
+        if (self.user_agent.ptr != user_agent_base.ptr and self.user_agent.ptr != stealth_user_agent.ptr) {
             allocator.free(self.user_agent);
         }
     }
@@ -879,7 +1191,7 @@ pub fn printUsageAndExit(self: *const Config, allocator: Allocator, help_for: Ru
             , .{Help.general});
             break :text try std.fmt.allocPrint(allocator, template, .{exec_name});
         },
-        inline .fetch, .serve, .mcp, .agent, .run => |tag| text: {
+        inline .fetch, .render, .serve, .mcp, .agent, .run => |tag| text: {
             const template = comptimePrint(
                 \\{s}
                 \\
@@ -995,6 +1307,193 @@ test "Config: blockedUrlPatterns splits comma-separated patterns" {
     try std.testing.expectEqualStrings("*doubleclick*", patterns.next().?);
     try std.testing.expectEqualStrings("*://*/*.png", patterns.next().?);
     try std.testing.expectEqual(null, patterns.next());
+}
+
+test "Config: pi resource profile bounds expensive defaults" {
+    var config = try Config.init(std.testing.allocator, "test", .{ .serve = .{
+        .resource_profile = .pi,
+    } });
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(ResourceProfile.pi, config.resourceProfile());
+    try std.testing.expect(config.disableSubframes());
+    try std.testing.expect(config.disableWorkers());
+    try std.testing.expectEqual(@as(?u32, 10_000), config.watchdogMs());
+    try std.testing.expectEqual(@as(?u32, 64), config.v8MaxHeapMb());
+    try std.testing.expectEqual(@as(u8, 1), config.v8ThreadPoolSize());
+    try std.testing.expect(!config.v8IdleTasks());
+    try std.testing.expect(!config.speculativePreloading());
+    try std.testing.expectEqual(@as(u8, 8), config.httpMaxConcurrent());
+    try std.testing.expectEqual(@as(u8, 2), config.httpMaxHostOpen());
+    try std.testing.expectEqual(@as(?usize, 32 * 1024 * 1024), config.httpMaxResponseSize());
+    try std.testing.expectEqual(@as(u8, 2), config.wsMaxConcurrent());
+    try std.testing.expectEqual(@as(u16, 2), config.maxConnections());
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), config.mcpMaxResponseSize());
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), config.mcpMaxRequestSize());
+    try std.testing.expectEqual(@as(u31, 16), config.maxPendingConnections());
+    try std.testing.expectEqual(@as(u32, 256 * 1024), config.cdpMaxMessageSize());
+    try std.testing.expectEqual(@as(?usize, 8 * 1024 * 1024), config.cdpMaxCapturedResponseSize());
+    try std.testing.expectEqual(@as(?usize, 256), config.cdpMaxCapturedResponses());
+}
+
+test "Config: explicit limits override pi profile defaults" {
+    var config = try Config.init(std.testing.allocator, "test", .{ .serve = .{
+        .resource_profile = .pi,
+        .http_max_concurrent = 3,
+        .http_max_host_open = 1,
+        .http_max_response_size = 4096,
+        .ws_max_concurrent = 1,
+        .v8_max_heap_mb = 96,
+        .v8_thread_pool_size = 2,
+        .cdp_max_connections = 4,
+        .cdp_max_pending_connections = 8,
+        .cdp_max_message_size = 512 * 1024,
+        .cdp_max_captured_response_size = 12 * 1024 * 1024,
+        .cdp_max_captured_responses = 300,
+    } });
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u8, 3), config.httpMaxConcurrent());
+    try std.testing.expectEqual(@as(u8, 1), config.httpMaxHostOpen());
+    try std.testing.expectEqual(@as(?usize, 4096), config.httpMaxResponseSize());
+    try std.testing.expectEqual(@as(u8, 1), config.wsMaxConcurrent());
+    try std.testing.expectEqual(@as(?u32, 96), config.v8MaxHeapMb());
+    try std.testing.expectEqual(@as(u8, 2), config.v8ThreadPoolSize());
+    try std.testing.expectEqual(@as(u16, 4), config.maxConnections());
+    try std.testing.expectEqual(@as(u31, 8), config.maxPendingConnections());
+    try std.testing.expectEqual(@as(u32, 512 * 1024), config.cdpMaxMessageSize());
+    try std.testing.expectEqual(@as(?usize, 12 * 1024 * 1024), config.cdpMaxCapturedResponseSize());
+    try std.testing.expectEqual(@as(?usize, 300), config.cdpMaxCapturedResponses());
+}
+
+test "Config: pi resource profile caps MCP isolates" {
+    var config = try Config.init(std.testing.allocator, "test", .{ .mcp = .{
+        .resource_profile = .pi,
+    } });
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 2), config.mcpMaxSessions());
+    try std.testing.expectEqual(@as(u16, 2), config.maxConnections());
+    try std.testing.expectEqual(@as(u32, 256 * 1024), config.cdpMaxMessageSize());
+    try std.testing.expectEqual(@as(u14, 4096), config.cdpMaxHTTPMessageSize());
+    try std.testing.expect(!config.metricsEndpointEnabled());
+    try std.testing.expectEqual(@as(?usize, 8 * 1024 * 1024), config.cdpMaxCapturedResponseSize());
+    try std.testing.expectEqual(@as(?usize, 256), config.cdpMaxCapturedResponses());
+
+    config.mode.mcp.max_sessions = 5;
+    config.mode.mcp.max_connections = 4;
+    config.mode.mcp.max_request_size = 5 * 1024 * 1024;
+    config.mode.mcp.max_response_size = 6 * 1024 * 1024;
+    try std.testing.expectEqual(@as(u16, 5), config.mcpMaxSessions());
+    try std.testing.expectEqual(@as(u16, 4), config.maxConnections());
+    try std.testing.expectEqual(@as(usize, 6 * 1024 * 1024), config.mcpMaxResponseSize());
+    try std.testing.expectEqual(@as(usize, 5 * 1024 * 1024), config.mcpMaxRequestSize());
+
+    config.mode.mcp.max_sessions = 0;
+    config.mode.mcp.max_connections = 0;
+    try std.testing.expectEqual(@as(u16, 1), config.mcpMaxSessions());
+    try std.testing.expectEqual(@as(u16, 1), config.maxConnections());
+}
+
+test "Config: render handoff defaults are Pi-class and bounded" {
+    var config = try Config.init(std.testing.allocator, "test", .{ .render = .{} });
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expect(config.clientSideRendering());
+    try std.testing.expectEqual(ResourceProfile.pi, config.resourceProfile());
+    try std.testing.expectEqual(@as(?u32, 64), config.v8MaxHeapMb());
+    try std.testing.expectEqual(@as(u16, 2), config.maxConnections());
+    try std.testing.expectEqual(@as(u31, 8), config.maxPendingConnections());
+    try std.testing.expectEqual(@as(usize, 16 * 1024), config.renderMaxRequestSize());
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), config.renderMaxResponseSize());
+    try std.testing.expectEqual(@as(u32, 10_000), config.renderMaxWaitMs());
+    try std.testing.expectEqual(@as(u32, 15_000), config.renderClientTimeoutMs());
+    try std.testing.expect(config.blockPrivateNetworks());
+    try std.testing.expect(config.renderAuthToken() == null);
+
+    config.mode.render.resource_profile = .standard;
+    config.mode.render.max_connections = 3;
+    config.mode.render.max_response_size = 1234;
+    config.mode.render.max_wait_ms = 4321;
+    config.mode.render.client_timeout_ms = 7654;
+    config.mode.render.allow_private_networks = true;
+    config.mode.render.auth_token = "0123456789abcdef";
+    try std.testing.expectEqual(ResourceProfile.standard, config.resourceProfile());
+    try std.testing.expectEqual(@as(u16, 3), config.maxConnections());
+    try std.testing.expectEqual(@as(usize, 1234), config.renderMaxResponseSize());
+    try std.testing.expectEqual(@as(u32, 4321), config.renderMaxWaitMs());
+    try std.testing.expectEqual(@as(u32, 7654), config.renderClientTimeoutMs());
+    try std.testing.expect(!config.blockPrivateNetworks());
+    try std.testing.expectEqualStrings("0123456789abcdef", config.renderAuthToken().?);
+}
+
+test "Config: CLI parses pi profile and explicit resource limits" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        const argv = [_][*:0]const u8{
+            "lightpanda",
+            "serve",
+            "--resource-profile",
+            "pi",
+            "--cdp-max-connections",
+            "3",
+            "--cdp-max-captured-responses",
+            "99",
+        };
+        var config = try parseArgs(std.testing.allocator, .{ .vector = &argv });
+        defer config.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(ResourceProfile.pi, config.resourceProfile());
+        try std.testing.expectEqual(@as(u16, 3), config.maxConnections());
+        try std.testing.expectEqual(@as(?usize, 99), config.cdpMaxCapturedResponses());
+    }
+}
+
+test "Config: CLI parses MCP caps" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        const argv = [_][*:0]const u8{
+            "lightpanda",
+            "mcp",
+            "--resource-profile",
+            "pi",
+            "--max-connections",
+            "4",
+            "--max-request-size",
+            "5242880",
+            "--max-response-size",
+            "6291456",
+            "--max-sessions",
+            "5",
+        };
+        var config = try parseArgs(std.testing.allocator, .{ .vector = &argv });
+        defer config.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(ResourceProfile.pi, config.resourceProfile());
+        try std.testing.expectEqual(@as(u16, 4), config.maxConnections());
+        try std.testing.expectEqual(@as(usize, 6 * 1024 * 1024), config.mcpMaxResponseSize());
+        try std.testing.expectEqual(@as(usize, 5 * 1024 * 1024), config.mcpMaxRequestSize());
+        try std.testing.expectEqual(@as(u16, 5), config.mcpMaxSessions());
+    }
+}
+
+test "Config: CLI rejects an invalid resource profile" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        const argv = [_][*:0]const u8{
+            "lightpanda",
+            "serve",
+            "--resource-profile",
+            "tiny",
+        };
+        try std.testing.expectError(
+            error.InvalidArgument,
+            parseArgs(std.testing.allocator, .{ .vector = &argv }),
+        );
+    }
 }
 
 pub fn validateUserAgent(ua: []const u8) !void {

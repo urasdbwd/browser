@@ -100,15 +100,17 @@ pub fn getSheet(self: *Style, frame: *Frame) !?*CSSStyleSheet {
     const owner = self.asNode().ownerDocument(frame) orelse frame.document;
     const sheets = try owner.getStyleSheets(frame);
     try sheets.add(sheet, frame);
+    frame._style_manager.sheetModified();
 
     return sheet;
 }
 
 pub fn styleAddedCallback(self: *Style, frame: *Frame) !void {
-    // Force stylesheet initialization so rules are parsed immediately
-    if (self.getSheet(frame) catch null) |_| {
-        // Notify StyleManager about the new stylesheet
-        frame._style_manager.sheetModified();
+    // A render handoff keeps the raw <style> for the real client browser, so
+    // eagerly building a second server-side CSSOM is wasted work. Accessing
+    // style.sheet still initializes it on demand for scripts that need CSSOM.
+    if (!frame._session.browser.app.config.clientSideRendering()) {
+        _ = self.getSheet(frame) catch null;
     }
 
     // if we're planning on navigating to another frame, don't trigger load event.

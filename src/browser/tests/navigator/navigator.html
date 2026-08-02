@@ -101,6 +101,41 @@
   testing.expectEqual(8, navigator.deviceMemory);
 </script>
 
+<script id=plugins_mimeTypes>
+{
+  testing.expectEqual(true, navigator.plugins.length >= 3);
+  testing.expectEqual(true, navigator.plugins[0] instanceof Plugin);
+  testing.expectEqual(true, navigator.plugins[0].name.length > 0);
+  testing.expectEqual(true, /PDF/i.test(navigator.plugins[0].name));
+  // Iterable for CreepJS-style walks
+  let count = 0;
+  for (const p of navigator.plugins) {
+    testing.expectEqual(true, p.name.length > 0);
+    count++;
+  }
+  testing.expectEqual(navigator.plugins.length, count);
+  testing.expectEqual(true, navigator.mimeTypes.length >= 1);
+  testing.expectEqual(true, navigator.mimeTypes[0] instanceof MimeType);
+  testing.expectEqual("application/pdf", navigator.mimeTypes.namedItem("application/pdf").type);
+  testing.expectEqual(true, navigator.mimeTypes[0].enabledPlugin instanceof Plugin);
+}
+</script>
+
+<script id=notification_permissions_consistency type=module>
+{
+  const state = await testing.async();
+  const status = await navigator.permissions.query({ name: "notifications" });
+  state.resolve();
+  await state.done(() => {
+    // Notification.permission "default" maps to permissions "prompt".
+    testing.expectEqual("default", Notification.permission);
+    testing.expectEqual("prompt", status.state);
+    // Classic headless bug is denied/prompt mismatch — neither here.
+    testing.expectEqual(false, Notification.permission === "denied" && status.state === "prompt");
+  });
+}
+</script>
+
 <script id=userAgentData>
   testing.expectEqual(true, navigator.userAgentData !== undefined);
   testing.expectEqual(false, navigator.userAgentData.mobile);

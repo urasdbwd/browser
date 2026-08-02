@@ -109,6 +109,51 @@ You can use `--dump markdown` to convert directly into markdown.
 `--wait-until`, `--wait-ms`, `--wait-selector` and `--wait-script` are
 available to adjust waiting time before dump.
 
+### Render visually in the client browser
+
+Lightpanda has no native pixel renderer. The `render` command keeps it that
+way: Lightpanda executes page JavaScript and hands a script-free DOM snapshot
+to an attachable browser library; the user's real browser performs CSS, image
+and font decoding, layout, paint, compositing and rasterization.
+
+```console
+./lightpanda render --port 9223 --cors-origin http://localhost:5173
+```
+
+The command defaults to the low-memory `pi` resource profile even on desktop
+hardware: one V8 isolate, a 64 MiB V8 heap, at most two connections and a
+4 MiB uncompressed snapshot cap. Dynamic HTML uses negotiated Brotli quality 0
+or gzip level 1 only when the body is large and compressible; small bodies stay
+uncompressed. Browsers decompress the HTTP response automatically. Outbound
+private, loopback and link-local addresses are blocked by default; use
+`--allow-private-networks` only for a trusted local target.
+
+```html
+<div id="preview" style="height: 720px"></div>
+<script type="module">
+  import { attachLightpandaRenderer } from
+    "http://127.0.0.1:9223/lightpanda-renderer.js";
+
+  const renderer = attachLightpandaRenderer("#preview");
+  await renderer.render("https://example.com", { waitUntil: "done" });
+</script>
+```
+
+The library uses a Blob URL inside an opaque, empty-sandbox iframe. Page
+scripts cannot execute a second time, and the HTML never enters the parent via
+`innerHTML`. It requests a credentialless iframe where supported and sends no
+referrer. Set `requireCredentialless: true` to fail closed on browsers without
+that feature; otherwise sandboxed subresources may still use site cookies on
+older browsers.
+
+Set an exact `--cors-origin` for browser use. A non-loopback bind also requires
+an `--auth-token` of at least 16 bytes; pass the same value as the library's
+`token` option. The host page's CSP must allow the endpoint in `script-src` and
+`connect-src`, plus `blob:` in `frame-src`. A snapshot transfers DOM and
+attributes, not a JavaScript heap, event listeners, canvas pixels or the
+original site's origin, so some origin-gated fonts/media cannot be reproduced
+perfectly without an origin proxy.
+
 ### Start a CDP server
 
 ```console
@@ -266,7 +311,7 @@ NOTE: There are hundreds of Web APIs. Developing a browser (even just for headle
 
 ### Prerequisites
 
-Lightpanda is written with [Zig](https://ziglang.org/) `0.15.2`. You have to
+Lightpanda is written with [Zig](https://ziglang.org/) `0.16.0`. You have to
 install it with the right version in order to build the project.
 
 Lightpanda also depends on
@@ -300,6 +345,42 @@ You can build the entire browser with `make build` or `make build-dev` for debug
 env.
 
 But you can directly use the zig command: `zig build run`.
+
+### Pi-class low-resource profile
+
+To build an artifact tuned for a Pi-class memory and CPU budget on the current
+platform, download the matching prebuilt V8 archive and build with bounded
+parallelism:
+
+```bash
+make build-pi
+./zig-out/bin/lightpanda serve
+```
+
+`build-pi` uses `ReleaseSmall` and makes the `pi` resource profile the binary's
+default. The name describes its resource budget, not a requirement to run on
+Raspberry Pi hardware. A regular build can select the same runtime limits
+explicitly:
+
+```bash
+./zig-out/bin/lightpanda serve --resource-profile pi
+```
+
+The profile caps each V8 heap at 64 MiB, uses one V8 background worker, disables
+V8 idle tasks, limits HTTP/CDP/WebSocket concurrency and response sizes, and
+skips iframe and Web Worker loading plus speculative script preloads. It also
+reduces pooled arena retention from roughly 6 MiB to 448 KiB. Explicit numeric
+limits override the profile. CDP response-body capture is capped at 8 MiB and
+256 entries per page lifecycle. MCP is capped at two V8-backed sessions, two
+simultaneous HTTP connections and 4 MiB request/response buffers per connection.
+A CDP client can opt loading features back in per session with
+`LP.configureLoading`.
+
+Lightpanda is headless: it does not rasterize pixels or produce screenshots on
+the server. DOM and JavaScript run in the browser process; page data is
+serialized only when a CDP/MCP/fetch/render client asks for it. Render-handoff
+mode also skips eager inline CSSOM construction and lets the attached client
+browser do presentation work.
 
 #### Embed v8 snapshot
 

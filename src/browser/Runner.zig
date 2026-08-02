@@ -26,6 +26,7 @@ const HttpClient = @import("../network/HttpClient.zig");
 
 const Node = @import("webapi/Node.zig");
 const Selector = @import("webapi/selector/Selector.zig");
+const Turnstile = @import("Turnstile.zig");
 
 const log = lp.log;
 
@@ -63,8 +64,9 @@ const WaitForFrameOpts = struct {
 pub fn waitForFrame(self: *Runner, frame_id: u32, timeout_ms: u32, opts: WaitForFrameOpts) !void {
     const condition = WaitCondition{ .frame_id = frame_id, .until = opts.until };
     var conditions = [_]WaitCondition{condition};
-    _ = try self._wait(false, timeout_ms, &conditions);
+    const result = try self._wait(false, timeout_ms, &conditions);
     try firstConditionError(&conditions);
+    if (result == .timeout) return error.Timeout;
 }
 
 pub fn waitForFrameCDP(self: *Runner, frame_id: u32, timeout_ms: u32, until: lp.Config.WaitUntil) !void {
@@ -96,12 +98,13 @@ pub fn waitForAll(self: *Runner, timeout_ms: u32, opts: WaitForFrameOpts) !void 
             i += 1;
         }
     }
-    _ = try self._wait(false, timeout_ms, conditions);
+    const result = try self._wait(false, timeout_ms, conditions);
     try firstConditionError(conditions);
+    if (result == .timeout) return error.Timeout;
 }
 
 pub fn wait(self: *Runner, timeout_ms: u32, conditions: []WaitCondition) !void {
-    try self._wait(false, timeout_ms, conditions);
+    if (try self._wait(false, timeout_ms, conditions) == .timeout) return error.Timeout;
 }
 
 pub const WaitResult = enum { completed, timeout };
@@ -454,6 +457,73 @@ fn firstConditionError(conditions: []const WaitCondition) !void {
     }
 }
 
+/// Poll Turnstile widgets: wait for passive (always-pass) tokens first, then
+/// click managed interactive controls. Soft-fail if no token by timeout.
+pub fn solveTurnstile(self: *Runner, timeout_ms: u32) !void {
+    const session = self.session;
+    const timer: std.Io.Timestamp = .now(lp.io, .boot);
+    var last_click_ms: u32 = 0;
+    var click_count: u32 = 0;
+    // Let always-pass / non-interactive widgets resolve before we start clicking.
+    const passive_ms: u32 = @min(8_000, timeout_ms / 3);
+    const click_interval_ms: u32 = 1_500;
+    const max_clicks: u32 = 12;
+
+    while (true) {
+        if (session.isCancelled()) {
+            return error.Cancelled;
+        }
+
+        const elapsed: u32 = @intCast(timer.untilNow(lp.io, .boot).toMilliseconds());
+        if (elapsed >= timeout_ms) {
+            return;
+        }
+
+        // Always promote any existing response into title / detect token.
+        if (Turnstile.hasToken(session)) {
+            log.info(.browser, "turnstile token ready", .{ .elapsed_ms = elapsed });
+            return;
+        }
+
+        // After passive window, click challenge UI occasionally (not every tick).
+        if (elapsed >= passive_ms and click_count < max_clicks) {
+            if (elapsed -| last_click_ms >= click_interval_ms) {
+                // First interactive clicks stay inside challenge iframes only
+                // (aggressive=false). Later ones also tap the host iframe.
+                const aggressive = click_count >= 3;
+                if (Turnstile.hasWidget(session)) {
+                    Turnstile.interact(session, aggressive);
+                    click_count += 1;
+                    last_click_ms = elapsed;
+                    log.debug(.browser, "turnstile interact", .{
+                        .click = click_count,
+                        .aggressive = aggressive,
+                    });
+                }
+            }
+        }
+
+        // Keep the event loop and challenge network alive.
+        for (session.pages.items) |p| {
+            if (p.replacement != null) continue;
+            const remaining = timeout_ms -| elapsed;
+            switch (try self.tickForFrame(p.frame._frame_id, @min(remaining, 250), .{ .until = .done })) {
+                .done => {
+                    lp.io.sleep(.fromMilliseconds(@intCast(@min(remaining, 100))), .awake) catch {};
+                },
+                .ok => |ms| {
+                    if (ms > 0) {
+                        lp.io.sleep(.fromMilliseconds(@intCast(@min(ms, 80))), .awake) catch {};
+                    }
+                },
+            }
+            break;
+        } else {
+            lp.io.sleep(.fromMilliseconds(80), .awake) catch {};
+        }
+    }
+}
+
 fn hasRunnablePage(session: *Session) bool {
     for (session.pages.items) |page| {
         switch (page.frame._parse_state) {
@@ -495,6 +565,18 @@ test "Runner: waitForScript" {
 
     var runner = page.session.runner(.{});
     try runner.waitForScript(page.frame_id, "document.querySelector('#sel1')", 10);
+}
+
+test "Runner: void wait APIs surface timeout" {
+    const page = try testing.pageTest("runner/iframe_lazy.html", .{ .wait_until_done = false });
+    defer page.close();
+
+    var runner = page.session.runner(.{});
+    try testing.expectError(error.Timeout, runner.waitForFrame(page.frame_id, 1, .{ .until = .done }));
+    try testing.expectError(error.Timeout, runner.waitForAll(1, .{ .until = .done }));
+
+    var conditions = [_]WaitCondition{.{ .frame_id = page.frame_id }};
+    try testing.expectError(error.Timeout, runner.wait(1, &conditions));
 }
 
 test "Runner: networkidle notifies child frames" {

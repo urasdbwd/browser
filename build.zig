@@ -42,6 +42,16 @@ pub fn build(b: *Build) !void {
     const prebuilt_v8_path = b.option([]const u8, "prebuilt_v8_path", "Path to prebuilt libc_v8.a");
     const snapshot_path = b.option([]const u8, "snapshot_path", "Path to v8 snapshot");
     const wpt_extensions = b.option(bool, "wpt_extensions", "Extend WebAPI with WPT driver behavior") orelse false;
+    const low_resource_default = b.option(
+        bool,
+        "low_resource_default",
+        "Use Raspberry Pi resource limits unless the CLI selects another profile",
+    ) orelse false;
+    const skip_fmt = b.option(
+        bool,
+        "skip_fmt",
+        "Skip the formatting gate (useful for cross-platform bind mounts)",
+    ) orelse false;
 
     const version = resolveVersion(b);
     std.debug.print("Lightpanda {f}\n", .{version});
@@ -54,6 +64,7 @@ pub fn build(b: *Build) !void {
     opts.addOption([]const u8, "version_encoded", version_encoded);
     opts.addOption(?[]const u8, "snapshot_path", snapshot_path);
     opts.addOption(bool, "wpt_extensions", wpt_extensions);
+    opts.addOption(bool, "low_resource_default", low_resource_default);
 
     const enable_tsan = b.option(bool, "tsan", "Enable Thread Sanitizer") orelse false;
     const enable_asan = b.option(bool, "asan", "Enable Address Sanitizer") orelse false;
@@ -81,7 +92,7 @@ pub fn build(b: *Build) !void {
         fmt_step.dependOn(&fmt.step);
 
         // Set default behavior
-        b.default_step.dependOn(fmt_step);
+        if (!skip_fmt) b.default_step.dependOn(fmt_step);
 
         try linkV8(b, mod, enable_asan, enable_tsan, prebuilt_v8_path);
         try linkCurl(b, mod, enable_tsan);
@@ -354,6 +365,24 @@ fn linkCurl(b: *Build, mod: *Build.Module, is_tsan: bool) !void {
 
     const brotli = buildBrotli(b, target, mod.optimize.?, is_tsan);
     for (brotli) |lib| curl.root_module.linkLibrary(lib);
+    for (brotli) |lib| mod.linkLibrary(lib);
+
+    const brotli_dep = b.dependency("brotli", .{});
+    const brotli_encode_translate = b.addTranslateC(.{
+        .root_source_file = brotli_dep.path("c/include/brotli/encode.h"),
+        .target = target,
+        .optimize = mod.optimize.?,
+    });
+    brotli_encode_translate.addIncludePath(brotli_dep.path("c/include"));
+    mod.addImport("brotli_encode", brotli_encode_translate.createModule());
+
+    const brotli_decode_translate = b.addTranslateC(.{
+        .root_source_file = brotli_dep.path("c/include/brotli/decode.h"),
+        .target = target,
+        .optimize = mod.optimize.?,
+    });
+    brotli_decode_translate.addIncludePath(brotli_dep.path("c/include"));
+    mod.addImport("brotli_decode", brotli_decode_translate.createModule());
 
     const nghttp2 = buildNghttp2(b, target, mod.optimize.?, is_tsan);
     curl.root_module.linkLibrary(nghttp2);
@@ -407,34 +436,50 @@ fn buildZlib(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.Opti
 fn buildBrotli(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, is_tsan: bool) [3]*Build.Step.Compile {
     const dep = b.dependency("brotli", .{});
 
-    const mod = b.createModule(.{
+    const common_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .link_libc = true,
         .sanitize_thread = is_tsan,
     });
-    mod.addIncludePath(dep.path("c/include"));
+    common_mod.addIncludePath(dep.path("c/include"));
 
-    const brotlicmn = b.addLibrary(.{ .name = "brotlicommon", .root_module = mod });
-    const brotlidec = b.addLibrary(.{ .name = "brotlidec", .root_module = mod });
-    const brotlienc = b.addLibrary(.{ .name = "brotlienc", .root_module = mod });
+    const brotlicmn = b.addLibrary(.{ .name = "brotlicommon", .root_module = common_mod });
 
     brotlicmn.installHeadersDirectory(dep.path("c/include/brotli"), "brotli", .{});
-    mod.addCSourceFiles(.{
+    common_mod.addCSourceFiles(.{
         .root = dep.path("c/common"),
         .files = &.{
             "transform.c",  "shared_dictionary.c", "platform.c",
             "dictionary.c", "context.c",           "constants.c",
         },
     });
-    mod.addCSourceFiles(.{
+
+    const dec_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .sanitize_thread = is_tsan,
+    });
+    dec_mod.addIncludePath(dep.path("c/include"));
+    dec_mod.addCSourceFiles(.{
         .root = dep.path("c/dec"),
         .files = &.{
             "bit_reader.c", "decode.c", "huffman.c",
             "prefix.c",     "state.c",  "static_init.c",
         },
     });
-    mod.addCSourceFiles(.{
+    const brotlidec = b.addLibrary(.{ .name = "brotlidec", .root_module = dec_mod });
+    dec_mod.linkLibrary(brotlicmn);
+
+    const enc_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .sanitize_thread = is_tsan,
+    });
+    enc_mod.addIncludePath(dep.path("c/include"));
+    enc_mod.addCSourceFiles(.{
         .root = dep.path("c/enc"),
         .files = &.{
             "backward_references.c",        "backward_references_hq.c", "bit_cost.c",
@@ -447,6 +492,8 @@ fn buildBrotli(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.Op
             "static_init.c",                "utf8_util.c",
         },
     });
+    const brotlienc = b.addLibrary(.{ .name = "brotlienc", .root_module = enc_mod });
+    enc_mod.linkLibrary(brotlicmn);
 
     return .{ brotlicmn, brotlidec, brotlienc };
 }

@@ -126,11 +126,15 @@ pub fn sendPong(self: *Connection, data: []const u8) !void {
     if (data.len == 0) {
         return self.send(&WS.EMPTY_PONG);
     }
+    // RFC 6455 limits control-frame payloads to 125 bytes. send() completes
+    // synchronously, so frame pongs on the stack instead of growing and then
+    // retaining the per-connection send arena for a <=127-byte write.
+    lp.assert(data.len <= 125, "Connection.pong payload", .{ .len = data.len });
     var header_buf: [10]u8 = undefined;
     const header = websocketHeader(&header_buf, .pong, data.len);
 
-    const allocator = self.send_arena.allocator();
-    const framed = try allocator.alloc(u8, header.len + data.len);
+    var framed_buf: [127]u8 = undefined;
+    const framed = framed_buf[0 .. header.len + data.len];
     @memcpy(framed[0..header.len], header);
     @memcpy(framed[header.len..], data);
     return self.send(framed);

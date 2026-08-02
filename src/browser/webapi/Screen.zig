@@ -55,6 +55,12 @@ pub fn getHeight(_: *const Screen, frame: *Frame) u32 {
     return frame._page.getViewport().height;
 }
 
+pub fn getAvailHeight(_: *const Screen, frame: *Frame) u32 {
+    const h = frame._page.getViewport().height;
+    // ~48px Windows taskbar when height is large enough.
+    return if (h > 100) h - 40 else h;
+}
+
 pub const JsApi = struct {
     pub const bridge = js.Bridge(Screen);
 
@@ -67,7 +73,8 @@ pub const JsApi = struct {
     pub const width = bridge.accessor(Screen.getWidth, null, .{});
     pub const height = bridge.accessor(Screen.getHeight, null, .{});
     pub const availWidth = bridge.accessor(Screen.getWidth, null, .{});
-    pub const availHeight = bridge.property(1040, .{ .template = false });
+    // Taskbar-ish inset from height (CloakBrowser --fingerprint-taskbar-height spirit).
+    pub const availHeight = bridge.accessor(getAvailHeight, null, .{});
     pub const colorDepth = bridge.property(24, .{ .template = false });
     pub const pixelDepth = bridge.property(24, .{ .template = false });
     pub const orientation = bridge.accessor(Screen.getOrientation, null, .{});

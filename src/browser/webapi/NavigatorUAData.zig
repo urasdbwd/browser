@@ -22,75 +22,102 @@ const Config = @import("../../Config.zig");
 const js = @import("../js/js.zig");
 const Execution = js.Execution;
 
-const NavigatorUAData = @This();
-
-_pad: bool = false,
-
 const Brand = struct {
     brand: []const u8,
     version: []const u8,
 };
 
-pub fn getBrands(_: *const NavigatorUAData) []const Brand {
-    return brandList();
+_pad: bool = false,
+
+pub fn getBrands(_: *const @This(), exec: *const Execution) []const Brand {
+    return brandList(exec);
 }
 
-pub fn getMobile(_: *const NavigatorUAData) bool {
+pub fn getMobile(_: *const @This()) bool {
     return false;
 }
 
-pub fn getPlatform(_: *const NavigatorUAData) []const u8 {
-    return uaPlatform();
+pub fn getPlatform(_: *const @This(), exec: *const Execution) []const u8 {
+    return uaPlatform(exec);
 }
 
-pub fn toJSON(_: *const NavigatorUAData) struct {
+pub fn toJSON(_: *const @This(), exec: *const Execution) struct {
     brands: []const Brand,
     mobile: bool,
     platform: []const u8,
 } {
     return .{
         .mobile = false,
-        .brands = brandList(),
-        .platform = uaPlatform(),
+        .brands = brandList(exec),
+        .platform = uaPlatform(exec),
     };
 }
 
-pub fn getHighEntropyValues(_: *const NavigatorUAData, hints: []const []const u8, exec: *const Execution) !js.Promise {
-    // This should always return `brands` + `mobile` + `platform` and then whatever
-    // "hints" field is requested (assuming the browser has permission), but it's
-    // also valid to just return everything.
-
+pub fn getHighEntropyValues(_: *const @This(), hints: []const []const u8, exec: *const Execution) !js.Promise {
     _ = hints;
 
+    const stealth = exec.session.browser.app.config.http_headers.stealth;
+    const brands = brandList(exec);
+    const full_ver: []const u8 = if (stealth)
+        Config.HttpHeaders.stealth_ua_full_version
+    else
+        "1.0.0.0";
+    const platform_version: []const u8 = if (stealth)
+        "15.0.0"
+    else
+        "";
+
     return exec.js.local.?.resolvePromise(.{
-        .brands = brandList(),
+        .brands = brands,
         .mobile = false,
-        .platform = uaPlatform(),
+        .platform = uaPlatform(exec),
         .architecture = uaArchitecture(),
         .bitness = uaBitness(),
         .model = "",
-        .platformVersion = "",
-        .uaFullVersion = "1.0.0.0",
-        .fullVersionList = brandList(),
+        .platformVersion = platform_version,
+        .uaFullVersion = full_ver,
+        .fullVersionList = brands,
         .wow64 = false,
         .formFactor = [_][]const u8{"Desktop"},
     });
 }
 
-fn brandList() []const Brand {
-    const out = comptime blk: {
-        const src = &Config.HttpHeaders.brands;
-        var arr: [src.len]Brand = undefined;
-        for (src, 0..) |b, i| {
-            arr[i] = .{ .brand = b.brand, .version = b.version };
-        }
-        const final = arr;
-        break :blk final;
-    };
-    return &out;
+fn brandList(exec: *const Execution) []const Brand {
+    return stableBrandSlice(exec.session.browser.app.config.http_headers.stealth);
 }
 
-fn uaPlatform() []const u8 {
+fn stableBrandSlice(stealth: bool) []const Brand {
+    const S = struct {
+        var default_done = false;
+        var stealth_done = false;
+        var default_brands: [Config.HttpHeaders.brands_default.len]Brand = undefined;
+        var stealth_brands: [Config.HttpHeaders.brands_stealth.len]Brand = undefined;
+    };
+    if (stealth) {
+        if (!S.stealth_done) {
+            for (Config.HttpHeaders.brands_stealth, 0..) |b, i| {
+                S.stealth_brands[i] = .{ .brand = b.brand, .version = b.version };
+            }
+            S.stealth_done = true;
+        }
+        return S.stealth_brands[0..];
+    }
+    if (!S.default_done) {
+        for (Config.HttpHeaders.brands_default, 0..) |b, i| {
+            S.default_brands[i] = .{ .brand = b.brand, .version = b.version };
+        }
+        S.default_done = true;
+    }
+    return S.default_brands[0..];
+}
+
+fn uaPlatform(exec: *const Execution) []const u8 {
+    const cfg = exec.session.browser.app.config;
+    const fp = cfg.fingerprint_profile;
+    // CloakBrowser-style: seed/stealth profile drives UA-CH platform.
+    if (fp.seed != 0 or cfg.stealth()) {
+        return fp.platform.uaChPlatform();
+    }
     return switch (builtin.os.tag) {
         .macos => "macOS",
         .windows => "Windows",
@@ -115,8 +142,10 @@ fn uaBitness() []const u8 {
     };
 }
 
+const Self = @This();
+
 pub const JsApi = struct {
-    pub const bridge = js.Bridge(NavigatorUAData);
+    pub const bridge = js.Bridge(Self);
 
     pub const Meta = struct {
         pub const name = "NavigatorUAData";
@@ -125,9 +154,13 @@ pub const JsApi = struct {
         pub const empty_with_no_proto = true;
     };
 
-    pub const brands = bridge.accessor(NavigatorUAData.getBrands, null, .{});
-    pub const mobile = bridge.accessor(NavigatorUAData.getMobile, null, .{});
-    pub const platform = bridge.accessor(NavigatorUAData.getPlatform, null, .{});
-    pub const toJSON = bridge.function(NavigatorUAData.toJSON, .{});
-    pub const getHighEntropyValues = bridge.function(NavigatorUAData.getHighEntropyValues, .{});
+    pub const brands = bridge.accessor(getBrands, null, .{});
+    pub const mobile = bridge.accessor(getMobile, null, .{});
+    pub const platform = bridge.accessor(getPlatform, null, .{});
+    pub const toJSON = bridge.function(toJSONFn, .{});
+    pub const getHighEntropyValues = bridge.function(getHighEntropyValuesFn, .{});
 };
+
+// Aliases avoid JsApi field names shadowing the free functions.
+const toJSONFn = toJSON;
+const getHighEntropyValuesFn = getHighEntropyValues;
