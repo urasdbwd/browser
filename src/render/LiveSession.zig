@@ -38,6 +38,10 @@ dom_version: usize = 0,
 last_activity_ms: u64 = 0,
 value_updates: usize = 0,
 value_update_bytes: usize = 0,
+snapshot_digest: [32]u8 = @splat(0),
+snapshot_length: usize = 0,
+snapshot_digest_valid: bool = false,
+snapshot_navigated: bool = false,
 
 pub fn init(allocator: std.mem.Allocator, browser: *lp.Browser) LiveSession {
     return .{ .allocator = allocator, .browser = browser };
@@ -102,6 +106,10 @@ pub fn open(self: *LiveSession, opts: OpenOpts, writer: *std.Io.Writer) !void {
     self.dom_version = 0;
     self.value_updates = 0;
     self.value_update_bytes = 0;
+    self.snapshot_digest = @splat(0);
+    self.snapshot_length = 0;
+    self.snapshot_digest_valid = false;
+    self.snapshot_navigated = false;
     try self.snapshot(writer);
     self.last_activity_ms = lp.datetime.milliTimestamp(.boot);
 }
@@ -310,6 +318,10 @@ pub fn close(self: *LiveSession) void {
     self.last_activity_ms = 0;
     self.value_updates = 0;
     self.value_update_bytes = 0;
+    self.snapshot_digest = @splat(0);
+    self.snapshot_length = 0;
+    self.snapshot_digest_valid = false;
+    self.snapshot_navigated = false;
 
     if (self.notification) |notification| {
         if (page) |active_page| {
@@ -326,6 +338,7 @@ pub fn close(self: *LiveSession) void {
 fn snapshot(self: *LiveSession, writer: *std.Io.Writer) !void {
     const page = self.page orelse return error.FrameNotLoaded;
     const frame = page.frame() orelse return error.FrameNotLoaded;
+    const previous_page = self.snapshot_page;
     const target_arena = try frame.getArena(.small, "render-live-targets");
     defer target_arena.release();
     self.targets.clearRetainingCapacity();
@@ -345,8 +358,25 @@ fn snapshot(self: *LiveSession, writer: *std.Io.Writer) !void {
     }, writer, frame);
 
     self.snapshot_page = page.page() orelse return error.FrameNotLoaded;
+    self.snapshot_navigated = previous_page != null and previous_page.? != self.snapshot_page.?;
     self.dom_version = self.snapshot_page.?.dom_version;
     self.version +%= 1;
+}
+
+pub fn acknowledgeSnapshot(self: *LiveSession, bytes: []const u8, allow_unchanged: bool) bool {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(bytes, &digest, .{});
+    const unchanged = allow_unchanged and
+        self.snapshot_digest_valid and
+        !self.snapshot_navigated and
+        self.snapshot_length == bytes.len and
+        std.mem.eql(u8, &self.snapshot_digest, &digest);
+
+    self.snapshot_digest = digest;
+    self.snapshot_length = bytes.len;
+    self.snapshot_digest_valid = true;
+    self.snapshot_navigated = false;
+    return unchanged;
 }
 
 fn matchesToken(self: *const LiveSession, candidate: []const u8) bool {
@@ -370,6 +400,29 @@ test "LiveSession: opaque token is 128-bit lowercase hex" {
     };
     const text = live.tokenText();
     try std.testing.expectEqualStrings("000102030405060708090a0b0c0d0e0f", &text);
+}
+
+test "LiveSession: unchanged acknowledgements require identical non-navigation snapshots" {
+    var live: LiveSession = .{
+        .allocator = std.testing.allocator,
+        .browser = undefined,
+    };
+
+    try std.testing.expect(!live.acknowledgeSnapshot("snapshot", true));
+    try std.testing.expect(live.acknowledgeSnapshot("snapshot", true));
+    try std.testing.expect(!live.acknowledgeSnapshot("changed!", true));
+    try std.testing.expect(!live.acknowledgeSnapshot("changed!", false));
+    try std.testing.expect(live.acknowledgeSnapshot("changed!", true));
+
+    live.snapshot_length += 1;
+    try std.testing.expect(!live.acknowledgeSnapshot("changed!", true));
+    live.snapshot_navigated = true;
+    try std.testing.expect(!live.acknowledgeSnapshot("changed!", true));
+
+    live.close();
+    try std.testing.expect(!live.snapshot_digest_valid);
+    try std.testing.expectEqual(@as(usize, 0), live.snapshot_length);
+    try std.testing.expect(!live.snapshot_navigated);
 }
 
 const LiveSessionTestResult = struct {

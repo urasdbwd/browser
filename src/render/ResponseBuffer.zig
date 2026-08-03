@@ -29,6 +29,13 @@ pub fn deinit(self: *ResponseBuffer) void {
     self.out.deinit();
 }
 
+pub fn releaseRetainedCapacity(self: *ResponseBuffer) void {
+    const allocator = self.out.allocator;
+    self.out.deinit();
+    self.out = .init(allocator);
+    self.failed = false;
+}
+
 pub fn buffered(self: *const ResponseBuffer) []const u8 {
     return self.out.writer.buffered();
 }
@@ -69,4 +76,18 @@ test "ResponseBuffer: limit failure is transactional" {
     try std.testing.expectError(error.WriteFailed, out.writer.writeAll("1234567"));
     try std.testing.expect(out.failed);
     try std.testing.expectEqualStrings("1234567890", out.buffered());
+}
+
+test "ResponseBuffer: retained capacity can be released and reused" {
+    var out: ResponseBuffer = .init(std.testing.allocator, 16);
+    defer out.deinit();
+
+    try out.writer.writeAll("1234567890");
+    try std.testing.expect(out.out.writer.buffer.len >= 10);
+    out.releaseRetainedCapacity();
+    try std.testing.expectEqual(@as(usize, 0), out.out.writer.buffer.len);
+    try std.testing.expectEqual(@as(usize, 0), out.buffered().len);
+
+    try out.writer.writeAll("reused");
+    try std.testing.expectEqualStrings("reused", out.buffered());
 }

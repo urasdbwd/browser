@@ -93,6 +93,7 @@ const Job = struct {
     cancel_reason: std.atomic.Value(u8) = .init(@intFromEnum(CancelReason.none)),
     termination_requested: std.atomic.Value(bool) = .init(false),
     live_snapshot: bool = false,
+    live_no_content: bool = false,
     live_token: [32]u8 = undefined,
     live_version: u64 = 0,
     next: ?*Job = null,
@@ -514,6 +515,11 @@ const RenderRequest = struct {
     height: u32 = 720,
 };
 
+const LiveSnapshotMode = enum {
+    full,
+    unchanged_204,
+};
+
 const LiveRequest = struct {
     op: enum { open, activate, set_value, close },
     url: ?[]const u8 = null,
@@ -525,6 +531,7 @@ const LiveRequest = struct {
     wait_ms: u32 = 5_000,
     width: u32 = 1280,
     height: u32 = 720,
+    snapshot_mode: LiveSnapshotMode = .full,
 };
 
 fn processRender(self: *HttpServer, browser: *lp.Browser, arena: std.mem.Allocator, job: *Job) void {
@@ -618,7 +625,7 @@ fn processLive(live: *LiveSession, arena: std.mem.Allocator, job: *Job) void {
                 job.result = mapLiveError(err);
                 return;
             };
-            setLiveSnapshotHeaders(job, live);
+            finishLiveSnapshot(job, live, request.snapshot_mode);
         },
         .activate => {
             const session = request.session orelse {
@@ -641,7 +648,7 @@ fn processLive(live: *LiveSession, arena: std.mem.Allocator, job: *Job) void {
                 job.result = mapLiveError(err);
                 return;
             };
-            setLiveSnapshotHeaders(job, live);
+            finishLiveSnapshot(job, live, request.snapshot_mode);
         },
         .set_value => {
             const session = request.session orelse {
@@ -676,7 +683,7 @@ fn processLive(live: *LiveSession, arena: std.mem.Allocator, job: *Job) void {
                 job.result = mapLiveError(err);
                 return;
             };
-            setLiveSnapshotHeaders(job, live);
+            finishLiveSnapshot(job, live, request.snapshot_mode);
         },
         .close => {
             const session = request.session orelse {
@@ -721,10 +728,15 @@ fn mapLiveError(err: anyerror) Result {
     };
 }
 
-fn setLiveSnapshotHeaders(job: *Job, live: *const LiveSession) void {
+fn finishLiveSnapshot(job: *Job, live: *LiveSession, mode: LiveSnapshotMode) void {
+    job.live_no_content = live.acknowledgeSnapshot(
+        job.out.buffered(),
+        mode == .unchanged_204,
+    );
     job.live_token = live.tokenText();
     job.live_version = live.version;
     job.live_snapshot = true;
+    if (job.live_no_content) job.out.releaseRetainedCapacity();
 }
 
 fn handleConn(self: *HttpServer, socket: posix.socket_t) void {
@@ -817,13 +829,8 @@ fn serve(
     if (job.result != .ok) return respondJson(request, job.result.status(), job.result.body(), cors_value);
     if (job.live_snapshot) {
         var version_buf: [20]u8 = undefined;
-        const version = std.fmt.bufPrint(&version_buf, "{d}", .{job.live_version}) catch unreachable;
-        const headers = [_]std.http.Header{
-            .{ .name = "x-lightpanda-live-session", .value = job.live_token[0..] },
-            .{ .name = "x-lightpanda-live-version", .value = version },
-            .{ .name = "access-control-expose-headers", .value = "x-lightpanda-live-session, x-lightpanda-live-version" },
-        };
-        respondBody(request, job.out.buffered(), .ok, "text/html; charset=utf-8", "no-store", null, cors_value, &headers) catch |err| {
+        const response = liveSnapshotResponse(job, &version_buf);
+        respondBody(request, response.body, response.status, "text/html; charset=utf-8", "no-store", null, cors_value, &response.headers) catch |err| {
             self.abandonLive(job.live_token);
             return err;
         };
@@ -833,6 +840,25 @@ fn serve(
         return respondBody(request, "", .no_content, "text/plain; charset=utf-8", "no-store", null, cors_value, &.{});
     }
     return respondBody(request, job.out.buffered(), .ok, "text/html; charset=utf-8", "no-store", null, cors_value, &.{});
+}
+
+const LiveSnapshotResponse = struct {
+    status: std.http.Status,
+    body: []const u8,
+    headers: [3]std.http.Header,
+};
+
+fn liveSnapshotResponse(job: *const Job, version_buf: *[20]u8) LiveSnapshotResponse {
+    const version = std.fmt.bufPrint(version_buf, "{d}", .{job.live_version}) catch unreachable;
+    return .{
+        .status = if (job.live_no_content) .no_content else .ok,
+        .body = if (job.live_no_content) "" else job.out.buffered(),
+        .headers = .{
+            .{ .name = "x-lightpanda-live-session", .value = job.live_token[0..] },
+            .{ .name = "x-lightpanda-live-version", .value = version },
+            .{ .name = "access-control-expose-headers", .value = "x-lightpanda-live-session, x-lightpanda-live-version" },
+        },
+    };
 }
 
 const JobWaitResult = enum { complete, disconnected, disconnected_complete, timeout };
@@ -1152,16 +1178,18 @@ test "render server: live operations carry a versioned activation" {
     );
     try std.testing.expect(open.op == .open);
     try std.testing.expectEqualStrings("https://example.test/", open.url.?);
+    try std.testing.expectEqual(LiveSnapshotMode.full, open.snapshot_mode);
 
     const activate = try std.json.parseFromSliceLeaky(
         LiveRequest,
         arena.allocator(),
-        "{\"op\":\"activate\",\"session\":\"0123456789abcdef0123456789abcdef\",\"version\":7,\"target\":3}",
+        "{\"op\":\"activate\",\"session\":\"0123456789abcdef0123456789abcdef\",\"version\":7,\"target\":3,\"snapshot_mode\":\"unchanged_204\"}",
         .{},
     );
     try std.testing.expect(activate.op == .activate);
     try std.testing.expectEqual(@as(u64, 7), activate.version.?);
     try std.testing.expectEqual(@as(u64, 3), activate.target.?);
+    try std.testing.expectEqual(LiveSnapshotMode.unchanged_204, activate.snapshot_mode);
 
     const set_value = try std.json.parseFromSliceLeaky(
         LiveRequest,
@@ -1215,6 +1243,74 @@ test "render server: cancelled live work releases the worker session" {
         _ = job.cancel(reason);
         closeCancelledLiveJob(&live, job, job.cancellation());
         try std.testing.expect(!live.isActive());
+    }
+}
+
+test "render server: unchanged live snapshot releases its response buffer" {
+    var live: LiveSession = .{
+        .allocator = std.testing.allocator,
+        .browser = undefined,
+        .token = @splat(0),
+        .version = 2,
+    };
+    _ = live.acknowledgeSnapshot("same snapshot", false);
+
+    const job = try Job.create(std.testing.allocator, .live, "", 1, 1024);
+    defer job.release();
+    try job.out.writer.writeAll("same snapshot");
+    finishLiveSnapshot(job, &live, .unchanged_204);
+
+    try std.testing.expect(job.live_snapshot);
+    try std.testing.expect(job.live_no_content);
+    try std.testing.expectEqual(@as(u64, 2), job.live_version);
+    try std.testing.expectEqual(@as(usize, 0), job.out.buffered().len);
+    try std.testing.expectEqual(@as(usize, 0), job.out.out.writer.buffer.len);
+
+    var version_buf: [20]u8 = undefined;
+    const response = liveSnapshotResponse(job, &version_buf);
+    try std.testing.expectEqual(std.http.Status.no_content, response.status);
+    try std.testing.expectEqual(@as(usize, 0), response.body.len);
+    try std.testing.expectEqualStrings("x-lightpanda-live-session", response.headers[0].name);
+    try std.testing.expectEqualStrings("00000000000000000000000000000000", response.headers[0].value);
+    try std.testing.expectEqualStrings("x-lightpanda-live-version", response.headers[1].name);
+    try std.testing.expectEqualStrings("2", response.headers[1].value);
+    try std.testing.expectEqualStrings("access-control-expose-headers", response.headers[2].name);
+    try std.testing.expectEqualStrings(
+        "x-lightpanda-live-session, x-lightpanda-live-version",
+        response.headers[2].value,
+    );
+}
+
+test "render server: legacy and changed live snapshots retain full responses" {
+    var live: LiveSession = .{
+        .allocator = std.testing.allocator,
+        .browser = undefined,
+        .token = @splat(0),
+        .version = 2,
+    };
+    _ = live.acknowledgeSnapshot("same snapshot", false);
+
+    inline for (.{ LiveSnapshotMode.full, LiveSnapshotMode.unchanged_204 }) |mode| {
+        const job = try Job.create(std.testing.allocator, .live, "", 1, 1024);
+        defer job.release();
+        const body = if (mode == .full) "same snapshot" else "changed snapshot";
+        try job.out.writer.writeAll(body);
+        finishLiveSnapshot(job, &live, mode);
+
+        try std.testing.expect(job.live_snapshot);
+        try std.testing.expect(!job.live_no_content);
+        try std.testing.expectEqualStrings(body, job.out.buffered());
+
+        var version_buf: [20]u8 = undefined;
+        const response = liveSnapshotResponse(job, &version_buf);
+        try std.testing.expectEqual(std.http.Status.ok, response.status);
+        try std.testing.expectEqualStrings(body, response.body);
+        try std.testing.expectEqualStrings("00000000000000000000000000000000", response.headers[0].value);
+        try std.testing.expectEqualStrings("2", response.headers[1].value);
+        try std.testing.expectEqualStrings(
+            "x-lightpanda-live-session, x-lightpanda-live-version",
+            response.headers[2].value,
+        );
     }
 }
 

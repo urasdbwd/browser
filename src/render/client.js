@@ -269,6 +269,7 @@ export class LightpandaRenderer extends EventTarget {
       wait_ms: options.waitMs,
       width: Math.max(1, Math.round((options.width ?? bounds.width) || 1280)),
       height: Math.max(1, Math.round((options.height ?? bounds.height) || 720)),
+      snapshot_mode: "unchanged_204",
     };
     for (const key of Object.keys(request)) {
       if (request[key] == null) delete request[key];
@@ -426,6 +427,7 @@ export class LightpandaRenderer extends EventTarget {
         version: live.version,
         target,
         wait_ms: live.options.waitMs,
+        snapshot_mode: "unchanged_204",
       }, controller.signal);
       if (!response.ok) {
         const detail = await readResponseText(response, 512).catch((error) => error.message);
@@ -433,6 +435,12 @@ export class LightpandaRenderer extends EventTarget {
       }
 
       const metadata = liveHeaders(response);
+      if (response.status === 204) {
+        if (sequence !== this.#sequence) throw aborted(controller.signal);
+        this.#live = { ...live, ...metadata };
+        this.dispatchEvent(new CustomEvent("live", { detail: { url: live.url, version: metadata.version, target } }));
+        return;
+      }
       const html = await readResponseText(response, this.#maxResponseBytes);
       if (sequence !== this.#sequence) throw aborted(controller.signal);
       await waitForFrame(
@@ -466,6 +474,7 @@ export class LightpandaRenderer extends EventTarget {
         target,
         value,
         wait_ms: live.options.waitMs,
+        snapshot_mode: "unchanged_204",
       };
       if (selectedIndex !== null) request.selected_index = selectedIndex;
       const response = await this.#postLive(request, controller.signal);
@@ -475,6 +484,12 @@ export class LightpandaRenderer extends EventTarget {
       }
 
       const metadata = liveHeaders(response);
+      if (response.status === 204) {
+        if (sequence !== this.#sequence) throw aborted(controller.signal);
+        this.#live = { ...live, ...metadata };
+        this.dispatchEvent(new CustomEvent("live", { detail: { url: live.url, version: metadata.version, target } }));
+        return;
+      }
       const html = await readResponseText(response, this.#maxResponseBytes);
       if (sequence !== this.#sequence) throw aborted(controller.signal);
       await waitForFrame(this.iframe, html, controller.signal, () => sequence === this.#sequence);

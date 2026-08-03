@@ -41,10 +41,12 @@ class FakeElement extends EventTarget {
 
 class FakeDocument {
   listeners = new Map();
+  listenerAdds = new Map();
   documentElement = new FakeElement();
 
   addEventListener(type, listener) {
     this.listeners.set(type, listener);
+    this.listenerAdds.set(type, (this.listenerAdds.get(type) ?? 0) + 1);
   }
 
   dispatchClick(target, init = {}) {
@@ -397,6 +399,7 @@ const { attachLightpandaRenderer } = await import(
       url: "https://source.example/live",
       width: 640,
       height: 480,
+      snapshot_mode: "unchanged_204",
     },
     authorization: "Bearer live-token",
   });
@@ -427,6 +430,7 @@ const { attachLightpandaRenderer } = await import(
     session: "0123456789abcdef0123456789abcdef",
     version: 1,
     target: 0,
+    snapshot_mode: "unchanged_204",
   });
   renderer.destroy();
   await waitUntil(() => requests.length === 3);
@@ -434,6 +438,84 @@ const { attachLightpandaRenderer } = await import(
     op: "close",
     session: "0123456789abcdef0123456789abcdef",
   });
+}
+
+{
+  autoLoadFrames = true;
+  const requests = [];
+  const noContentResponse = (version) => ({
+    ok: true,
+    status: 204,
+    headers: new Headers({
+      "x-lightpanda-live-session": "abcdef0123456789abcdef0123456789",
+      "x-lightpanda-live-version": String(version),
+    }),
+    get body() {
+      assert.fail("204 live response body must not be read");
+    },
+    async text() {
+      assert.fail("204 live response text must not be read");
+    },
+  });
+  fetchImpl = async (_endpoint, options) => {
+    const request = JSON.parse(options.body);
+    requests.push(request);
+    if (request.op === "open") {
+      return new Response(
+        '<button data-lp-live-target="0" data-lp-live-kind="activate">same</button>',
+        {
+          headers: {
+            "x-lightpanda-live-session": "abcdef0123456789abcdef0123456789",
+            "x-lightpanda-live-version": "1",
+          },
+        },
+      );
+    }
+    if (request.op === "activate") return noContentResponse(2);
+    if (request.op === "set_value") return noContentResponse(3);
+    assert.equal(request.op, "close");
+    return new Response(null, { status: 204 });
+  };
+
+  const renderer = attachLightpandaRenderer(new FakeElement());
+  await renderer.open("https://source.example/live-unchanged");
+  const snapshot = renderer.iframe.snapshot;
+  const snapshotDocument = renderer.iframe.contentDocument;
+
+  const clickTarget = new FakeElement();
+  clickTarget.setAttribute("data-lp-live-target", "0");
+  clickTarget.setAttribute("data-lp-live-kind", "activate");
+  snapshotDocument.dispatchClick(clickTarget);
+  await waitUntil(() => requests.length === 2 && renderer.iframe.inert === false);
+  assert.deepEqual(requests[1], {
+    op: "activate",
+    session: "abcdef0123456789abcdef0123456789",
+    version: 1,
+    target: 0,
+    snapshot_mode: "unchanged_204",
+  });
+
+  const valueTarget = new FakeElement();
+  valueTarget.setAttribute("data-lp-live-target", "1");
+  valueTarget.setAttribute("data-lp-live-kind", "value");
+  valueTarget.value = "same";
+  snapshotDocument.dispatchChange(valueTarget);
+  await waitUntil(() => requests.length === 3 && renderer.iframe.inert === false);
+  assert.deepEqual(requests[2], {
+    op: "set_value",
+    session: "abcdef0123456789abcdef0123456789",
+    version: 2,
+    target: 1,
+    value: "same",
+    snapshot_mode: "unchanged_204",
+  });
+
+  assert.equal(renderer.iframe.snapshot, snapshot);
+  assert.equal(renderer.iframe.contentDocument, snapshotDocument);
+  assert.equal(snapshotDocument.listenerAdds.get("click"), 1);
+  assert.equal(snapshotDocument.listenerAdds.get("change"), 1);
+  renderer.destroy();
+  await waitUntil(() => requests.length === 4);
 }
 
 {
@@ -507,6 +589,7 @@ const { attachLightpandaRenderer } = await import(
     value: "after",
     wait_ms: 1234,
     selected_index: 2,
+    snapshot_mode: "unchanged_204",
   });
 
   finishSetValue();
