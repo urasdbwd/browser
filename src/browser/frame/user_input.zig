@@ -322,7 +322,7 @@ const JavascriptUrlTask = struct {
     }
 };
 
-pub fn handleClick(frame: *Frame, target: *Node) !void {
+pub fn handleClick(frame: *Frame, target: *Node, current_context_form_submit_only: bool) !void {
     // TODO: Also support <area> elements when implement
     const element = target.is(Element) orelse return;
     const html_element = element.is(Element.Html) orelse return;
@@ -370,13 +370,17 @@ pub fn handleClick(frame: *Frame, target: *Node) !void {
             // submitter's coordinate fields appended via FormData.collectForm
             // (see src/browser/webapi/net/FormData.zig).
             if (input._input_type == .submit or input._input_type == .image) {
-                return frame.submitForm(element, input.getForm(frame), .{});
+                return frame.submitForm(element, input.getForm(frame), .{
+                    .current_context_target_only = current_context_form_submit_only,
+                });
             }
         },
         .button => |button| {
             try element.focus(frame);
             if (std.mem.eql(u8, button.getType(), "submit")) {
-                return frame.submitForm(element, button.getForm(frame), .{});
+                return frame.submitForm(element, button.getForm(frame), .{
+                    .current_context_target_only = current_context_form_submit_only,
+                });
             }
         },
         .select, .textarea => try element.focus(frame),

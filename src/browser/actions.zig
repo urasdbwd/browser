@@ -38,7 +38,15 @@ fn dispatchInputAndChangeEvents(el: *Element, frame: *Frame) !void {
     };
 }
 
+pub const ClickOptions = struct {
+    current_context_form_submit_only: bool = false,
+};
+
 pub fn click(node: *DOMNode, frame: *Frame) !void {
+    return clickWithOptions(node, frame, .{});
+}
+
+pub fn clickWithOptions(node: *DOMNode, frame: *Frame, opts: ClickOptions) !void {
     const el = node.is(Element) orelse return error.InvalidNodeType;
 
     const mouse_event: *MouseEvent = try .initTrusted(comptime .wrap("click"), .{
@@ -48,6 +56,7 @@ pub fn click(node: *DOMNode, frame: *Frame) !void {
         .clientX = 0,
         .clientY = 0,
     }, frame);
+    mouse_event.asEvent()._current_context_form_submit_only = opts.current_context_form_submit_only;
 
     frame._event_manager.dispatch(el.asEventTarget(), mouse_event.asEvent()) catch |err| {
         lp.log.err(.app, "click failed", .{ .err = err });

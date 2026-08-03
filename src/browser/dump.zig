@@ -256,10 +256,13 @@ pub fn isLiveTarget(
         else
             false,
         .button => if (el.is(Button)) |button|
-            !el.isDisabled() and button.getForm(frame) == null
+            !el.isDisabled() and
+                !std.mem.eql(u8, button.getType(), "reset") and
+                (button.getForm(frame) == null or isLiveFormSubmitTarget(el, frame))
         else
             false,
-        .input => liveCheckable(el) != null and !el.isDisabled(),
+        .input => (liveCheckable(el) != null and !el.isDisabled()) or
+            isLiveFormSubmitTarget(el, frame),
         else => false,
     };
     if (legacy_target) return true;
@@ -328,13 +331,14 @@ fn hasUnsafeActivationTarget(el: *Node.Element, frame: *Frame) bool {
         else
             false,
         .button => if (el.is(Button)) |button|
-            std.mem.eql(u8, button.getType(), "submit") and button.getForm(frame) != null
+            std.mem.eql(u8, button.getType(), "reset") or
+                (std.mem.eql(u8, button.getType(), "submit") and button.getForm(frame) != null)
         else
             false,
         .input => if (el.is(Input)) |input|
             switch (input._input_type) {
-                .submit, .image => input.getForm(frame) != null,
-                .file => true,
+                .submit => input.getForm(frame) != null,
+                .reset, .file, .image => true,
                 else => false,
             }
         else
@@ -362,11 +366,28 @@ fn isLiveAnchor(el: *Node.Element, anchor: *Anchor) bool {
     const href = el.getAttributeSafe(comptime .wrap("href")) orelse return false;
     if (href.len == 0 or el.hasAttributeSafe(comptime .wrap("download"))) return false;
 
-    const target = anchor.getTarget();
-    return target.len == 0 or
-        std.ascii.eqlIgnoreCase(target, "_self") or
-        std.ascii.eqlIgnoreCase(target, "_parent") or
-        std.ascii.eqlIgnoreCase(target, "_top");
+    return Frame.isCurrentContextTarget(anchor.getTarget());
+}
+
+fn isLiveFormSubmitTarget(el: *Node.Element, frame: *Frame) bool {
+    if (el.isDisabled() or !el.asNode().isConnected()) return false;
+
+    const form = switch (el.getTag()) {
+        .button => if (el.is(Button)) |button| blk: {
+            if (!std.mem.eql(u8, button.getType(), "submit")) return false;
+            break :blk button.getForm(frame) orelse return false;
+        } else return false,
+        .input => if (el.is(Input)) |input| blk: {
+            if (input._input_type != .submit) return false;
+            break :blk input.getForm(frame) orelse return false;
+        } else return false,
+        else => return false,
+    };
+
+    // Keep this in lockstep with Frame.submitForm: a present, even empty,
+    // submitter formtarget overrides the form target.
+    const target = el.getAttributeSafe(comptime .wrap("formtarget")) orelse form.getTarget();
+    return Frame.isCurrentContextTarget(target);
 }
 
 fn formatElement(
@@ -735,6 +756,7 @@ test "dump: live targets replace author markers without mutating the DOM" {
 
     const form = try doc.createElement("form", null, frame);
     const associated = try doc.createElement("button", null, frame);
+    try associated.setAttributeSafe(comptime .wrap("type"), .wrap("button"), frame);
     _ = try form.asNode().appendChild(associated.asNode(), frame);
     _ = try body.asNode().appendChild(form.asNode(), frame);
 
@@ -769,6 +791,54 @@ test "dump: live targets replace author markers without mutating the DOM" {
     try testing.expect(!try isLiveTarget(associated, frame, .{}));
     try testing.expect(!try isLiveTarget(file, frame, .{}));
     try testing.expectEqual(dom_version, frame._page.dom_version);
+}
+
+test "dump: live form submits require a current-context target" {
+    var page = try testing.pageTest("dump.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    const doc = frame.window._document;
+    const body = doc.is(Node.Document.HTMLDocument).?.getBody().?;
+    try Frame.parse.htmlAsChildren(frame, body.asNode(),
+        \\<form target="_self"><button id="default-submit">default</button></form>
+        \\<form target="_top"><input id="top-submit" type="submit"></form>
+        \\<form target="_blank"><button id="blank-submit">blank</button></form>
+        \\<form target="named"><input id="named-submit" type="submit"></form>
+        \\<form target="_blank"><input id="empty-override" type="submit" formtarget=""></form>
+        \\<form target="_self"><button id="blank-override" formtarget="_blank">blank override</button></form>
+        \\<form><button id="disabled-submit" disabled>disabled</button></form>
+        \\<form><button id="reset-button" type="reset">reset</button></form>
+        \\<form><input id="reset-input" type="reset"></form>
+        \\<form><input id="file-input" type="file"></form>
+        \\<form><input id="image-input" type="image"></form>
+    );
+
+    var elements: std.ArrayListUnmanaged(LiveTargets.Target) = .empty;
+    defer elements.deinit(testing.allocator);
+    var targets: LiveTargets = .{ .elements = &elements, .allocator = testing.allocator };
+
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try root(doc, .{ .live_targets = &targets }, &aw.writer, frame);
+
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "<button id=\"default-submit\" data-lp-live-target=\"0\" data-lp-live-kind=\"activate\">") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "<input id=\"top-submit\" type=\"submit\" data-lp-live-target=\"1\" data-lp-live-kind=\"activate\">") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "<input id=\"empty-override\" type=\"submit\" formtarget=\"\" data-lp-live-target=\"2\" data-lp-live-kind=\"activate\">") != null);
+    try testing.expectEqual(@as(usize, 3), elements.items.len);
+
+    inline for (.{
+        "blank-submit",
+        "named-submit",
+        "blank-override",
+        "disabled-submit",
+        "reset-button",
+        "reset-input",
+        "file-input",
+        "image-input",
+    }) |id| {
+        try testing.expect(!try isLiveTarget(doc.getElementById(id, frame).?, frame, .{}));
+    }
 }
 
 test "dump: live checkables serialize current checked state" {

@@ -159,7 +159,9 @@ pub fn activate(
         return error.StaleSnapshot;
     }
 
-    lp.actions.click(target.element.asNode(), frame) catch |err| {
+    lp.actions.clickWithOptions(target.element.asNode(), frame, .{
+        .current_context_form_submit_only = true,
+    }) catch |err| {
         self.close();
         return err;
     };
@@ -395,7 +397,7 @@ fn liveSessionRoundTrip() !void {
     try live.open(.{ .url = button_url, .width = 640, .height = 480, .wait_ms = 2_000 }, &opened.writer);
     try testing.expect(live.isActive());
     try testing.expectEqual(@as(u64, 1), live.version);
-    try testing.expectEqual(@as(usize, 13), live.targets.items.len);
+    try testing.expectEqual(@as(usize, 20), live.targets.items.len);
     try testing.expect(std.mem.indexOf(u8, opened.written(), "<input id=\"toggle\" type=\"checkbox\" checked data-lp-live-target=\"1\" data-lp-live-kind=\"activate\">") != null);
     try testing.expect(std.mem.indexOf(u8, opened.written(), "<input id=\"disabled\" type=\"checkbox\" disabled>") != null);
     try testing.expect(std.mem.indexOf(u8, opened.written(), "<input id=\"text\" value=\"input-before\" data-lp-live-target=\"4\" data-lp-live-kind=\"value\">") != null);
@@ -414,10 +416,24 @@ fn liveSessionRoundTrip() !void {
     try testing.expect(std.mem.indexOf(u8, opened.written(), "data-lp-live-target=\"9\" data-lp-live-kind=\"activate\">inline</div>") != null);
     try testing.expect(std.mem.indexOf(u8, opened.written(), "data-lp-live-target=\"10\" data-lp-live-kind=\"activate\">anchor</a>") != null);
     try testing.expect(std.mem.indexOf(u8, opened.written(), "data-lp-live-target=\"11\" data-lp-live-kind=\"activate\">button</button>") != null);
-    try testing.expect(std.mem.indexOf(u8, opened.written(), "data-lp-live-target=\"12\" data-lp-live-kind=\"activate\">") != null);
+    try testing.expect(std.mem.indexOf(u8, opened.written(), "<button id=\"submit-script-button\" type=\"submit\" data-lp-live-target=\"12\" data-lp-live-kind=\"activate\">") != null);
+    try testing.expect(std.mem.indexOf(u8, opened.written(), "<input id=\"label-submit-control\" type=\"submit\" data-lp-live-target=\"13\" data-lp-live-kind=\"activate\">") != null);
+    try testing.expect(std.mem.indexOf(u8, opened.written(), "<input id=\"input-script-button\" type=\"button\" onclick=") != null);
+    try testing.expect(std.mem.indexOf(u8, opened.written(), "data-lp-live-target=\"14\" data-lp-live-kind=\"activate\">") != null);
+    try testing.expect(std.mem.indexOf(u8, opened.written(), "<input id=\"prevent-field\" name=\"field\" value=\"prevent-before\" data-lp-live-target=\"15\" data-lp-live-kind=\"value\">") != null);
+    try testing.expect(std.mem.indexOf(u8, opened.written(), "<button id=\"prevent-submit\" type=\"submit\" name=\"submitter\" value=\"prevent\" formtarget=\"\" data-lp-live-target=\"16\" data-lp-live-kind=\"activate\">") != null);
+    try testing.expect(std.mem.indexOf(u8, opened.written(), "<input id=\"get-field\" name=\"field\" value=\"get-before\" data-lp-live-target=\"17\" data-lp-live-kind=\"value\">") != null);
+    try testing.expect(std.mem.indexOf(u8, opened.written(), "<input id=\"get-submit\" type=\"submit\" name=\"submitter\" value=\"go\" data-lp-live-target=\"18\" data-lp-live-kind=\"activate\">") != null);
+    try testing.expect(std.mem.indexOf(u8, opened.written(), "<button id=\"click-mutates-submit-target\" type=\"submit\" onclick=") != null);
+    try testing.expect(std.mem.indexOf(u8, opened.written(), "data-lp-live-target=\"19\" data-lp-live-kind=\"activate\">") != null);
     try testing.expect(std.mem.indexOf(u8, opened.written(), "<span id=\"submit-script-child\" onclick=") != null);
     try testing.expect(std.mem.indexOf(u8, opened.written(), "<label id=\"label-submit-script\" for=\"label-submit-control\" onclick=") != null);
     try testing.expect(std.mem.indexOf(u8, opened.written(), "<input id=\"file-script\" type=\"file\" onclick=") != null);
+    try testing.expect(std.mem.indexOf(u8, opened.written(), "<button id=\"blank-submit\">blank submit</button>") != null);
+    try testing.expect(std.mem.indexOf(u8, opened.written(), "<input id=\"named-submit\" type=\"submit\">") != null);
+    try testing.expect(std.mem.indexOf(u8, opened.written(), "<button id=\"disabled-submit\" disabled>disabled submit</button>") != null);
+    try testing.expect(std.mem.indexOf(u8, opened.written(), "<button id=\"reset-submit\" type=\"reset\">reset</button>") != null);
+    try testing.expect(std.mem.indexOf(u8, opened.written(), "<input id=\"image-submit\" type=\"image\">") != null);
     try testing.expect(std.mem.indexOf(u8, opened.written(), "<div id=\"delegated-update\">delegated</div>") != null);
     try testing.expect(std.mem.indexOf(u8, opened.written(), "<button id=\"disabled-script\" disabled onclick=") != null);
     try testing.expect(std.mem.indexOf(u8, opened.written(), "<div id=\"blocked-script\" style=\"pointer-events: none\" onclick=") != null);
@@ -461,7 +477,7 @@ fn liveSessionRoundTrip() !void {
     try live.activate(token[0..], live.version, 1, 2_000, &activated.writer);
     try testing.expectEqual(@as(u64, 5), live.version);
     try testing.expect(std.mem.indexOf(u8, activated.written(), "<input id=\"toggle\" type=\"checkbox\" data-lp-live-target=\"1\" data-lp-live-kind=\"activate\">") != null);
-    try testing.expectEqual(@as(usize, 13), live.targets.items.len);
+    try testing.expectEqual(@as(usize, 20), live.targets.items.len);
 
     activated.clearRetainingCapacity();
     try live.activate(token[0..], live.version, 3, 2_000, &activated.writer);
@@ -495,9 +511,25 @@ fn liveSessionRoundTrip() !void {
     try testing.expect(std.mem.indexOf(u8, activated.written(), ">button<") != null);
 
     activated.clearRetainingCapacity();
-    try live.activate(token[0..], live.version, 12, 2_000, &activated.writer);
+    try live.activate(token[0..], live.version, 14, 2_000, &activated.writer);
     try testing.expectEqual(@as(u64, 12), live.version);
     try testing.expect(std.mem.indexOf(u8, activated.written(), ">input<") != null);
+
+    activated.clearRetainingCapacity();
+    try live.setValue(token[0..], live.version, 15, "prevent-after", null, 2_000, &activated.writer);
+    try testing.expectEqual(@as(u64, 13), live.version);
+
+    activated.clearRetainingCapacity();
+    try live.activate(token[0..], live.version, 16, 2_000, &activated.writer);
+    try testing.expectEqual(@as(u64, 14), live.version);
+    try testing.expect(std.mem.indexOf(u8, activated.written(), ">prevented:prevent-after:prevent<") != null);
+
+    activated.clearRetainingCapacity();
+    try live.activate(token[0..], live.version, 19, 2_000, &activated.writer);
+    try testing.expectEqual(@as(u64, 15), live.version);
+    try testing.expect(std.mem.indexOf(u8, activated.written(), ">click target mutated<") != null);
+    try testing.expect(std.mem.indexOf(u8, activated.written(), "<base href=\"http://127.0.0.1:9582/src/browser/tests/render_live.html\">") != null);
+    try testing.expect(std.mem.indexOf(u8, activated.written(), "data-lp-live-target=\"19\"") == null);
     try live.closeForToken(token[0..]);
     try testing.expect(!live.isActive());
     try testing.expectEqual(@as(usize, 0), live.targets.capacity);
@@ -510,6 +542,30 @@ fn liveSessionRoundTrip() !void {
     try testing.expect(std.mem.indexOf(u8, activated.written(), "<base href=\"http://127.0.0.1:9582/src/browser/tests/mcp_nav.html\">") != null);
     try testing.expectEqual(@as(usize, 1), live.targets.items.len);
     try live.closeForToken(navigation_token[0..]);
+
+    activated.clearRetainingCapacity();
+    try live.open(.{ .url = button_url, .width = 640, .height = 480, .wait_ms = 2_000 }, &activated.writer);
+    const submit_navigation_token = live.tokenText();
+    activated.clearRetainingCapacity();
+    try live.setValue(submit_navigation_token[0..], live.version, 17, "get-after", null, 2_000, &activated.writer);
+    activated.clearRetainingCapacity();
+    try live.activate(submit_navigation_token[0..], live.version, 18, 2_000, &activated.writer);
+    try testing.expect(std.mem.indexOf(u8, activated.written(), "<base href=\"http://127.0.0.1:9582/src/browser/tests/mcp_nav.html?field=get-after&amp;submitter=go\">") != null);
+    try testing.expectEqual(@as(usize, 1), live.targets.items.len);
+    try live.closeForToken(submit_navigation_token[0..]);
+
+    activated.clearRetainingCapacity();
+    try live.open(.{ .url = button_url, .width = 640, .height = 480, .wait_ms = 2_000 }, &activated.writer);
+    const blocked_submit_token = live.tokenText();
+    const blocked_submit_frame = live.page.?.frame().?;
+    {
+        var ls: js.Local.Scope = undefined;
+        blocked_submit_frame.js.localScope(&ls);
+        defer ls.deinit();
+        _ = try ls.local.exec("window.blockPreventSubmitTarget()", null);
+    }
+    try testing.expectError(error.StaleSnapshot, live.activate(blocked_submit_token[0..], live.version, 16, 2_000, &opened.writer));
+    try testing.expect(!live.isActive());
 
     activated.clearRetainingCapacity();
     try live.open(.{ .url = button_url, .width = 640, .height = 480, .wait_ms = 2_000 }, &activated.writer);

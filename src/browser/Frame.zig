@@ -3157,6 +3157,13 @@ pub const QueuedNavigation = struct {
 /// to the appropriateFrame to navigate.
 /// Returns null if the target is "_blank" (which would open a new window/tab).
 /// Note: Callers should handle empty target separately (for owner document resolution).
+pub fn isCurrentContextTarget(target_name: []const u8) bool {
+    return target_name.len == 0 or
+        std.ascii.eqlIgnoreCase(target_name, "_self") or
+        std.ascii.eqlIgnoreCase(target_name, "_parent") or
+        std.ascii.eqlIgnoreCase(target_name, "_top");
+}
+
 pub fn resolveTargetFrame(self: *Frame, target_name: []const u8) ?*Frame {
     if (std.ascii.eqlIgnoreCase(target_name, "_self")) {
         return self;
@@ -3218,6 +3225,7 @@ fn findFrameByName(frame: *Frame, name: []const u8) ?*Frame {
 
 const SubmitFormOpts = struct {
     fire_event: bool = true,
+    current_context_target_only: bool = false,
 };
 pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.Form, submit_opts: SubmitFormOpts) !void {
     const form = form_ orelse return;
@@ -3257,6 +3265,11 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
         }
         break :blk form_element.getAttributeSafe(comptime .wrap("target"));
     };
+    if (submit_opts.current_context_target_only and
+        !isCurrentContextTarget(target_name_ orelse ""))
+    {
+        return;
+    }
 
     const target_frame = blk: {
         const target_name = target_name_ orelse {

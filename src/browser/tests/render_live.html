@@ -28,6 +28,25 @@
     <label id="label-submit-script" for="label-submit-control" onclick="document.getElementById('status').textContent = 'label submit'">label submit</label>
 </form>
 <input id="input-script-button" type="button" onclick="document.getElementById('status').textContent = 'input'">
+<form id="prevent-submit-form" target="_blank">
+    <input id="prevent-field" name="field" value="prevent-before">
+    <button id="prevent-submit" type="submit" name="submitter" value="prevent" formtarget="">prevent</button>
+</form>
+<form id="get-submit-form" action="/src/browser/tests/mcp_nav.html" method="get" target="_top">
+    <input id="get-field" name="field" value="get-before">
+    <input id="get-submit" type="submit" name="submitter" value="go">
+</form>
+<form>
+    <button id="click-mutates-submit-target" type="submit"
+        onclick="this.setAttribute('formtarget', 'named'); document.getElementById('status').textContent = 'click target mutated'">
+        mutate target
+    </button>
+</form>
+<form target="_blank"><button id="blank-submit">blank submit</button></form>
+<form target="named"><input id="named-submit" type="submit"></form>
+<form><button id="disabled-submit" disabled>disabled submit</button></form>
+<form><button id="reset-submit" type="reset">reset</button></form>
+<form><input id="image-submit" type="image"></form>
 <input id="file-script" type="file" onclick="document.getElementById('status').textContent = 'file'">
 <div id="delegated-update">delegated</div>
 <button id="disabled-script" disabled onclick="document.getElementById('status').textContent = 'disabled'">disabled script</button>
@@ -78,6 +97,14 @@ for (const id of ["text", "textarea", "select"]) {
 document.getElementById("focus-invalidated").addEventListener("focus", (event) => {
     event.currentTarget.readOnly = true;
 });
+document.getElementById("prevent-submit-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    document.getElementById("status").textContent =
+        `prevented:${document.getElementById("prevent-field").value}:${event.submitter.value}`;
+});
+window.blockPreventSubmitTarget = () => {
+    document.getElementById("prevent-submit").setAttribute("formtarget", "_blank");
+};
 document.getElementById("password").value = "current-secret";
 </script>
 </body>

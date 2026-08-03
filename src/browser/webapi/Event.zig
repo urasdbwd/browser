@@ -49,6 +49,9 @@ _needs_retargeting: bool = false,
 _is_trusted: bool = false,
 _in_passive_listener: bool = false,
 _listeners_did_throw: bool = false, // IndexedDB needs to abort on callback throw
+// Internal activation policy for renderer-generated clicks. This is not
+// exposed to JavaScript and only narrows form navigation during default action.
+_current_context_form_submit_only: bool = false,
 // Per spec, events created via document.createEvent are not initialized
 // until one of the init*Event methods runs; dispatching one throws an
 // InvalidStateError. Events created any other way start initialized.
