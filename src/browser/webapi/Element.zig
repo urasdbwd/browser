@@ -1313,11 +1313,20 @@ pub fn getElementDimensions(self: *Element, frame: *Frame) struct { width: f64, 
     return .{ .width = width, .height = height };
 }
 
-// CSSOM: on the root element, clientWidth/clientHeight are the viewport, not
-// the element box. Without this the artificial 1920 x 100_000_000 default
+// CSSOM: on the root element, client* and scroll* are the viewport, not the
+// element box. Without this the artificial 1920 x 100_000_000 default
 // getElementDimensions hands <html> leaks straight out to script, and
 // `Math.max(documentElement.clientHeight, innerHeight)` — what bot scanners
 // read for the viewport — reports a 100-million-pixel display.
+//
+// Reporting the same number for both keeps the infinite-scroll idiom
+// (`scrollTop + clientHeight >= scrollHeight`) firing, which is what the giant
+// default bought in the first place.
+//
+// ponytail: root element only. <body> keeps the synthetic box, so
+// document.body.clientHeight still reads 100_000_000. Give it the same
+// treatment if a scanner is found reading it — the layout stand-in
+// getElementDimensions returns has to stay for calculateDocumentPosition.
 fn isRootElement(self: *Element) bool {
     const parent = self.asNode().parentNode() orelse return false;
     return parent._type == .document;
@@ -1433,6 +1442,10 @@ pub fn getScrollHeight(self: *Element, frame: *Frame) f64 {
         return 0.0;
     }
 
+    if (self.isRootElement()) {
+        return @floatFromInt(frame._page.getViewport().height);
+    }
+
     const height = self.getElementDimensions(frame).height;
 
     const tag = self.getTag();
@@ -1474,6 +1487,10 @@ pub fn getScrollWidth(self: *Element, frame: *Frame) f64 {
     var visibility_cache: VisibilityCache = .{};
     if (!self.checkVisibilityCached(&visibility_cache, frame)) {
         return 0.0;
+    }
+
+    if (self.isRootElement()) {
+        return @floatFromInt(frame._page.getViewport().width);
     }
 
     const width = self.getElementDimensions(frame).width;
