@@ -30,6 +30,7 @@ const WebSocket = @import("../browser/webapi/net/WebSocket.zig");
 const CookieJar = @import("../browser/webapi/storage/Cookie.zig").Jar;
 
 const http = @import("http.zig");
+const Cors = @import("Cors.zig");
 const Network = @import("Network.zig");
 const Cache = @import("cache/Cache.zig");
 const RobotsGate = @import("RobotsGate.zig");
@@ -183,6 +184,7 @@ serve_mode: bool,
 obey_robots: bool,
 
 robots: RobotsGate,
+cors: Cors,
 url_blocklist: ?UrlBlocklist,
 
 pub fn init(self: *Client, allocator: Allocator, network: *Network, cdp: ?*CDP) !void {
@@ -222,6 +224,7 @@ pub fn init(self: *Client, allocator: Allocator, network: *Network, cdp: ?*CDP) 
         .serve_mode = network.config.mode == .serve,
         .obey_robots = network.config.obeyRobots(),
         .robots = .{ .allocator = allocator, .network = network },
+        .cors = .{ .allocator = allocator },
         .url_blocklist = url_blocklist,
         .arena_pool = &network.app.arena_pool,
     };
@@ -253,6 +256,7 @@ pub fn deinit(self: *Client) void {
 
     self.clearUrlBlocklist();
     self.robots.deinit();
+    self.cors.deinit();
     self.blocking_requests.deinit(self.allocator);
     self.transfers.deinit(self.allocator);
     self.inbox.deinit();
@@ -558,6 +562,9 @@ pub fn newRequest(self: *Client, req: Request, owner: ?*Owner) anyerror!*Transfe
         if (req.credentials) |c| {
             owned.credentials = try arena.dupeZ(u8, c);
         }
+        if (req.cors) |c| {
+            owned.cors.?.origin = try arena.dupe(u8, c.origin);
+        }
 
         // The body can be larger, so callers can signal, via the
         // `body_outlives_request` flag that they guarantee that the body
@@ -809,7 +816,7 @@ fn startPending(self: *Client) !void {
     }
 }
 
-const SubmitFrom = enum { start, after_intercept, network };
+const SubmitFrom = enum { start, after_intercept, after_cors, network };
 
 // Process a transfer, passing it through our pipeline. A transfer an move off
 // the pipeline(e.g. while parked waiting for a robots.txt check) and then
@@ -850,6 +857,16 @@ fn pipeline(self: *Client, transfer: *Transfer, from: SubmitFrom) !void {
                 log.warn(.http, "blocked url", .{ .url = transfer.req.url });
                 return transfer.failAsync(error.UrlBlocked);
             }
+            // Before the cache: a preflight has to be satisfied even when
+            // the request itself would be served locally.
+            switch (try self.cors.check(transfer)) {
+                .allowed => {},
+                .blocked => return transfer.failAsync(error.CorsBlocked),
+                .pending => return,
+            }
+            continue :sw SubmitFrom.after_cors;
+        },
+        .after_cors => {
             if (try self.cacheLookup(transfer)) {
                 // response came from the cache, we're done
                 return;
@@ -876,6 +893,12 @@ fn pipeline(self: *Client, transfer: *Transfer, from: SubmitFrom) !void {
 // network, so an allowed transfer goes straight there.
 pub fn resumeAfterRobots(self: *Client, transfer: *Transfer) !void {
     return self.pipeline(transfer, .network);
+}
+
+// Cors preflight resumption. The preflight runs before the cache, so an
+// allowed transfer re-enters there.
+pub fn resumeAfterCors(self: *Client, transfer: *Transfer) !void {
+    return self.pipeline(transfer, .after_cors);
 }
 
 fn findHeader(headers: []const http.Header, name: []const u8) ?[]const u8 {
@@ -1622,6 +1645,10 @@ pub const Request = struct {
     resource_type: ResourceType,
     redirect: RedirectMode = .follow,
     credentials: ?[:0]const u8 = null,
+
+    // Fetch CORS state. Non-null only for requests that participate (today
+    // fetch() and XHR); see Cors.zig.
+    cors: ?Cors.Params = null,
     notification: *Notification,
     timeout_ms: u32 = 0,
     skip_cache: bool = false,
@@ -1989,6 +2016,9 @@ pub const Transfer = struct {
 
         // RobotsGate holds the transfer pending a robots.txt fetch.
         robots,
+
+        // Cors holds the transfer pending its OPTIONS preflight.
+        cors,
     };
 
     pub const HeaderResult = enum {
@@ -2024,7 +2054,7 @@ pub const Transfer = struct {
             return;
         }
         switch (self.state.parked) {
-            .robots => {},
+            .robots, .cors => {},
             .intercept_request, .intercept_auth => {
                 lp.assert(self.client.intercepted > 0, "Transfer.leaveIntercept", .{ .value = self.client.intercepted });
                 self.client.intercepted -= 1;
@@ -2097,6 +2127,11 @@ pub const Transfer = struct {
         // while we're parked.
         if (self.state == .parked and self.state.parked == .robots) {
             self.client.robots.remove(self);
+        }
+
+        // Same for the cors gate while parked on a preflight.
+        if (self.state == .parked and self.state.parked == .cors) {
+            self.client.cors.remove(self);
         }
 
         // A pending revalidation entry owns cache resources (possibly an
@@ -2926,6 +2961,14 @@ pub const Transfer = struct {
                     }
                 },
                 .header => {
+                    // The shared CORS chokepoint: every consumer (fetch,
+                    // XHR, cache hits, synthetic responses) funnels through
+                    // here, so neither the body nor the headers can reach
+                    // script before the check runs.
+                    if (!Cors.responseAllowed(transfer)) {
+                        log.warn(.http, "cors blocked", .{ .url = req.url, .reason = "allow-origin" });
+                        return transfer.failDelivery(error.CorsBlocked);
+                    }
                     if (transfer._notify_cdp) {
                         req.notification.dispatch(.http_response_header_done, &.{
                             .transfer = transfer,
@@ -3267,6 +3310,7 @@ fn initTestClient(client: *Client, pool: *ArenaPool) void {
     client.serve_mode = false;
     client.obey_robots = false;
     client.robots = .{ .allocator = testing.allocator, .network = undefined };
+    client.cors = .{ .allocator = testing.allocator };
     client.url_blocklist = null;
 }
 

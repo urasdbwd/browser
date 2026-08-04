@@ -45,6 +45,7 @@ _body: ?[]const u8,
 _arena: *lp.Arena,
 _cache: Cache,
 _credentials: Credentials,
+_mode: Mode,
 _redirect: Redirect,
 _signal: ?*AbortSignal,
 _body_used: bool = false,
@@ -60,6 +61,7 @@ pub const InitOpts = struct {
     body: ?BodyInit = null,
     cache: Cache = .default,
     credentials: Credentials = .@"same-origin",
+    mode: Mode = .cors,
     redirect: Redirect = .follow,
     signal: ?*AbortSignal = null,
     priority: ?[]const u8 = null,
@@ -78,6 +80,15 @@ const Credentials = enum {
     omit,
     include,
     @"same-origin",
+    pub const js_enum_from_string = true;
+};
+
+// ponytail: `navigate` / `websocket` are spec modes a script can never
+// construct, so they're left out.
+pub const Mode = enum {
+    cors,
+    @"same-origin",
+    @"no-cors",
     pub const js_enum_from_string = true;
 };
 
@@ -156,6 +167,7 @@ pub fn init(input: Input, opts_: ?InitOpts, exec: *const Execution) !*Request {
         ._headers = headers,
         ._cache = opts.cache,
         ._credentials = opts.credentials,
+        ._mode = opts.mode,
         ._redirect = opts.redirect,
         ._body = body,
         ._signal = signal,
@@ -210,6 +222,10 @@ pub fn getCache(self: *const Request) []const u8 {
 
 pub fn getCredentials(self: *const Request) []const u8 {
     return @tagName(self._credentials);
+}
+
+pub fn getMode(self: *const Request) []const u8 {
+    return @tagName(self._mode);
 }
 
 pub fn getRedirect(self: *const Request) []const u8 {
@@ -355,6 +371,7 @@ pub fn clone(self: *const Request, exec: *const Execution) !*Request {
         ._headers = self._headers,
         ._cache = self._cache,
         ._credentials = self._credentials,
+        ._mode = self._mode,
         ._redirect = self._redirect,
         ._body = if (self._body) |b| try arena.dupe(u8, b) else null,
         ._signal = self._signal,
@@ -378,6 +395,7 @@ pub const JsApi = struct {
     pub const headers = bridge.accessor(Request.getHeaders, null, .{});
     pub const cache = bridge.accessor(Request.getCache, null, .{});
     pub const credentials = bridge.accessor(Request.getCredentials, null, .{});
+    pub const mode = bridge.accessor(Request.getMode, null, .{});
     pub const redirect = bridge.accessor(Request.getRedirect, null, .{});
     pub const signal = bridge.accessor(Request.getSignal, null, .{});
     pub const bodyUsed = bridge.accessor(Request.getBodyUsed, null, .{});

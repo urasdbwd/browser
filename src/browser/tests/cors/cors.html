@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<!-- CORS enforcement for fetch() and XMLHttpRequest.
+
+     The test HTTP server never looks at the Host header, so hitting it as
+     "localhost" from a page loaded as "127.0.0.1" (or vice versa) is a real
+     second origin as far as the browser is concerned, on the same socket.
+     /cors/data mirrors whatever CORS headers the query string asks for. -->
+<script src="../testing.js"></script>
+
+<script id=setup>
+  window.XO = testing.ORIGIN.includes('127.0.0.1')
+    ? testing.ORIGIN.replace('127.0.0.1', 'localhost')
+    : testing.ORIGIN.replace('localhost', '127.0.0.1');
+  testing.expectFalse(XO === testing.ORIGIN);
+</script>
+
+<script id=same_origin type=module>
+  {
+    // The overwhelming majority of traffic: no CORS machinery at all.
+    const state = await testing.async();
+    const response = await fetch(testing.ORIGIN + '/cors/data');
+    const text = await response.text();
+    state.resolve();
+    await state.done(() => {
+      testing.expectEqual('basic', response.type);
+      testing.expectEqual('{"cors":true}', text);
+      // Same-origin sees every header, including the non-safelisted ones.
+      testing.expectEqual('hidden', response.headers.get('x-secret'));
+    });
+  }
+</script>
+
+<script id=cross_origin_no_acao type=module>
+  {
+    const state = await testing.async();
+    let err = null;
+    try {
+      const response = await fetch(XO + '/cors/data');
+      err = 'read body: ' + (await response.text());
+    } catch (e) {
+      err = e.constructor.name;
+    }
+    state.resolve();
+    await state.done(() => testing.expectEqual('TypeError', err));
+  }
+</script>
+
+<script id=cross_origin_wildcard type=module>
+  {
+    const state = await testing.async();
+    const response = await fetch(XO + '/cors/data?acao=*');
+    const text = await response.text();
+    state.resolve();
+    await state.done(() => {
+      testing.expectEqual('cors', response.type);
+      testing.expectEqual('{"cors":true}', text);
+    });
+  }
+</script>
+
+<script id=cross_origin_exact type=module>
+  {
+    const state = await testing.async();
+    const response = await fetch(XO + '/cors/data?acao=origin');
+    const text = await response.text();
+    state.resolve();
+    await state.done(() => {
+      testing.expectEqual(200, response.status);
+      testing.expectEqual('{"cors":true}', text);
+    });
+  }
+</script>
+
+<script id=cross_origin_mismatch type=module>
+  {
+    const state = await testing.async();
+    let err = null;
+    try {
+      const response = await fetch(XO + '/cors/data?acao=http://example.com');
+      err = 'read body: ' + (await response.text());
+    } catch (e) {
+      err = e.constructor.name;
+    }
+    state.resolve();
+    await state.done(() => testing.expectEqual('TypeError', err));
+  }
+</script>
+
+<script id=credentialed_wildcard type=module>
+  {
+    // "*" must NOT satisfy a credentialed request.
+    const state = await testing.async();
+    let err = null;
+    try {
+      const response = await fetch(XO + '/cors/data?acao=*', {credentials: 'include'});
+      err = 'read body: ' + (await response.text());
+    } catch (e) {
+      err = e.constructor.name;
+    }
+    state.resolve();
+    await state.done(() => testing.expectEqual('TypeError', err));
+  }
+</script>
+
+<script id=credentialed_exact type=module>
+  {
+    const state = await testing.async();
+    const response = await fetch(XO + '/cors/data?acao=origin&acac=true', {credentials: 'include'});
+    const text = await response.text();
+    state.resolve();
+    await state.done(() => testing.expectEqual('{"cors":true}', text));
+  }
+</script>
+
+<script id=credentialed_without_allow_credentials type=module>
+  {
+    const state = await testing.async();
+    let err = null;
+    try {
+      const response = await fetch(XO + '/cors/data?acao=origin', {credentials: 'include'});
+      err = 'read body: ' + (await response.text());
+    } catch (e) {
+      err = e.constructor.name;
+    }
+    state.resolve();
+    await state.done(() => testing.expectEqual('TypeError', err));
+  }
+</script>
+
+<script id=preflight_granted type=module>
+  {
+    // A non-safelisted author header forces an OPTIONS preflight.
+    const state = await testing.async();
+    const response = await fetch(XO + '/cors/data?acao=origin&acah=x-custom', {
+      headers: {'X-Custom': 'yes'},
+    });
+    const text = await response.text();
+    state.resolve();
+    await state.done(() => testing.expectEqual('{"cors":true}', text));
+  }
+</script>
+
+<script id=preflight_denied type=module>
+  {
+    // Same request, but the preflight doesn't allow the header.
+    const state = await testing.async();
+    let err = null;
+    try {
+      const response = await fetch(XO + '/cors/data?acao=origin', {
+        headers: {'X-Custom': 'yes'},
+      });
+      err = 'read body: ' + (await response.text());
+    } catch (e) {
+      err = e.constructor.name;
+    }
+    state.resolve();
+    await state.done(() => testing.expectEqual('TypeError', err));
+  }
+</script>
+
+<script id=preflight_method type=module>
+  {
+    // PUT is not a safelisted method: preflight, and it grants PUT.
+    const state = await testing.async();
+    const response = await fetch(XO + '/cors/data?acao=origin&acam=PUT', {method: 'PUT'});
+    const text = await response.text();
+    state.resolve();
+    await state.done(() => testing.expectEqual('{"cors":true}', text));
+  }
+</script>
+
+<script id=preflight_method_denied type=module>
+  {
+    const state = await testing.async();
+    let err = null;
+    try {
+      const response = await fetch(XO + '/cors/data?acao=origin&acam=GET', {method: 'PUT'});
+      err = 'read body: ' + (await response.text());
+    } catch (e) {
+      err = e.constructor.name;
+    }
+    state.resolve();
+    await state.done(() => testing.expectEqual('TypeError', err));
+  }
+</script>
+
+<script id=preflight_status_denied type=module>
+  {
+    // Preflight itself answers 403.
+    const state = await testing.async();
+    let err = null;
+    try {
+      const response = await fetch(XO + '/cors/data?acao=origin&acah=x-custom&preflight_status=403', {
+        headers: {'X-Custom': 'yes'},
+      });
+      err = 'read body: ' + (await response.text());
+    } catch (e) {
+      err = e.constructor.name;
+    }
+    state.resolve();
+    await state.done(() => testing.expectEqual('TypeError', err));
+  }
+</script>
+
+<script id=mode_no_cors type=module>
+  {
+    // no-cors never errors, it yields an opaque response instead.
+    const state = await testing.async();
+    const response = await fetch(XO + '/cors/data', {mode: 'no-cors'});
+    const text = await response.text();
+    state.resolve();
+    await state.done(() => {
+      testing.expectEqual('opaque', response.type);
+      testing.expectEqual(0, response.status);
+      testing.expectEqual('', text);
+      testing.expectEqual(null, response.headers.get('content-type'));
+    });
+  }
+</script>
+
+<script id=mode_same_origin type=module>
+  {
+    const state = await testing.async();
+    let err = null;
+    try {
+      const response = await fetch(XO + '/cors/data?acao=*', {mode: 'same-origin'});
+      err = 'read body: ' + (await response.text());
+    } catch (e) {
+      err = e.constructor.name;
+    }
+    state.resolve();
+    await state.done(() => testing.expectEqual('TypeError', err));
+  }
+</script>
+
+<script id=expose_headers type=module>
+  {
+    const state = await testing.async();
+    const response = await fetch(XO + '/cors/data?acao=*&expose=x-total');
+    await response.text();
+    state.resolve();
+    await state.done(() => {
+      // Safelisted: always visible.
+      testing.expectEqual('application/json', response.headers.get('content-type'));
+      // Named in Expose-Headers.
+      testing.expectEqual('42', response.headers.get('x-total'));
+      // Not named: hidden.
+      testing.expectEqual(null, response.headers.get('x-secret'));
+    });
+  }
+</script>
+
+<script id=xhr_blocked type=module>
+  {
+    const state = await testing.async();
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', XO + '/cors/data');
+    xhr.onerror = () => state.resolve('error');
+    xhr.onload = () => state.resolve('loaded:' + xhr.responseText);
+    xhr.send();
+    await state.done((res) => testing.expectEqual('error', res));
+  }
+</script>
+
+<script id=xhr_allowed type=module>
+  {
+    const state = await testing.async();
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', XO + '/cors/data?acao=*&expose=x-total');
+    xhr.onerror = () => state.resolve('error');
+    xhr.onload = () => state.resolve(xhr.responseText);
+    xhr.send();
+    await state.done((res) => {
+      testing.expectEqual('{"cors":true}', res);
+      testing.expectEqual('42', xhr.getResponseHeader('x-total'));
+      testing.expectEqual(null, xhr.getResponseHeader('x-secret'));
+    });
+  }
+</script>
