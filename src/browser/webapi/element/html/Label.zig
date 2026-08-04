@@ -47,7 +47,7 @@ pub fn getControl(self: *Label, frame: *Frame) ?*Element {
 
 fn isLabelable(el: *Element) bool {
     const html = el.is(HtmlElement) orelse return false;
-    return switch (html._type) {
+    return switch (html.typed()) {
         .button, .meter, .output, .progress, .select, .textarea => true,
         .input => |input| input._input_type != .hidden,
         else => false,

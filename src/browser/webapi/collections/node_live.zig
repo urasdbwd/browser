@@ -133,7 +133,7 @@ pub fn NodeLive(comptime mode: Mode) type {
                 ._last_length = null,
                 ._filter = filter,
                 ._tw = TW.init(root, .{}),
-                ._cached_version = frame._page.dom_version,
+                ._cached_version = currentVersion(frame),
             };
         }
 
@@ -407,7 +407,7 @@ pub fn NodeLive(comptime mode: Mode) type {
 
         fn isFormControl(el: *Element) bool {
             if (el._type != .html) return false;
-            const html = el._type.html;
+            const html = el.typed().html;
             return switch (html._type) {
                 .input, .button, .select, .textarea => true,
                 else => false,
@@ -415,7 +415,7 @@ pub fn NodeLive(comptime mode: Mode) type {
         }
 
         fn versionCheck(self: *Self, frame: *const Frame) bool {
-            const current = frame._page.dom_version;
+            const current = currentVersion(frame);
             if (current == self._cached_version) {
                 return true;
             }
@@ -425,6 +425,13 @@ pub fn NodeLive(comptime mode: Mode) type {
             self._last_length = null;
             self._cached_version = current;
             return false;
+        }
+
+        fn currentVersion(frame: *const Frame) usize {
+            return if (comptime mode == .selected_options)
+                frame._page.snapshot_version
+            else
+                frame._page.dom_version;
         }
 
         const HTMLCollection = @import("HTMLCollection.zig");

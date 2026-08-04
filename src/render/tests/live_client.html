@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Lightpanda live client test</title>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #toolbar { display: flex; gap: 4px; height: 36px; padding: 4px; box-sizing: border-box; }
+    #toolbar button { min-width: 32px; }
+    #address { flex: 1; }
+    #browser { height: calc(100% - 36px); }
+    #state { position: fixed; inset: auto 4px 4px auto; z-index: 1; }
+  </style>
+</head>
+<body>
+  <output id="state">opening</output>
+  <form id="toolbar">
+    <button id="back" type="button" aria-label="Back" title="Back" disabled>←</button>
+    <button id="forward" type="button" aria-label="Forward" title="Forward" disabled>→</button>
+    <button id="reload" type="button" aria-label="Reload" title="Reload" disabled>↻</button>
+    <input id="address" aria-label="Address">
+    <button>Go</button>
+  </form>
+  <main id="browser"></main>
+  <script type="module">
+    const params = new URLSearchParams(location.search);
+    const endpoint = params.get("endpoint") ?? "http://127.0.0.1:9223/v1/live";
+    const target = params.get("target") ??
+      "http://127.0.0.1:8766/src/render/tests/styled_page.html";
+    const moduleBase = new URL(endpoint, location.href);
+    if (moduleBase.protocol === "ws:") moduleBase.protocol = "http:";
+    if (moduleBase.protocol === "wss:") moduleBase.protocol = "https:";
+    const moduleUrl = new URL("/lightpanda-renderer.js", moduleBase);
+    const { attachLightpandaVirtualBrowser } = await import(moduleUrl);
+    const browser = attachLightpandaVirtualBrowser("#browser", {
+      endpoint,
+      directResources: params.get("resources") !== "false",
+      credentialless: params.get("credentialless") !== "false",
+      requireCredentialless: params.get("resources") !== "false",
+    });
+    globalThis.virtualBrowser = browser;
+    const address = document.querySelector("#address");
+    const back = document.querySelector("#back");
+    const forward = document.querySelector("#forward");
+    const reload = document.querySelector("#reload");
+    const state = document.querySelector("#state");
+    let committedUrl = target;
+    let renderedFrame = browser.iframe;
+    browser.addEventListener("snapshot", (event) => {
+      state.dataset.commit =
+        event.detail.iframe === renderedFrame ? "reconciled" : "replaced";
+      renderedFrame = event.detail.iframe;
+    });
+    browser.addEventListener("state", (event) => {
+      const page = event.detail;
+      if (page.url && (document.activeElement !== address || address.value === committedUrl)) {
+        address.value = page.url;
+      }
+      if (page.url) committedUrl = page.url;
+      back.disabled = !page.canGoBack;
+      forward.disabled = !page.canGoForward;
+      reload.disabled = !page.url;
+      if (page.title) document.title = `${page.title} — Lightpanda`;
+    });
+    address.value = target;
+    const runNavigation = async (label, action) => {
+      state.value = label;
+      try {
+        await action();
+        state.value = "ready";
+      } catch {
+        // The browser's error event owns the visible failure state.
+      }
+    };
+    document.querySelector("#toolbar").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      address.blur();
+      await runNavigation("navigating", () => browser.navigate(address.value));
+    });
+    back.addEventListener("click", () => {
+      void runNavigation("back", () => browser.back());
+    });
+    forward.addEventListener("click", () => {
+      void runNavigation("forward", () => browser.forward());
+    });
+    reload.addEventListener("click", () => {
+      void runNavigation("reloading", () => browser.reload());
+    });
+    browser.addEventListener("error", (event) => {
+      state.value = event.detail.message;
+    });
+    browser.addEventListener("action", (event) => {
+      state.value = `action:${event.detail.type}`;
+    });
+    browser.addEventListener("reconnecting", () => {
+      state.value = "reconnecting";
+    });
+    browser.addEventListener("reconnect", () => {
+      state.value = "ready";
+    });
+    browser.addEventListener("close", () => {
+      state.value = "closed";
+    });
+    await browser.open(target);
+    state.value = "ready";
+  </script>
+</body>
+</html>

@@ -85,7 +85,7 @@ pub fn dispatch(self: *EventManager, target: *EventTarget, event: *Event) Dispat
         log.debug(.event, "eventManager.dispatch", .{ .type = event._type_string.str(), .bubbles = event._bubbles });
     }
 
-    switch (target._type) {
+    switch (target.typed()) {
         .node => |node| try self.dispatchNode(node, event),
         .xhr => |xhr| try self.dispatchDirect(target, event, xhr.inlineHandler(event._type_string), .{ .context = "dispatch" }),
         .window => |w| try self.dispatchDirect(target, event, windowInlineHandler(w, event._type_string), .{ .context = "dispatch" }),
@@ -213,7 +213,7 @@ fn dispatchNode(self: *EventManager, target: *Node, event: *Event) !void {
             // activation behavior (ancestors only for bubbling events).
             if (event.is(@import("webapi/event/MouseEvent.zig")) != null) {
                 if (Frame.user_input.findClickActivationTarget(target, event._bubbles)) |activation_target| {
-                    Frame.user_input.handleClick(frame, activation_target) catch |err| {
+                    Frame.user_input.handleClick(frame, activation_target, event) catch |err| {
                         log.warn(.event, "frame.click", .{ .err = err });
                     };
                 }
@@ -263,7 +263,7 @@ fn dispatchNode(self: *EventManager, target: *Node, event: *Event) !void {
     // root is the document (not for detached trees, and not when propagation
     // stopped at a shadow boundary). The only explicit exception is "load".
     if (event._type_string.eql(comptime .wrap("load")) == false and path_len < path_buffer.len) {
-        const root_is_document = path_len > 0 and switch (path_buffer[path_len - 1]._type) {
+        const root_is_document = path_len > 0 and switch (path_buffer[path_len - 1].typed()) {
             .node => |n| n._type == .document,
             else => false,
         };
@@ -528,7 +528,7 @@ fn getInlineHandler(self: *EventManager, target: *EventTarget, event: *Event) ?j
     }
 
     // Look up the inline handler for this target
-    const html_element = switch (target._type) {
+    const html_element = switch (target.typed()) {
         .node => |n| n.is(Element.Html) orelse return null,
         // The Window stores its event handlers in dedicated fields; an event
         // propagating to the window must fire them too.
@@ -553,11 +553,11 @@ fn getInlineHandler(self: *EventManager, target: *EventTarget, event: *Event) ?j
 // DOM spec "retarget": walk original_target out of shadow trees until the
 // node is visible from current_target's tree.
 fn getAdjustedTarget(original_target: ?*EventTarget, current_target: *EventTarget) ?*EventTarget {
-    const orig_node = switch ((original_target orelse return null)._type) {
+    const orig_node = switch ((original_target orelse return null).typed()) {
         .node => |n| n,
         else => return original_target,
     };
-    const curr_node = switch (current_target._type) {
+    const curr_node = switch (current_target.typed()) {
         .node => |n| n,
         else => return original_target,
     };
@@ -592,7 +592,7 @@ fn isShadowIncludingInclusiveAncestor(ancestor: *Node, node: *Node) bool {
 // shadow root. Used for the spec's post-dispatch "clear targets" step.
 fn rootIsShadowRoot(target_: ?*EventTarget) bool {
     const target = target_ orelse return false;
-    var current: *Node = switch (target._type) {
+    var current: *Node = switch (target.typed()) {
         .node => |n| n,
         else => return false,
     };

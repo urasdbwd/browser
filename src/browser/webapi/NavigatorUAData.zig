@@ -16,21 +16,21 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+const std = @import("std");
 const builtin = @import("builtin");
 
 const Config = @import("../../Config.zig");
 const js = @import("../js/js.zig");
 const Execution = js.Execution;
 
-const Brand = struct {
-    brand: []const u8,
-    version: []const u8,
-};
+const Brand = Config.HttpHeaders.Brand;
 
 _pad: bool = false,
 
-pub fn getBrands(_: *const @This(), exec: *const Execution) []const Brand {
-    return brandList(exec);
+pub fn getBrands(_: *const @This(), exec: *const Execution) !js.Value {
+    const local = exec.js.local.?;
+    const brands = try local.zigValueToJs(brandList(exec), .{});
+    return local.freeze(brands);
 }
 
 pub fn getMobile(_: *const @This()) bool {
@@ -54,68 +54,65 @@ pub fn toJSON(_: *const @This(), exec: *const Execution) struct {
 }
 
 pub fn getHighEntropyValues(_: *const @This(), hints: []const []const u8, exec: *const Execution) !js.Promise {
-    _ = hints;
+    const local = exec.js.local.?;
+    const values = local.newObject();
+    _ = try values.set("brands", brandList(exec), .{});
+    _ = try values.set("mobile", false, .{});
+    _ = try values.set("platform", uaPlatform(exec), .{});
 
-    const stealth = exec.session.browser.app.config.http_headers.stealth;
-    const brands = brandList(exec);
-    const full_ver: []const u8 = if (stealth)
-        Config.HttpHeaders.stealth_ua_full_version
-    else
-        "1.0.0.0";
-    const platform_version: []const u8 = if (stealth)
-        "15.0.0"
-    else
-        "";
+    for (hints) |hint| {
+        if (std.mem.eql(u8, hint, "architecture")) {
+            _ = try values.set(hint, uaArchitecture(), .{});
+        } else if (std.mem.eql(u8, hint, "bitness")) {
+            _ = try values.set(hint, uaBitness(), .{});
+        } else if (std.mem.eql(u8, hint, "model")) {
+            _ = try values.set(hint, "", .{});
+        } else if (std.mem.eql(u8, hint, "platformVersion")) {
+            _ = try values.set(hint, platformVersion(exec), .{});
+        } else if (std.mem.eql(u8, hint, "uaFullVersion")) {
+            _ = try values.set(hint, fullVersion(exec), .{});
+        } else if (std.mem.eql(u8, hint, "fullVersionList")) {
+            _ = try values.set(hint, fullBrandList(exec), .{});
+        } else if (std.mem.eql(u8, hint, "wow64")) {
+            _ = try values.set(hint, false, .{});
+        } else if (std.mem.eql(u8, hint, "formFactors")) {
+            _ = try values.set(hint, [_][]const u8{}, .{});
+        }
+    }
 
-    return exec.js.local.?.resolvePromise(.{
-        .brands = brands,
-        .mobile = false,
-        .platform = uaPlatform(exec),
-        .architecture = uaArchitecture(),
-        .bitness = uaBitness(),
-        .model = "",
-        .platformVersion = platform_version,
-        .uaFullVersion = full_ver,
-        .fullVersionList = brands,
-        .wow64 = false,
-        .formFactor = [_][]const u8{"Desktop"},
-    });
+    return local.resolvePromise(values);
+}
+
+fn stealth(exec: *const Execution) bool {
+    return exec.session.browser.app.config.http_headers.stealth;
+}
+
+// Under --stealth the brands already carry the Chrome version, so the same
+// list doubles as the full-version list.
+fn fullBrandList(exec: *const Execution) []const Brand {
+    return if (stealth(exec)) brandList(exec) else &Config.HttpHeaders.full_brands;
+}
+
+fn fullVersion(exec: *const Execution) []const u8 {
+    return if (stealth(exec)) Config.HttpHeaders.stealth_ua_full_version else Config.HttpHeaders.product_version;
+}
+
+fn platformVersion(exec: *const Execution) []const u8 {
+    if (!stealth(exec)) return "";
+    return switch (exec.session.browser.app.config.fingerprint_profile.platform) {
+        .windows => "15.0.0",
+        .macos => "10.15.7",
+        .linux => "6.6.0",
+    };
 }
 
 fn brandList(exec: *const Execution) []const Brand {
-    return stableBrandSlice(exec.session.browser.app.config.http_headers.stealth);
-}
-
-fn stableBrandSlice(stealth: bool) []const Brand {
-    const S = struct {
-        var default_done = false;
-        var stealth_done = false;
-        var default_brands: [Config.HttpHeaders.brands_default.len]Brand = undefined;
-        var stealth_brands: [Config.HttpHeaders.brands_stealth.len]Brand = undefined;
-    };
-    if (stealth) {
-        if (!S.stealth_done) {
-            for (Config.HttpHeaders.brands_stealth, 0..) |b, i| {
-                S.stealth_brands[i] = .{ .brand = b.brand, .version = b.version };
-            }
-            S.stealth_done = true;
-        }
-        return S.stealth_brands[0..];
-    }
-    if (!S.default_done) {
-        for (Config.HttpHeaders.brands_default, 0..) |b, i| {
-            S.default_brands[i] = .{ .brand = b.brand, .version = b.version };
-        }
-        S.default_done = true;
-    }
-    return S.default_brands[0..];
+    return exec.session.browser.app.config.http_headers.brand_list;
 }
 
 fn uaPlatform(exec: *const Execution) []const u8 {
-    const cfg = exec.session.browser.app.config;
-    const fp = cfg.fingerprint_profile;
-    // CloakBrowser-style: seed/stealth profile drives UA-CH platform.
-    if (fp.seed != 0 or cfg.stealth()) {
+    const fp = exec.session.browser.app.config.fingerprint_profile;
+    if (fp.seed != 0) {
         return fp.platform.uaChPlatform();
     }
     return switch (builtin.os.tag) {
@@ -154,7 +151,7 @@ pub const JsApi = struct {
         pub const empty_with_no_proto = true;
     };
 
-    pub const brands = bridge.accessor(getBrands, null, .{});
+    pub const brands = bridge.accessor(getBrands, null, .{ .cache = .{ .private = "navigator_array" } });
     pub const mobile = bridge.accessor(getMobile, null, .{});
     pub const platform = bridge.accessor(getPlatform, null, .{});
     pub const toJSON = bridge.function(toJSONFn, .{});

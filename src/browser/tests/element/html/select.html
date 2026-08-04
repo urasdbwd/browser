@@ -168,6 +168,19 @@
   }
 </script>
 
+<script id="multiple_selectedIndex_clears_others">
+  {
+    const sel = $('#select_multi')
+    sel.options[0].selected = true
+    sel.options[1].selected = true
+    sel.selectedIndex = 2
+
+    testing.expectEqual(false, sel.options[0].selected)
+    testing.expectEqual(false, sel.options[1].selected)
+    testing.expectEqual(true, sel.options[2].selected)
+  }
+</script>
+
 <script id="options_collection">
   {
     const sel = $('#select1')
@@ -363,6 +376,20 @@
     testing.expectEqual(2, selectedOpts.length)
     testing.expectEqual('c', selectedOpts[0].value)
     testing.expectEqual('d', selectedOpts[1].value)
+
+    // value mutations keep the retained collection live
+    sel.value = 'a'
+    testing.expectEqual(1, selectedOpts.length)
+    testing.expectEqual('a', selectedOpts[0].value)
+
+    // Prime the cache, then exercise selectedIndex independently
+    sel.options[1].selected = true
+    testing.expectEqual(2, selectedOpts.length)
+    testing.expectEqual('a', selectedOpts[0].value)
+
+    sel.selectedIndex = 2
+    testing.expectEqual(1, selectedOpts.length)
+    testing.expectEqual('c', selectedOpts[0].value)
   }
 </script>
 

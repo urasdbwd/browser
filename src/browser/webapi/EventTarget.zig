@@ -22,6 +22,7 @@ const js = @import("../js/js.zig");
 const Page = @import("../Page.zig");
 const EventManager = @import("../EventManager.zig");
 
+const Factory = @import("../Factory.zig");
 const Event = @import("Event.zig");
 const AbortSignal = @import("AbortSignal.zig");
 
@@ -32,7 +33,38 @@ const EventTarget = @This();
 pub const _prototype_root = true;
 _type: Type,
 
-pub const Type = union(enum) {
+pub const Type = enum(u8) {
+    generic,
+    node,
+    window,
+    worker,
+    shared_worker,
+    worker_global_scope,
+    xhr,
+    abort_signal,
+    media_query_list,
+    message_port,
+    broadcast_channel,
+    text_track_cue,
+    navigation,
+    navigation_history_entry,
+    screen,
+    screen_orientation,
+    visual_viewport,
+    file_reader,
+    font_face_set,
+    websocket,
+    event_source,
+    cookie_store,
+    idb_request,
+    idb_database,
+    idb_transaction,
+    notification,
+};
+
+// `_type` only stores the tag: the payload is the next member of the
+// (contiguous) factory chain, resolved by Factory.typedOf.
+pub const Typed = union(Type) {
     generic: void,
     node: *@import("Node.zig"),
     window: *@import("Window.zig"),
@@ -60,6 +92,10 @@ pub const Type = union(enum) {
     idb_transaction: *@import("storage/idb/IDBTransaction.zig"),
     notification: *@import("Notification.zig"),
 };
+
+pub fn typed(self: *const EventTarget) Typed {
+    return Factory.typedOf(self);
+}
 
 pub fn init(page: *Page) !*EventTarget {
     return page.factory.create(EventTarget{
@@ -119,7 +155,7 @@ fn defaultPassiveValue(self: *EventTarget, typ: []const u8) bool {
         return false;
     }
 
-    switch (self._type) {
+    switch (self.typed()) {
         .window => return true,
         .node => |n| {
             const Element = @import("Element.zig");
@@ -211,7 +247,7 @@ pub fn removeEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nu
 }
 
 pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
-    return switch (self._type) {
+    return switch (self.typed()) {
         .node => |n| n.format(writer),
         .generic => writer.writeAll("<EventTarget>"),
         .window => writer.writeAll("<Window>"),
@@ -293,6 +329,6 @@ test "WebApi: EventTarget" {
     testing.silenceLog(&.{ .js, .event });
 
     // we create thousands of these per frame. Nothing should bloat it.
-    try testing.expectEqual(16, @sizeOf(EventTarget));
+    try testing.expectEqual(1, @sizeOf(EventTarget));
     try testing.htmlRunner("events.html", .{});
 }

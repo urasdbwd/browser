@@ -28,8 +28,8 @@ fn TelemetryT(comptime P: type) type {
 
         const Self = @This();
 
-        pub fn init(app: *App, run_mode: Config.RunMode, interactive: bool) !Self {
-            const disabled = isDisabled();
+        pub fn init(app: *App, run_mode: Config.RunMode, interactive: bool, disabled_by_profile: bool) !Self {
+            const disabled = isDisabled() or disabled_by_profile;
             if (builtin.mode != .Debug and builtin.is_test == false) {
                 log.info(.telemetry, "telemetry status", .{ .disabled = disabled });
             }
@@ -176,7 +176,7 @@ test "telemetry: always disabled in debug builds" {
         }
     };
 
-    var telemetry = try TelemetryT(FailingProvider).init(testing.test_app, .serve, false);
+    var telemetry = try TelemetryT(FailingProvider).init(testing.test_app, .serve, false, false);
     defer telemetry.deinit(testing.test_app.allocator);
     telemetry.record(.{ .run = {} });
 }
@@ -200,7 +200,7 @@ test "telemetry: getOrCreateId" {
 }
 
 test "telemetry: sends event to provider" {
-    var telemetry = try TelemetryT(MockProvider).init(testing.test_app, .serve, false);
+    var telemetry = try TelemetryT(MockProvider).init(testing.test_app, .serve, false, false);
     defer telemetry.deinit(testing.test_app.allocator);
     telemetry.disabled = false;
     const mock = telemetry.provider;

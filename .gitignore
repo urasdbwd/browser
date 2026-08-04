@@ -8,3 +8,6 @@ zig-out
 lightpanda.id
 /src/html5ever/target/
 src/snapshot.bin
+
+.codex-worktrees/
+*.log

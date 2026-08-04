@@ -16,8 +16,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Fingerprint-grade Web Audio stubs.
-//! OfflineAudioContext.startRendering yields a stable non-zero AudioBuffer.
+//! Minimal Web Audio compatibility APIs.
 
 const std = @import("std");
 const lp = @import("lightpanda");
@@ -256,7 +255,7 @@ pub const AnalyserNode = struct {
     _pad: bool = false,
 
     pub fn getFloatFrequencyData(_: *AnalyserNode, array: js.Value) void {
-        // Accept any typed array-like; fingerprint scripts pass Float32Array.
+        // Accept any typed array-like; callers commonly pass Float32Array.
         _ = array;
     }
     pub fn getByteFrequencyData(_: *AnalyserNode, array: js.Value) void {
@@ -338,8 +337,7 @@ fn createParam(exec: *const js.Execution, value: f64) !*AudioParam {
     return exec._factory.create(AudioParam{ ._value = value });
 }
 
-fn fillFingerprintSamples(samples: []f32, seed: u64, sample_rate: f32) void {
-    // Mix profile noise seed into the OfflineAudio path (CloakBrowser audio FP).
+fn fillSamples(samples: []f32, seed: u64, sample_rate: f32) void {
     var rng = seed ^ 0x415544494f;
     for (samples, 0..) |*s, i| {
         rng ^= rng << 13;
@@ -439,8 +437,7 @@ pub const OfflineAudioContext = struct {
         self._base.state = "closed";
         const local = exec.js.local.?;
         const samples = local.createTypedArray(.float32, self._length);
-        const noise = exec.session.browser.app.config.fingerprint_profile.noise_seed;
-        fillFingerprintSamples(samples.slice(), self._base.seed ^ noise, self._base.sample_rate);
+        fillSamples(samples.slice(), self._base.seed, self._base.sample_rate);
         const buffer = try exec._factory.create(AudioBuffer{
             ._sample_rate = self._base.sample_rate,
             ._length = self._length,

@@ -82,7 +82,7 @@ pub fn init(callback: js.Function.Global, options: ?ObserverInit, frame: *Frame)
 
     const root: ?*Element = blk: {
         const root_opt = opts.root orelse break :blk null;
-        switch (root_opt._type) {
+        switch (root_opt.typed()) {
             .element => |el| break :blk el,
             .document => {
                 // not strictly correct, `null` means the viewport, not the
@@ -215,7 +215,7 @@ fn calculateIntersection(
     };
 
     // For a headless browser without real layout, we treat all elements as fully visible.
-    // This avoids fingerprinting issues (massive viewports) and matches the behavior
+    // This avoids treating the synthetic viewport as a real layout surface and matches the behavior
     // scripts expect when querying element visibility.
     // However, elements without a parent cannot intersect (they have no containing block).
     const intersection_ratio: f64 = if (has_parent) 1.0 else 0.0;

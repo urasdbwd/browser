@@ -19,7 +19,9 @@
 const std = @import("std");
 const js = @import("../js/js.zig");
 
-/// Chrome-like PDF viewer plugin surface for fingerprint realism.
+/// Chrome's built-in PDF viewer surface. Chrome reports exactly these five
+/// plugins and two MIME types on every desktop build; an empty navigator.plugins
+/// is one of the oldest headless tells there is.
 pub fn registerTypes() []const type {
     return &.{ PluginArray, Plugin, MimeTypeArray, MimeType, PluginArray.Iterator, MimeTypeArray.Iterator };
 }
@@ -281,8 +283,9 @@ pub const MimeType = struct {
         return self._description;
     }
 
-    pub fn getEnabledPlugin(_: *const MimeType) *Plugin {
-        return &pluginsStorage()[0];
+    pub fn getEnabledPlugin(_: *const MimeType) ?*Plugin {
+        const storage = pluginsStorage();
+        return if (storage.len == 0) null else &storage[0];
     }
 
     pub const JsApi = struct {

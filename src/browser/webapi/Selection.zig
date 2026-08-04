@@ -358,7 +358,7 @@ pub fn modify(
 }
 
 fn isTextNode(node: *const Node) bool {
-    return switch (node._type) {
+    return switch (node.typed()) {
         .cdata => |cd| cd._type == .text,
         else => false,
     };

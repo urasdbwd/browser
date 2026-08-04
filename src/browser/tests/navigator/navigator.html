@@ -18,14 +18,20 @@
   testing.expectEqual(2, navigator.languages.length);
   testing.expectEqual('en-US', navigator.languages[0]);
   testing.expectEqual('en', navigator.languages[1]);
+  testing.expectTrue(navigator.languages === navigator.languages);
+  testing.expectTrue(Object.isFrozen(navigator.languages));
   testing.expectEqual(true, navigator.onLine);
   testing.expectEqual(true, navigator.cookieEnabled);
   testing.expectEqual(true, navigator.hardwareConcurrency > 0);
-  testing.expectEqual(4, navigator.hardwareConcurrency);
+  // Chrome always exposes deviceMemory; its absence is a headless tell.
+  testing.expectEqual('number', typeof navigator.deviceMemory);
+  testing.expectEqual(true, navigator.deviceMemory > 0);
   testing.expectEqual(0, navigator.maxTouchPoints);
   testing.expectEqual('', navigator.vendor);
   testing.expectEqual('Gecko', navigator.product);
   testing.expectEqual(false, navigator.javaEnabled());
+  // Must stay false: Chrome only sets it under a WebDriver session, and it is
+  // the single loudest automation signal a page can read.
   testing.expectEqual(false, navigator.webdriver);
 
   testing.expectEqual(null, navigator.doNotTrack);
@@ -40,8 +46,8 @@
   for (const name of [
     'userAgent', 'appName', 'appCodeName', 'appVersion', 'platform',
     'language', 'languages', 'onLine', 'cookieEnabled', 'hardwareConcurrency',
-    'deviceMemory', 'maxTouchPoints', 'vendor', 'product', 'webdriver',
-    'plugins', 'doNotTrack', 'globalPrivacyControl',
+    'maxTouchPoints', 'vendor', 'product', 'webdriver', 'plugins', 'doNotTrack',
+    'globalPrivacyControl',
   ]) {
     const desc = Object.getOwnPropertyDescriptor(Navigator.prototype, name);
     testing.expectEqual('function', typeof desc.get); // accessor on prototype
@@ -52,8 +58,8 @@
 </script>
 
 <script id=navigator_native_descriptor_walk>
-  // Mirror the bot-detection fingerprint: read every navigator property's
-  // descriptor and call toString() on its value/getter. This must not throw.
+  // Read every navigator property's descriptor and call toString() on its
+  // value/getter. This must not throw.
   let obj = navigator;
   do {
     for (const name of Object.getOwnPropertyNames(obj)) {
@@ -80,6 +86,23 @@
   }
 </script>
 
+<script id=permission_query_unknown type=module>
+  {
+    const state = await testing.async();
+    let rejected = false;
+    try {
+      await navigator.permissions.query({ name: 'not-a-real-permission' });
+    } catch (err) {
+      rejected = err instanceof TypeError;
+    }
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectTrue(rejected);
+    });
+  }
+</script>
+
 <script id=storage_estimate type=module>
   {
     const state = await testing.async();
@@ -97,27 +120,18 @@
   }
 </script>
 
-<script id=deviceMemory>
-  testing.expectEqual(8, navigator.deviceMemory);
-</script>
-
 <script id=plugins_mimeTypes>
 {
-  testing.expectEqual(true, navigator.plugins.length >= 3);
-  testing.expectEqual(true, navigator.plugins[0] instanceof Plugin);
-  testing.expectEqual(true, navigator.plugins[0].name.length > 0);
-  testing.expectEqual(true, /PDF/i.test(navigator.plugins[0].name));
-  // Iterable for CreepJS-style walks
+  // Chrome reports exactly these five PDF-viewer plugins; an empty
+  // navigator.plugins is a classic headless tell.
+  testing.expectEqual(5, navigator.plugins.length);
+  testing.expectEqual('PDF Viewer', navigator.plugins[0].name);
   let count = 0;
-  for (const p of navigator.plugins) {
-    testing.expectEqual(true, p.name.length > 0);
-    count++;
-  }
+  for (const _ of navigator.plugins) count++;
   testing.expectEqual(navigator.plugins.length, count);
-  testing.expectEqual(true, navigator.mimeTypes.length >= 1);
-  testing.expectEqual(true, navigator.mimeTypes[0] instanceof MimeType);
-  testing.expectEqual("application/pdf", navigator.mimeTypes.namedItem("application/pdf").type);
-  testing.expectEqual(true, navigator.mimeTypes[0].enabledPlugin instanceof Plugin);
+  testing.expectEqual(2, navigator.mimeTypes.length);
+  testing.expectEqual('application/pdf', navigator.mimeTypes[0].type);
+  testing.expectEqual('PDF Viewer', navigator.mimeTypes[0].enabledPlugin.name);
 }
 </script>
 
@@ -151,6 +165,8 @@
   testing.expectEqual(true, navigator.userAgentData === navigator.userAgentData);
 
   const json = navigator.userAgentData.toJSON();
+  testing.expectTrue(navigator.userAgentData.brands === navigator.userAgentData.brands);
+  testing.expectTrue(Object.isFrozen(navigator.userAgentData.brands));
   testing.expectEqual(false, json.mobile);
   testing.expectEqual(navigator.userAgentData.platform, json.platform);
   testing.expectEqual(true, Array.isArray(json.brands));
@@ -169,14 +185,55 @@
       testing.expectEqual(false, v.mobile);
       testing.expectEqual(navigator.userAgentData.platform, v.platform);
       testing.expectEqual(true, Array.isArray(v.brands));
+      testing.expectEqual(true, typeof v.architecture === 'string');
+      testing.expectEqual(true, typeof v.platformVersion === 'string');
       testing.expectEqual(true, Array.isArray(v.fullVersionList));
       testing.expectEqual('Lightpanda', v.fullVersionList[0].brand);
-      testing.expectEqual('1.0.0.0', v.uaFullVersion);
-      testing.expectEqual(false, v.wow64);
-      testing.expectEqual(true, Array.isArray(v.formFactor));
-      testing.expectEqual('Desktop', v.formFactor[0]);
+      testing.expectEqual('1.0', v.fullVersionList[0].version);
+      testing.expectEqual(false, 'bitness' in v);
+      testing.expectEqual(false, 'model' in v);
+      testing.expectEqual(false, 'uaFullVersion' in v);
+      testing.expectEqual(false, 'wow64' in v);
+      testing.expectEqual(false, 'formFactors' in v);
     });
   }
+</script>
+
+<script id=userAgentData_highEntropy_formFactors type=module>
+  {
+    const state = await testing.async();
+    const v = await navigator.userAgentData.getHighEntropyValues([
+      'formFactors',
+      'uaFullVersion',
+      'wow64',
+    ]);
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual(true, Array.isArray(v.formFactors));
+      testing.expectEqual(0, v.formFactors.length);
+      testing.expectEqual('1.0', v.uaFullVersion);
+      testing.expectEqual(false, v.wow64);
+      testing.expectEqual(false, 'architecture' in v);
+      testing.expectEqual(false, 'fullVersionList' in v);
+      testing.expectEqual(false, 'platformVersion' in v);
+    });
+  }
+</script>
+
+<script id=frozen_arrays_ignore_overridden_intrinsics>
+  const originalObject = Object;
+  Object.freeze = () => "overridden";
+  globalThis.Object = null;
+
+  const languages = navigator.languages;
+  const brands = navigator.userAgentData.brands;
+
+  globalThis.Object = originalObject;
+  testing.expectTrue(Array.isArray(languages));
+  testing.expectTrue(Array.isArray(brands));
+  testing.expectTrue(Object.isFrozen(languages));
+  testing.expectTrue(Object.isFrozen(brands));
 </script>
 
 <script id=getBattery type=module>
@@ -185,4 +242,3 @@
   // rather than a stub that always rejects.
   testing.expectEqual('undefined', typeof navigator.getBattery);
 </script>
-

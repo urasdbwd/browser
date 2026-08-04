@@ -1,0 +1,10 @@
+<!DOCTYPE html>
+<!-- Stand-in for the Turnstile challenge iframe: clicking the checkbox writes
+     a token into the host page's cf-turnstile-response input. -->
+<input type="checkbox" id="cb">
+<script>
+  document.getElementById('cb').addEventListener('click', function () {
+    var i = parent.document.querySelector('input[name=cf-turnstile-response]');
+    if (i) i.value = 'FAKE-TURNSTILE-TOKEN-0123456789';
+  });
+</script>

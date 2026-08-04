@@ -43,6 +43,7 @@ const Timers = @This();
 _timer_id: u30 = 0,
 _repeating: u32 = 0, // # of repeating timers we have
 _callbacks: CallbackHashMap = .{},
+_stopped: bool = false,
 
 // We keep the depth of the timers (a setTimeout calling a setTimeout). When
 // the depth reaches CLAMP_NESTING, the minimum timeout is 4ms. This is per-
@@ -88,6 +89,26 @@ pub fn schedule(
     delay_ms: u32,
     opts: ScheduleOpts,
 ) !u32 {
+    var owns_globals = true;
+    errdefer if (owns_globals) {
+        cb.release();
+        for (opts.params) |param| {
+            param.release();
+        }
+    };
+
+    const timer_id = self._timer_id +% 1;
+    self._timer_id = timer_id;
+
+    if (self._stopped or exec.js.scheduler.stopped) {
+        cb.release();
+        for (opts.params) |param| {
+            param.release();
+        }
+        owns_globals = false;
+        return timer_id;
+    }
+
     if (self._callbacks.count() >= MAX_CALLBACKS) {
         return error.TooManyTimeout;
     }
@@ -97,9 +118,6 @@ pub fn schedule(
 
     const arena = try exec.getArena(.tiny, "Timers.schedule");
     errdefer arena.release();
-
-    const timer_id = self._timer_id +% 1;
-    self._timer_id = timer_id;
 
     const nesting = @min(self._nesting_level + 1, CLAMP_NESTING + 1);
     const delay = if (nesting > CLAMP_NESTING and delay_ms < CLAMP_MS) CLAMP_MS else delay_ms;
@@ -136,6 +154,7 @@ pub fn schedule(
         .low_priority = opts.low_priority,
         .finalizer = ScheduleCallback.cancelled,
     });
+    owns_globals = false;
 
     if (opts.repeat) {
         self._repeating += 1;
@@ -148,7 +167,27 @@ pub fn clear(self: *Timers, id: u32) void {
     if (sc.value.repeat_ms != null) {
         self._repeating -= 1;
     }
-    sc.value.removed = true;
+    if (!sc.value.exec.js.scheduler.remove(sc.value)) {
+        sc.value.removed = true;
+    }
+}
+
+// Permanently retire this global's timers. The scheduler owns queued callback
+// cleanup; marking every callback removed also catches a timer that is
+// currently running and removes its own iframe.
+pub fn shutdown(self: *Timers) void {
+    if (self._stopped) {
+        return;
+    }
+    self._stopped = true;
+
+    var it = self._callbacks.valueIterator();
+    while (it.next()) |callback| {
+        callback.*.removed = true;
+    }
+    self._callbacks.clearRetainingCapacity();
+    self._repeating = 0;
+    self._nesting_level = 0;
 }
 
 // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#dom-settimeout
@@ -249,6 +288,11 @@ const ScheduleCallback = struct {
             },
         }
         ls.local.runMicrotasks();
+
+        if (self.removed) {
+            self.deinit();
+            return null;
+        }
 
         if (self.repeat_ms) |ms| {
             // each repeat re-enters the timer initialization steps, so the

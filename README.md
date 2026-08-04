@@ -113,19 +113,22 @@ available to adjust waiting time before dump.
 
 Lightpanda has no native pixel renderer. The `render` command keeps it that
 way: Lightpanda executes page JavaScript and hands a script-free DOM snapshot
-to an attachable browser library; the user's real browser performs CSS, image
-and font decoding, layout, paint, compositing and rasterization.
+to an attachable browser library. The user's browser loads the preserved
+stylesheets, images, fonts and media in explicit direct-resource mode, then
+performs layout, paint, compositing and rasterization. Lightpanda never pays
+the CPU or memory cost of those rendering stages.
 
 ```console
 ./lightpanda render --port 9223 --cors-origin http://localhost:5173
 ```
 
 The command defaults to the low-memory `pi` resource profile even on desktop
-hardware: one V8 isolate, a 64 MiB V8 heap, at most two connections and a
-4 MiB uncompressed snapshot cap. Dynamic HTML uses negotiated Brotli quality 0
-or gzip level 1 only when the body is large and compressible; small bodies stay
-uncompressed. Browsers decompress the HTTP response automatically. Outbound
-private, loopback and link-local addresses are blocked by default; use
+hardware: one V8 isolate, a 64 MiB V8 heap limit, at most two connections and a
+4 MiB uncompressed snapshot cap. These are configurable defaults, and the heap
+limit is not a whole-process RSS cap. One-shot HTTP responses use negotiated
+Brotli quality 0 or gzip level 1 only when the body is large and compressible;
+live WebSocket snapshots are not application-compressed. Outbound private,
+loopback and link-local addresses are blocked by default; use
 `--allow-private-networks` only for a trusted local target.
 
 ```html
@@ -134,25 +137,129 @@ private, loopback and link-local addresses are blocked by default; use
   import { attachLightpandaRenderer } from
     "http://127.0.0.1:9223/lightpanda-renderer.js";
 
-  const renderer = attachLightpandaRenderer("#preview");
+  const renderer = attachLightpandaRenderer("#preview", {
+    directResources: true,
+    requireCredentialless: true,
+  });
   await renderer.render("https://example.com", { waitUntil: "done" });
 </script>
 ```
 
-The library uses a Blob URL inside an opaque, empty-sandbox iframe. Page
-scripts cannot execute a second time, and the HTML never enters the parent via
-`innerHTML`. It requests a credentialless iframe where supported and sends no
-referrer. Set `requireCredentialless: true` to fail closed on browsers without
-that feature; otherwise sandboxed subresources may still use site cookies on
-older browsers.
+For a persistent, interactive virtual browser, attach the live client instead.
+Lightpanda keeps the page, JavaScript heap, cookies and timers alive while the
+user's browser renders successive script-free snapshots:
+
+```html
+<div id="browser" style="height: 720px"></div>
+<script type="module">
+  import { attachLightpandaVirtualBrowser } from
+    "http://127.0.0.1:9223/lightpanda-renderer.js";
+
+  const browser = attachLightpandaVirtualBrowser("#browser", {
+    directResources: true,
+    requireCredentialless: true,
+  });
+  await browser.open("https://example.com");
+</script>
+```
+
+For a minimal browser-style viewer with Back, Forward, Reload and an address
+bar, run:
+
+```console
+make build-dev
+python3 -m http.server 8766 --bind 127.0.0.1
+./zig-out/bin/lightpanda render --port 9223 \
+  --cors-origin http://127.0.0.1:8766 --allow-private-networks
+```
+
+Then open
+`http://127.0.0.1:8766/src/render/tests/live_client.html`. Its `endpoint` and
+`target` query parameters override the local test defaults. The private-network
+flag is needed only because this fixture renders another local test page.
+
+The live client obtains a 30-second, single-use ticket from
+`POST /v1/live-ticket`, then opens `GET /v1/live` as a WebSocket. A configured
+bearer token is sent only to the ticket endpoint in the `Authorization` header,
+not in the WebSocket URL. Clicks, text edits, common non-text key presses and
+scrolling are sent back to the persistent Lightpanda session; the browser
+client never executes target-page scripts. `back()`, `forward()`, `reload()`
+and the `state` event expose the server-owned navigation history and committed
+address. Unchanged snapshots are acknowledged without reloading the iframe,
+and the server keeps timers and network work pumping between user commands.
+The client polls every 500 ms by default. Snapshots up to 256 KiB retain that
+interval; larger snapshots scale to 2 seconds, while an interaction restores
+the base interval. Captured clicks use the exact rendered leaf element,
+iframe-viewport coordinates and keyboard modifiers with opaque,
+generation-bound element IDs. Stale nodes fail instead of being retargeted
+through a CSS selector. Explicit API calls may still use selectors.
+Loaded nested frames are transported as script-free `srcdoc` documents; clicks
+and renderer-owned `animationend` timing route back to the owning server frame.
+Same-page updates reconcile stable keyed elements in place instead of replacing
+the iframe. This preserves the client's native focus, selection, scroll,
+control, stylesheet, image/media decode and CSS animation state. Navigation and
+unsafe frame-tree changes still replace the browsing context atomically.
+
+Lightpanda owns target JavaScript, the authoritative DOM/CSSOM, timers, storage,
+cookies, application network requests, form submission and navigation. The
+client browser owns CSS layout and paint, hit testing, focus/caret/IME,
+compositor scrolling, native controls and visual-resource decoding. Interaction
+messages reconcile those two halves; target JavaScript is never executed in
+both runtimes.
+
+The server owns one V8 isolate and one live session. A second live connection
+cannot take ownership while that session is active; its commands are rejected.
+Reopening on the owning connection, or submitting a valid `POST /v1/render`,
+closes the live session. Run one `render` process per independently concurrent
+user. If an established live WebSocket drops, the client keeps the last painted
+snapshot inert and reopens the Lightpanda session with bounded backoff.
+
+Remote visual resources are blocked by default. Set `directResources: true`
+to let the client browser fetch preserved stylesheets, images, fonts and media;
+this does not make Lightpanda decode or render them. Direct mode requires a
+credentialless iframe unless `allowCredentialedResources: true` explicitly
+accepts sending browser credentials. It also exposes the client IP and network
+to requests selected by the target page, so use it only for trusted targets or
+behind a future resource broker.
+Public anonymous CSS, images, fonts and media are suitable for direct client
+rendering. Authenticated, origin-bound, signed or `blob:` visual resources need
+an opaque Lightpanda resource relay: Lightpanda performs the authorized fetch
+and the client receives undecoded bytes to render. Scripts, modules, WASM,
+fetch/XHR/WebSocket traffic and storage remain server-only.
+
+The one-shot library loads a short-lived Blob URL inside an opaque,
+empty-sandbox iframe. The live client uses `srcdoc` and adds only
+`allow-same-origin` so the parent can capture user input; it never adds
+`allow-scripts`. Page scripts cannot execute a second time, and the HTML never
+enters the parent via `innerHTML`. Both clients request a credentialless iframe
+where supported and send no referrer. Set
+`requireCredentialless: true` to fail closed on browsers without that feature;
+otherwise remote stylesheet, image, font or media requests may still use site
+cookies on older browsers. Those resources are fetched and decoded by the
+client; Lightpanda only streams the script-free document state. The one-shot
+iframe is inert and has pointer events disabled.
+Live snapshots cancel capture-phase anchor clicks, auxiliary clicks and form
+submission; context-menu or drag navigation inside the sandbox remains
+browser-dependent.
+For untrusted targets, host the viewer on a dedicated origin with no application
+cookies or saved credentials. Contenteditable, pointer drags, nested-element
+scrolling, drag/drop and file input are not yet transported by the live client.
 
 Set an exact `--cors-origin` for browser use. A non-loopback bind also requires
 an `--auth-token` of at least 16 bytes; pass the same value as the library's
-`token` option. The host page's CSP must allow the endpoint in `script-src` and
-`connect-src`, plus `blob:` in `frame-src`. A snapshot transfers DOM and
-attributes, not a JavaScript heap, event listeners, canvas pixels or the
-original site's origin, so some origin-gated fonts/media cannot be reproduced
-perfectly without an origin proxy.
+`token` option. Live control rejects `--cors-origin '*'`; use one exact origin.
+Terminate TLS at a trusted reverse proxy before exposing the service outside
+the machine because WebSocket authentication and snapshots contain sensitive
+session data. The virtual-browser API has no agent dependency and adds no
+application-level agent identity, but it is not an anti-detection or CAPTCHA
+bypass layer. The host page's CSP must allow the endpoint in `script-src` and
+`connect-src`, plus `blob:` and its own `srcdoc` child in `frame-src`. A snapshot
+transfers DOM and attributes, not a JavaScript heap, event listeners, canvas
+pixels or the original site's origin. Target scripts never enter the client
+snapshot; target application connections and workers execute only in
+Lightpanda.
+Authenticated/CORS-restricted resources require a trusted fetch-and-rewrite
+broker that this server does not yet provide.
 
 ### Start a CDP server
 
@@ -367,14 +474,14 @@ explicitly:
 ```
 
 The profile caps each V8 heap at 64 MiB, uses one V8 background worker, disables
-V8 idle tasks, limits HTTP/CDP/WebSocket concurrency and response sizes, and
-skips iframe and Web Worker loading plus speculative script preloads. It also
-reduces pooled arena retention from roughly 6 MiB to 448 KiB. Explicit numeric
-limits override the profile. CDP response-body capture is capped at 8 MiB and
-256 entries per page lifecycle. MCP is capped at two V8-backed sessions, two
-simultaneous HTTP connections and 4 MiB request/response buffers per connection.
-A CDP client can opt loading features back in per session with
-`LP.configureLoading`.
+V8 idle tasks, optional telemetry and speculative script preloads, and limits
+HTTP/CDP/WebSocket concurrency and response sizes. It keeps iframe and Web
+Worker loading enabled for web compatibility; use `--disable-subframes` or
+`--disable-workers` when a workload does not need them. It also reduces pooled
+arena retention from roughly 6 MiB to 448 KiB. Explicit numeric limits override
+the profile. CDP response-body capture is capped at 8 MiB and 256 entries per
+page lifecycle. MCP is capped at two V8-backed sessions, two simultaneous HTTP
+connections and 4 MiB request/response buffers per connection.
 
 Lightpanda is headless: it does not rasterize pixels or produce screenshots on
 the server. DOM and JavaScript run in the browser process; page data is

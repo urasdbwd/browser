@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Live session frame parent</title>
+</head>
+<body>
+  <iframe
+    id="child-frame"
+    src="live_session_frame_child.html"
+    data-lightpanda-live-frame="spoof"
+  ></iframe>
+  <iframe
+    id="srcdoc-frame"
+    sandbox="allow-scripts"
+    srcdoc="<p id='srcdoc-content'>srcdoc child</p>"
+  ></iframe>
+</body>
+</html>

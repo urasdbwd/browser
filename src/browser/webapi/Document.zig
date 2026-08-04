@@ -1282,7 +1282,7 @@ fn validateDocumentNodes(self: *Document, nodes: []const Node.NodeOrText, compti
                     var frag_it = frag.asNode().childrenIterator();
                     while (frag_it.next()) |frag_child| {
                         // Document can only contain: Element, DocumentType, Comment, ProcessingInstruction
-                        switch (frag_child._type) {
+                        switch (frag_child.typed()) {
                             .element => {
                                 if (has_element) {
                                     return error.HierarchyError;
@@ -1308,7 +1308,7 @@ fn validateDocumentNodes(self: *Document, nodes: []const Node.NodeOrText, compti
                     }
                 } else {
                     // Validate node type for direct insertion
-                    switch (child._type) {
+                    switch (child.typed()) {
                         .element => {
                             if (has_element) {
                                 return error.HierarchyError;

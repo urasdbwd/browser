@@ -176,7 +176,7 @@ pub fn init(
     });
     const self = leaf._proto;
     self._type = @unionInit(Type, @tagName(tag), leaf);
-    self._proto._type = .{ .worker_global_scope = self };
+    self._proto._type = .worker_global_scope;
 
     self._http_owner = .init(&frame._page.blob_urls, &self.origin);
 

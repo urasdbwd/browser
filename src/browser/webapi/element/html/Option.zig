@@ -25,6 +25,7 @@ const Frame = @import("../../../Frame.zig");
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
 const HtmlElement = @import("../Html.zig");
+const collections = @import("../../collections.zig");
 
 const String = lp.String;
 
@@ -60,9 +61,7 @@ pub fn getValue(self: *Option, frame: *Frame) []const u8 {
 }
 
 pub fn setValue(self: *Option, value: []const u8, frame: *Frame) !void {
-    const owned = try frame.dupeString(value);
-    try self.asElement().setAttributeSafe(comptime .wrap("value"), .wrap(owned), frame);
-    self._value = owned;
+    try self.asElement().setAttributeSafe(comptime .wrap("value"), .wrap(value), frame);
 }
 
 pub fn getText(self: *const Option, frame: *Frame) []const u8 {
@@ -79,10 +78,33 @@ pub fn getSelected(self: *const Option) bool {
 }
 
 pub fn setSelected(self: *Option, selected: bool, frame: *Frame) !void {
-    // TODO: When setting selected=true, may need to unselect other options
-    // in the parent <select> if it doesn't have multiple attribute
+    var changed = self._selected != selected;
+
+    if (selected) {
+        const parent = self.asNode().parentNode();
+        const select = if (parent) |node| blk: {
+            if (node.is(Element.Html.Select)) |owner| break :blk owner;
+            if (node.is(Element.Html.OptGroup) == null) break :blk null;
+            const grandparent = node.parentNode() orelse break :blk null;
+            break :blk grandparent.is(Element.Html.Select);
+        } else null;
+
+        if (select) |owner| {
+            if (!owner.getMultiple()) {
+                var options = collections.NodeLive(.select_options).init(owner.asNode(), {}, frame);
+                while (options.next()) |element| {
+                    const option = element.as(Option);
+                    if (option == self or !option._selected) continue;
+                    option._selected = false;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    if (!changed) return;
     self._selected = selected;
-    frame.domChanged();
+    frame.snapshotChanged();
 }
 
 pub fn getDefaultSelected(self: *const Option) bool {

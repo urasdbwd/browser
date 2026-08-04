@@ -163,8 +163,20 @@ pub fn setValue(self: *Input, value: []const u8, frame: *Frame) !void {
         if (value.len == 0) return;
         return error.InvalidStateError;
     }
-    // This should _not_ call setAttribute. It updates the current state only
-    self._value = try self.sanitizeValue(true, value, frame);
+    if (self._input_type != .range) {
+        if (frame._page.getMutableFormValue(self)) |current| {
+            if (std.mem.eql(u8, current, value)) return;
+        }
+    }
+
+    // This should _not_ call setAttribute. It updates the current state only.
+    const sanitized: []u8 = @constCast(try self.sanitizeValue(true, value, frame));
+    const changed = !std.mem.eql(u8, self.getValue(), sanitized);
+    self._value = try frame._page.adoptMutableFormValue(self, sanitized);
+    if (changed and switch (self._input_type) {
+        .password, .file => false,
+        else => true,
+    }) frame.snapshotChanged();
 }
 
 pub fn getDefaultValue(self: *const Input) []const u8 {
@@ -180,21 +192,27 @@ pub fn getChecked(self: *const Input) bool {
 }
 
 pub fn setChecked(self: *Input, checked: bool, frame: *Frame) !void {
+    var changed = self._checked != checked;
     // If checking a radio button, uncheck others in the group first
     if (checked and self._input_type == .radio) {
-        self.uncheckRadioGroup(frame);
+        changed = self.uncheckRadioGroup(frame) or changed;
     }
     // This should _not_ call setAttribute. It updates the current state only
     self._checked = checked;
     self._checked_dirty = true;
+    if (changed and (self._input_type == .checkbox or self._input_type == .radio)) {
+        frame.snapshotChanged();
+    }
 }
 
 pub fn getIndeterminate(self: *const Input) bool {
     return self._indeterminate;
 }
 
-pub fn setIndeterminate(self: *Input, value: bool) !void {
+pub fn setIndeterminate(self: *Input, value: bool, frame: *Frame) !void {
+    if (self._indeterminate == value) return;
     self._indeterminate = value;
+    frame.snapshotChanged();
 }
 
 pub fn getDefaultChecked(self: *const Input) bool {
@@ -779,15 +797,14 @@ fn howSelected(self: *const Input) HowSelected {
 }
 
 pub fn innerInsert(self: *Input, str: []const u8, frame: *Frame) !void {
-    const arena = frame.arena;
+    const allocator = frame._page.session.browser.app.allocator;
 
     switch (self.howSelected()) {
         .full => {
             // if the input is fully selected, replace the content.
-            const new_value = try arena.dupe(u8, str);
-            try self.setValue(new_value, frame);
-            self._selection_start = @intCast(new_value.len);
-            self._selection_end = @intCast(new_value.len);
+            try self.setValue(str, frame);
+            self._selection_start = @intCast(str.len);
+            self._selection_end = @intCast(str.len);
             self._selection_direction = .none;
             try self.dispatchSelectionChangeEvent(frame);
         },
@@ -798,10 +815,11 @@ pub fn innerInsert(self: *Input, str: []const u8, frame: *Frame) !void {
             const remaining = current_value[range[1]..];
 
             const new_value = try std.mem.concat(
-                arena,
+                allocator,
                 u8,
                 &.{ before, str, remaining },
             );
+            defer allocator.free(new_value);
             try self.setValue(new_value, frame);
 
             const new_pos = range[0] + str.len;
@@ -813,7 +831,8 @@ pub fn innerInsert(self: *Input, str: []const u8, frame: *Frame) !void {
         .none => {
             // if the input is not selected, just insert at cursor.
             const current_value = self.getValue();
-            const new_value = try std.mem.concat(arena, u8, &.{ current_value, str });
+            const new_value = try std.mem.concat(allocator, u8, &.{ current_value, str });
+            defer allocator.free(new_value);
             try self.setValue(new_value, frame);
         },
     }
@@ -975,69 +994,109 @@ pub fn setFormNoValidate(self: *Input, value: bool, frame: *Frame) !void {
 
 /// Sanitize the value according to the current input type
 fn sanitizeValue(self: *Input, comptime dupe: bool, value: []const u8, frame: *Frame) ![]const u8 {
+    const allocator = if (comptime dupe)
+        frame._page.session.browser.app.allocator
+    else
+        frame.arena;
+
     switch (self._input_type) {
         .text, .search, .tel, .password, .url, .email => {
-            const sanitized = blk: {
-                const first = std.mem.indexOfAny(u8, value, "\r\n") orelse {
-                    break :blk if (comptime dupe) try frame.dupeString(value) else value;
-                };
-
-                var result = try frame.arena.alloc(u8, value.len);
-                @memcpy(result[0..first], value[0..first]);
-
-                var i: usize = first;
-                for (value[first + 1 ..]) |c| {
-                    if (c != '\r' and c != '\n') {
-                        result[i] = c;
-                        i += 1;
-                    }
-                }
-                break :blk result[0..i];
-            };
-
-            return switch (self._input_type) {
-                .url, .email => std.mem.trim(u8, sanitized, &std.ascii.whitespace),
-                else => sanitized,
-            };
+            const trim_whitespace = self._input_type == .url or self._input_type == .email;
+            return sanitizeTextValue(dupe, value, trim_whitespace, allocator);
         },
-        .date => return if (isValidDate(value)) if (comptime dupe) try frame.dupeString(value) else value else "",
-        .month => return if (isValidMonth(value)) if (comptime dupe) try frame.dupeString(value) else value else "",
-        .week => return if (isValidWeek(value)) if (comptime dupe) try frame.dupeString(value) else value else "",
-        .time => return if (isValidTime(value)) if (comptime dupe) try frame.dupeString(value) else value else "",
-        .@"datetime-local" => return try sanitizeDatetimeLocal(dupe, value, frame.arena),
-        .number => return if (isValidFloatingPoint(value)) if (comptime dupe) try frame.dupeString(value) else value else "",
+        .date => return dupeValue(dupe, if (isValidDate(value)) value else "", allocator),
+        .month => return dupeValue(dupe, if (isValidMonth(value)) value else "", allocator),
+        .week => return dupeValue(dupe, if (isValidWeek(value)) value else "", allocator),
+        .time => return dupeValue(dupe, if (isValidTime(value)) value else "", allocator),
+        .@"datetime-local" => {
+            const sanitized = try sanitizeDatetimeLocal(dupe, value, allocator);
+            if (comptime dupe) {
+                // Every mutable value stored by Page must be the complete
+                // allocation, including the invalid-value empty string.
+                if (sanitized.len == 0) return allocator.dupe(u8, "");
+            }
+            return sanitized;
+        },
+        .number => return dupeValue(dupe, if (isValidFloatingPoint(value)) value else "", allocator),
         .range => {
             const value_attr = self.asConstElement().getAttributeSafe(comptime .wrap("value")) orelse "";
-            return try sanitizeRange(dupe, value, self.getMin(), self.getMax(), self.getStep(), value_attr, frame);
+            return sanitizeRange(dupe, value, self.getMin(), self.getMax(), self.getStep(), value_attr, allocator);
         },
         .color => {
             if (value.len == 7 and value[0] == '#') {
                 var needs_lower = false;
                 for (value[1..]) |c| {
                     if (!std.ascii.isHex(c)) {
-                        return "#000000";
+                        return dupeValue(dupe, "#000000", allocator);
                     }
                     if (c >= 'A' and c <= 'F') {
                         needs_lower = true;
                     }
                 }
                 if (!needs_lower) {
-                    return if (comptime dupe) try frame.dupeString(value) else value;
+                    return dupeValue(dupe, value, allocator);
                 }
 
                 // Normalize to lowercase per spec
-                const result = try frame.arena.alloc(u8, 7);
+                const result = try allocator.alloc(u8, 7);
                 result[0] = '#';
                 for (value[1..], 1..) |c, j| {
                     result[j] = std.ascii.toLower(c);
                 }
                 return result;
             }
-            return "#000000";
+            return dupeValue(dupe, "#000000", allocator);
         },
-        .file => return "", // File: always empty
-        .checkbox, .radio, .submit, .image, .reset, .button, .hidden => return if (comptime dupe) try frame.dupeString(value) else value, // no sanitization
+        .file => return dupeValue(dupe, "", allocator), // File: always empty
+        .checkbox, .radio, .submit, .image, .reset, .button, .hidden => return dupeValue(dupe, value, allocator), // no sanitization
     }
+}
+
+fn dupeValue(comptime dupe: bool, value: []const u8, allocator: std.mem.Allocator) ![]const u8 {
+    return if (comptime dupe) allocator.dupe(u8, value) else value;
+}
+
+fn sanitizeTextValue(
+    comptime dupe: bool,
+    value: []const u8,
+    trim_whitespace: bool,
+    allocator: std.mem.Allocator,
+) ![]const u8 {
+    var filtered_len: usize = 0;
+    var first_non_whitespace: ?usize = null;
+    var last_non_whitespace: usize = 0;
+    var removed_newline = false;
+
+    for (value) |c| {
+        if (c == '\r' or c == '\n') {
+            removed_newline = true;
+            continue;
+        }
+        if (!trim_whitespace or !std.ascii.isWhitespace(c)) {
+            if (first_non_whitespace == null) first_non_whitespace = filtered_len;
+            last_non_whitespace = filtered_len + 1;
+        }
+        filtered_len += 1;
+    }
+
+    const start = if (trim_whitespace) first_non_whitespace orelse filtered_len else 0;
+    const end = if (trim_whitespace and first_non_whitespace != null) last_non_whitespace else filtered_len;
+    if (!dupe and !removed_newline and start == 0 and end == value.len) {
+        return value;
+    }
+
+    const result = try allocator.alloc(u8, end - start);
+    var filtered_index: usize = 0;
+    var result_index: usize = 0;
+    for (value) |c| {
+        if (c == '\r' or c == '\n') continue;
+        if (filtered_index >= start and filtered_index < end) {
+            result[result_index] = c;
+            result_index += 1;
+        }
+        filtered_index += 1;
+    }
+    return result;
 }
 
 /// WHATWG "valid floating-point number" grammar check + overflow detection.
@@ -1253,7 +1312,7 @@ fn sanitizeRange(
     max_attr: []const u8,
     step_attr: []const u8,
     value_attr: []const u8,
-    frame: *Frame,
+    allocator: std.mem.Allocator,
 ) ![]const u8 {
     const min: f64 = if (isValidFloatingPoint(min_attr))
         std.fmt.parseFloat(f64, min_attr) catch 0
@@ -1271,7 +1330,7 @@ fn sanitizeRange(
         0;
 
     if (!isValidFloatingPoint(value)) {
-        return try formatFloat(frame.arena, snapToStep(min + (max - min) / 2, min, max, step_base, step_attr));
+        return formatFloat(allocator, snapToStep(min + (max - min) / 2, min, max, step_base, step_attr));
     }
 
     const v0 = std.fmt.parseFloat(f64, value) catch unreachable; // grammar already validated
@@ -1282,9 +1341,9 @@ fn sanitizeRange(
     if (v == v0 and snapped == v) {
         // Already valid and on the ladder — preserve the original string so
         // assignments like `el.value = "1.0"` round-trip without canonicalizing.
-        return if (comptime dupe) try frame.dupeString(value) else value;
+        return dupeValue(dupe, value, allocator);
     }
-    return try formatFloat(frame.arena, snapped);
+    return formatFloat(allocator, snapped);
 }
 
 /// Snap `value` (already clamped to `[min, max]`) to the nearest value on the
@@ -1320,9 +1379,9 @@ fn snapToStep(value: f64, min: f64, max: f64, step_base: f64, step_attr: []const
     return candidate;
 }
 
-/// Format an f64 to its shortest decimal representation, arena-allocated.
-fn formatFloat(arena: std.mem.Allocator, value: f64) ![]const u8 {
-    return std.fmt.allocPrint(arena, "{d}", .{value});
+/// Format an f64 to its shortest decimal representation.
+fn formatFloat(allocator: std.mem.Allocator, value: f64) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{d}", .{value});
 }
 
 /// Parse a slice that must be ALL ASCII digits into a u32. Returns null if any non-digit or empty.
@@ -1360,14 +1419,17 @@ fn maxWeeksInYear(year: u32) u32 {
     return 52;
 }
 
-fn uncheckRadioGroup(self: *Input, frame: *Frame) void {
-    var iter = self.radioGroupIterator() orelse return;
+fn uncheckRadioGroup(self: *Input, frame: *Frame) bool {
+    var iter = self.radioGroupIterator() orelse return false;
     const my_form = self.getForm(frame);
+    var changed = false;
     while (iter.next()) |other| {
         if (other == self) continue;
         if (!sameFormOwner(my_form, other, frame)) continue;
+        changed = changed or other._checked;
         other._checked = false;
     }
+    return changed;
 }
 
 pub fn getPopoverTargetElement(self: *Input, frame: *Frame) ?*Element {
@@ -1481,7 +1543,7 @@ pub const Build = struct {
 
         // If this is a checked radio button, uncheck others in its group
         if (self._checked and self._input_type == .radio) {
-            self.uncheckRadioGroup(frame);
+            _ = self.uncheckRadioGroup(frame);
         }
     }
 
@@ -1493,14 +1555,15 @@ pub const Build = struct {
                 self._input_type = Type.fromString(value.str());
                 // Sanitize the current value according to the new type
                 if (self._value) |current_value| {
-                    self._value = try self.sanitizeValue(false, current_value, frame);
-                    // Apply default value for checkbox/radio if value is now empty
-                    if (self._value.?.len == 0 and (self._input_type == .checkbox or self._input_type == .radio)) {
-                        self._value = "on";
+                    if (current_value.len == 0 and (self._input_type == .checkbox or self._input_type == .radio)) {
+                        self._value = try frame._page.putMutableFormValue(self, "on");
+                    } else {
+                        const sanitized: []u8 = @constCast(try self.sanitizeValue(true, current_value, frame));
+                        self._value = try frame._page.adoptMutableFormValue(self, sanitized);
                     }
                 }
             },
-            .value => self._default_value = try frame.arena.dupe(u8, value.str()),
+            .value => self._default_value = element.getAttributeSafe(comptime .wrap("value")),
             .checked => {
                 self._default_checked = true;
                 // Only update checked state if it hasn't been manually modified
@@ -1508,7 +1571,7 @@ pub const Build = struct {
                     self._checked = true;
                     // If setting a radio button to checked, uncheck others in the group
                     if (self._input_type == .radio) {
-                        self.uncheckRadioGroup(frame);
+                        _ = self.uncheckRadioGroup(frame);
                     }
                 }
             },
@@ -1531,13 +1594,19 @@ pub const Build = struct {
         }
     }
 
-    pub fn cloned(source_element: *Element, cloned_element: *Element, deep: bool, _: *Frame) !void {
+    pub fn cloned(source_element: *Element, cloned_element: *Element, deep: bool, frame: *Frame) !void {
         _ = deep;
         const source = source_element.as(Input);
         const clone = cloned_element.as(Input);
 
         // Copy runtime state from source to clone
-        clone._value = source._value;
+        // Always copy a concrete value into the destination Page. The source
+        // may belong to another Page (Document.importNode), whose mutable map
+        // and arena can be torn down independently.
+        clone._value = if (source._value) |value|
+            try frame._page.putMutableFormValue(clone, value)
+        else
+            null;
         clone._checked = source._checked;
         clone._checked_dirty = source._checked_dirty;
         clone._selection_direction = source._selection_direction;
@@ -1556,6 +1625,102 @@ test "WebApi: HTML.Input" {
     try testing.htmlRunner("element/html/input-attrs.html", .{});
     try testing.htmlRunner("element/html/input-validity.html", .{});
     try testing.htmlRunner("element/html/input_file.html", .{});
+}
+
+test "HTML.Input live-only state invalidates snapshots" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    try frame.document.injectBlank(frame);
+
+    const body = (try frame.document.querySelector(comptime .wrap("body"), frame)).?;
+    const checkbox = (try frame.document.createElement("input", null, frame)).is(Input).?;
+    _ = try body.asNode().appendChild(checkbox.asNode(), frame);
+    try checkbox.setType("checkbox", frame);
+
+    const indeterminate = (try frame.document.createElement("input", null, frame)).is(Input).?;
+    _ = try body.asNode().appendChild(indeterminate.asNode(), frame);
+    try indeterminate.setType("checkbox", frame);
+
+    var snapshot_version = frame._page.snapshot_version;
+    const dom_version = frame._page.dom_version;
+
+    try checkbox.setValue("next-check", frame);
+    snapshot_version += 1;
+    try testing.expectEqual(snapshot_version, frame._page.snapshot_version);
+    try testing.expectEqual(dom_version, frame._page.dom_version);
+
+    try indeterminate.setIndeterminate(true, frame);
+    snapshot_version += 1;
+    try testing.expectEqual(snapshot_version, frame._page.snapshot_version);
+    try testing.expectEqual(dom_version, frame._page.dom_version);
+}
+
+test "HTML.Input runtime value storage stays bounded" {
+    var page = try testing.pageTest("dump_live_form.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    const input = frame.document.getElementById("text", frame).?.is(Input).?;
+    var first: [16 * 1024]u8 = undefined;
+    var second: [16 * 1024]u8 = undefined;
+    @memset(&first, 'a');
+    @memset(&second, 'b');
+
+    try input.setValue(first[0..], frame);
+    const arena_bytes = frame._page._frame_arena.bytes;
+    for (0..2000) |i| {
+        try input.setValue(if (i % 2 == 0) second[0..] else first[0..], frame);
+    }
+
+    try testing.expectEqual(arena_bytes, frame._page._frame_arena.bytes);
+    const stored = frame._page.getMutableFormValue(input).?;
+    try testing.expectEqual(@intFromPtr(stored.ptr), @intFromPtr(input.getValue().ptr));
+    first[0] = 'z';
+    try testing.expectEqual(@as(u8, 'a'), input.getValue()[0]);
+
+    try input.setType("email", frame);
+    try input.setValue("  a\r\nb  ", frame);
+    const sanitized_arena_bytes = frame._page._frame_arena.bytes;
+    for (0..2000) |i| {
+        try input.setValue(if (i % 2 == 0) "  a\r\nb  " else "\t c\n d \t", frame);
+    }
+    try testing.expectEqual(sanitized_arena_bytes, frame._page._frame_arena.bytes);
+}
+
+test "HTML.Input clone owns runtime value independently" {
+    var page = try testing.pageTest("dump_live_form.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    const source = frame.document.getElementById("text", frame).?.is(Input).?;
+    try source.setValue("source-value", frame);
+
+    const clone = (try source.asNode().cloneNode(false, frame)).is(Input).?;
+    try testing.expectString("source-value", clone.getValue());
+    try testing.expect(source.getValue().ptr != clone.getValue().ptr);
+
+    try source.setValue("source-next", frame);
+    try testing.expectString("source-value", clone.getValue());
+
+    try clone.setValue("clone-value", frame);
+    try testing.expectString("source-next", source.getValue());
+    try testing.expectString("clone-value", clone.getValue());
+
+    try source.setType("color", frame);
+    try source.setValue("#ABCDEF", frame);
+    try testing.expectString("#abcdef", source.getValue());
+    try testing.expectEqual(
+        @intFromPtr(frame._page.getMutableFormValue(source).?.ptr),
+        @intFromPtr(source.getValue().ptr),
+    );
+
+    const default_backed = frame.document.getElementById("file", frame).?.is(Input).?;
+    try testing.expectEqual(null, frame._page.getMutableFormValue(default_backed));
+    try default_backed.setType("text", frame);
+    try testing.expectEqual(
+        @intFromPtr(frame._page.getMutableFormValue(default_backed).?.ptr),
+        @intFromPtr(default_backed.getValue().ptr),
+    );
 }
 
 test "isValidFloatingPoint" {

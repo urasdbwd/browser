@@ -42,6 +42,16 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const DoublyLinkedList = std.DoublyLinkedList;
 const IS_DEBUG = builtin.mode == .Debug;
+const error_retry_ms = 50;
+
+const system_ca_bundle_paths = [_][*:0]const u8{
+    "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu/Gentoo
+    "/etc/pki/tls/certs/ca-bundle.crt", // Fedora/RHEL 6
+    "/etc/ssl/ca-bundle.pem", // OpenSUSE
+    "/etc/pki/tls/cacert.pem", // OpenELEC
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // CentOS/RHEL 7
+    "/etc/ssl/cert.pem", // Alpine, *BSD
+};
 
 const Network = @This();
 
@@ -602,6 +612,7 @@ pub fn run(self: *Network) void {
         // wait until we get a CDP message or a signal on the wakeup pipe
         _ = posix.poll(self.pollfds, -1) catch |err| {
             lp.log.err(.app, "poll", .{ .err = err });
+            lp.io.sleep(.fromMilliseconds(error_retry_ms), .awake) catch {};
             continue;
         };
 
@@ -673,7 +684,8 @@ fn acceptConnections(self: *Network) void {
                 },
                 else => {
                     lp.log.err(.app, "accept error", .{ .err = err });
-                    continue;
+                    lp.io.sleep(.fromMilliseconds(error_retry_ms), .awake) catch {};
+                    break;
                 },
             }
         };
@@ -761,7 +773,15 @@ fn storeFromSystemCA(allocator: Allocator) !*crypto.X509_STORE {
 
     switch (comptime builtin.os.tag) {
         .linux, .openbsd, .netbsd, .freebsd => blk: {
-            // Iterate over known directories; this may or may not succeed.
+            // Prefer aggregate bundles over scanning every certificate file.
+            inline for (system_ca_bundle_paths) |file| {
+                if (crypto.X509_STORE_load_locations(store, file, null) == 1) {
+                    count += 1;
+                    break :blk;
+                }
+            }
+
+            // Fall back to known certificate directories.
             const cwd = std.Io.Dir.cwd();
             inline for ([_][]const u8{
                 "/etc/ssl/certs", // Debian/Ubuntu/Gentoo/Alpine, SUSE
@@ -769,21 +789,6 @@ fn storeFromSystemCA(allocator: Allocator) !*crypto.X509_STORE {
             }) |dir_path| {
                 count += try loadFromDirectory(allocator, store, cwd, dir_path);
                 if (count > 0) break :blk;
-            }
-
-            // Iterate over known files.
-            inline for ([_][*:0]const u8{
-                "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu/Gentoo
-                "/etc/pki/tls/certs/ca-bundle.crt", // Fedora/RHEL 6
-                "/etc/ssl/ca-bundle.pem", // OpenSUSE
-                "/etc/pki/tls/cacert.pem", // OpenELEC
-                "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // CentOS/RHEL 7
-                "/etc/ssl/cert.pem", // Alpine, *BSD
-            }) |file| {
-                if (crypto.X509_STORE_load_locations(store, file, null) == 1) {
-                    count += 1;
-                    break :blk;
-                }
             }
         },
         else => {
@@ -839,4 +844,11 @@ fn loadFromDirectory(
         }
     }
     return count;
+}
+
+test "system CA bundle candidates prefer the Debian aggregate" {
+    try std.testing.expectEqualStrings(
+        "/etc/ssl/certs/ca-certificates.crt",
+        std.mem.span(system_ca_bundle_paths[0]),
+    );
 }

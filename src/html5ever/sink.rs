@@ -17,8 +17,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use std::ptr;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::os::raw::{c_void};
 
 use crate::types::*;
@@ -27,19 +28,50 @@ use html5ever::tendril::{StrTendril};
 use html5ever::{Attribute, QualName};
 use html5ever::interface::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 
-type Arena<'arena> = &'arena typed_arena::Arena<ElementData>;
+type Arena<'arena> = &'arena ElementDataArena;
 
 // Made public so it can be used from lib.rs
 pub struct ElementData {
     pub qname: QualName,
     pub mathml_annotation_xml_integration_point: bool,
 }
-impl ElementData {
-    fn new(qname: QualName, flags: ElementFlags) -> Self {
+
+/// One `ElementData` per *distinct* (qualified name, mathml-integration-point)
+/// pair, shared by every element carrying it.
+///
+/// `ElementData` is read-only after creation — `elem_name` and
+/// `is_mathml_annotation_xml_integration_point` only ever read it — so sharing
+/// is sound, and it turns a 32-byte-per-element arena allocation live for the
+/// whole parse into one allocation per tag name. On a 96k-`<div>` document
+/// that is ~3 MiB of peak RSS.
+///
+/// ponytail: a document with ~all-distinct tag names is a small net loss (the
+/// map entry outweighs the sharing). Real documents have <100 distinct tags;
+/// revisit only if that stops holding.
+pub struct ElementDataArena {
+    arena: typed_arena::Arena<ElementData>,
+    interned: RefCell<HashMap<(QualName, bool), *mut ElementData>>,
+}
+
+impl ElementDataArena {
+    pub fn new() -> Self {
         Self {
-            qname: qname,
-            mathml_annotation_xml_integration_point: flags.mathml_annotation_xml_integration_point,
+            arena: typed_arena::Arena::new(),
+            interned: RefCell::new(HashMap::new()),
         }
+    }
+
+    pub fn intern(&self, qname: QualName, integration_point: bool) -> *mut ElementData {
+        let key = (qname, integration_point);
+        if let Some(&data) = self.interned.borrow().get(&key) {
+            return data;
+        }
+        let data: *mut ElementData = self.arena.alloc(ElementData {
+            qname: key.0.clone(),
+            mathml_annotation_xml_integration_point: integration_point,
+        });
+        self.interned.borrow_mut().insert(key, data);
+        data
     }
 }
 
@@ -127,14 +159,16 @@ impl<'arena> TreeSink for Sink<'arena> {
     }
 
     fn create_element(&self, name: QualName, attrs: Vec<Attribute>, flags: ElementFlags) -> Ref {
-        let data = self.arena.alloc(ElementData::new(name.clone(), flags));
+        let data = self
+            .arena
+            .intern(name.clone(), flags.mathml_annotation_xml_integration_point);
 
         unsafe {
             let mut attribute_iterator = CAttributeIterator { vec: attrs, pos: 0 };
 
             (self.create_element_callback)(
                 self.ctx,
-                data as *mut _ as *mut c_void,
+                data as *mut c_void,
                 CQualName::create(&name),
                 &mut attribute_iterator as *mut _ as *mut c_void,
             )

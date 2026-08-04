@@ -51,7 +51,7 @@ pub const Result = union(enum) {
 /// (cheap, no allocation) and arena-allocated for element/document
 /// (concatenation buffer).
 pub fn stringValueOf(arena: Allocator, node: *Node) error{WriteFailed}![]const u8 {
-    return switch (node._type) {
+    return switch (node.typed()) {
         .attribute => |attr| attr._value.str(),
         .cdata => |cd| cd._data.str(),
         .element, .document => blk: {

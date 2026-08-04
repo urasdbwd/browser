@@ -303,6 +303,7 @@ pub fn render(self: *const CData, writer: *std.Io.Writer, opts: RenderOpts) !boo
 
 pub fn setData(self: *CData, value: ?[]const u8, frame: *Frame) !void {
     const old_value = self._data;
+    const changed = !std.mem.eql(u8, old_value.str(), value orelse "");
 
     if (value) |v| {
         self._data = try frame.dupeSSO(v);
@@ -310,6 +311,7 @@ pub fn setData(self: *CData, value: ?[]const u8, frame: *Frame) !void {
         self._data = .empty;
     }
 
+    if (changed) frame.domChanged();
     Frame.observers.notifyCharacterDataChange(frame, self.asNode(), old_value);
 }
 
@@ -382,6 +384,7 @@ pub fn deleteData(self: *CData, offset: usize, count: usize, frame: *Frame) !voi
             old_value[range.end..],
         });
     }
+    if (range.start != range.end) frame.domChanged();
     Frame.observers.notifyCharacterDataChange(frame, self.asNode(), old_data);
 }
 
@@ -398,6 +401,7 @@ pub fn insertData(self: *CData, offset: usize, data: []const u8, frame: *Frame) 
         data,
         existing[byte_offset..],
     });
+    if (data.len != 0) frame.domChanged();
     Frame.observers.notifyCharacterDataChange(frame, self.asNode(), old_value);
 }
 
@@ -417,6 +421,7 @@ pub fn replaceData(self: *CData, offset: usize, count: usize, data: []const u8, 
         data,
         existing[range.end..],
     });
+    if (!std.mem.eql(u8, existing[range.start..range.end], data)) frame.domChanged();
     Frame.observers.notifyCharacterDataChange(frame, self.asNode(), old_value);
 }
 
@@ -520,6 +525,51 @@ pub const JsApi = struct {
 const testing = @import("../../testing.zig");
 test "WebApi: CData" {
     try testing.htmlRunner("cdata", .{});
+}
+
+test "CharacterData mutations invalidate DOM snapshots once" {
+    var page = try testing.pageTest("dump_live_form.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    const node = try Frame.node_factory.createTextNode(frame, "a");
+    const cdata = node.is(CData).?;
+    var dom_version = frame._page.dom_version;
+    var snapshot_version = frame._page.snapshot_version;
+
+    try cdata.setData("b", frame);
+    dom_version += 1;
+    snapshot_version += 1;
+    try std.testing.expectEqual(dom_version, frame._page.dom_version);
+    try std.testing.expectEqual(snapshot_version, frame._page.snapshot_version);
+
+    try cdata.appendData("c", frame);
+    dom_version += 1;
+    snapshot_version += 1;
+    try std.testing.expectEqual(dom_version, frame._page.dom_version);
+    try std.testing.expectEqual(snapshot_version, frame._page.snapshot_version);
+
+    try cdata.insertData(1, "x", frame);
+    dom_version += 1;
+    snapshot_version += 1;
+    try std.testing.expectEqual(dom_version, frame._page.dom_version);
+    try std.testing.expectEqual(snapshot_version, frame._page.snapshot_version);
+
+    try cdata.deleteData(1, 1, frame);
+    dom_version += 1;
+    snapshot_version += 1;
+    try std.testing.expectEqual(dom_version, frame._page.dom_version);
+    try std.testing.expectEqual(snapshot_version, frame._page.snapshot_version);
+
+    try cdata.replaceData(0, 1, "z", frame);
+    dom_version += 1;
+    snapshot_version += 1;
+    try std.testing.expectEqual(dom_version, frame._page.dom_version);
+    try std.testing.expectEqual(snapshot_version, frame._page.snapshot_version);
+
+    try cdata.replaceData(0, 1, "z", frame);
+    try std.testing.expectEqual(dom_version, frame._page.dom_version);
+    try std.testing.expectEqual(snapshot_version, frame._page.snapshot_version);
 }
 
 test "WebApi: CData.render" {

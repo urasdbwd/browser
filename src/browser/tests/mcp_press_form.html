@@ -1,9 +1,125 @@
 <!DOCTYPE html>
 <html>
 <body>
-    <form id="f" onsubmit="window.submitted = true; window.submittedValue = document.getElementById('q').value; event.preventDefault();">
+    <form id="f">
         <input id="q" type="text" name="q">
-        <input type="submit" value="Go">
+        <button id="default-submit" type="submit">Go</button>
     </form>
+
+    <form id="prevent-form">
+        <input id="prevented" type="text">
+        <button id="prevent-submit" type="submit">Prevented</button>
+    </form>
+
+    <form id="textarea-form">
+        <textarea id="notes">line</textarea>
+        <button id="textarea-submit" type="submit">Notes</button>
+    </form>
+
+    <form id="nontext-form">
+        <input id="checkbox" type="checkbox">
+        <input id="radio" type="radio">
+        <input id="file" type="file">
+        <input id="reset" type="reset">
+        <input id="hidden" type="hidden">
+        <button id="nontext-submit" type="submit">Non-text</button>
+    </form>
+
+    <form id="activation-form">
+        <input id="submit-input" type="submit" value="Input submit">
+        <button id="submit-button" type="submit">Button submit</button>
+    </form>
+
+    <form id="single-form">
+        <input id="single" type="text">
+    </form>
+
+    <form id="two-form">
+        <input id="two-a" type="text">
+        <input id="two-b" type="email">
+    </form>
+
+    <script>
+        window.submitted = false;
+        window.enterResults = {
+            default: {clicks: 0, submits: 0, clickTrusted: false, submitter: null, order: []},
+            prevented: {clicks: 0, submits: 0, order: []},
+            textarea: {submits: 0},
+            nontext: {clicks: 0, submits: 0},
+            activation: {inputClicks: 0, buttonClicks: 0, submits: 0, trusted: [], submitters: []},
+            single: {submits: 0, submitterIsNull: false},
+            two: {submits: 0}
+        };
+
+        const q = document.getElementById('q');
+        q.addEventListener('keydown', event => {
+            if (event.key === 'Enter') enterResults.default.order.push(event.isTrusted ? 'keydown' : 'keydown-untrusted');
+        });
+        q.addEventListener('keyup', event => {
+            if (event.key === 'Enter') enterResults.default.order.push(event.isTrusted ? 'keyup' : 'keyup-untrusted');
+        });
+        document.getElementById('default-submit').addEventListener('click', event => {
+            enterResults.default.clicks++;
+            enterResults.default.clickTrusted = event.isTrusted;
+            enterResults.default.order.push(event.isTrusted ? 'click' : 'click-untrusted');
+        });
+        document.getElementById('f').addEventListener('submit', event => {
+            window.submitted = true;
+            window.submittedValue = q.value;
+            enterResults.default.submits++;
+            enterResults.default.submitter = event.submitter && event.submitter.id;
+            enterResults.default.order.push(event.isTrusted ? 'submit' : 'submit-untrusted');
+            event.preventDefault();
+        });
+
+        const prevented = document.getElementById('prevented');
+        prevented.addEventListener('keydown', event => {
+            if (event.key !== 'Enter') return;
+            enterResults.prevented.order.push('keydown');
+            event.preventDefault();
+        });
+        prevented.addEventListener('keyup', event => {
+            if (event.key === 'Enter') enterResults.prevented.order.push('keyup');
+        });
+        document.getElementById('prevent-submit').addEventListener('click', () => enterResults.prevented.clicks++);
+        document.getElementById('prevent-form').addEventListener('submit', event => {
+            enterResults.prevented.submits++;
+            event.preventDefault();
+        });
+
+        document.getElementById('textarea-form').addEventListener('submit', event => {
+            enterResults.textarea.submits++;
+            event.preventDefault();
+        });
+        document.getElementById('nontext-submit').addEventListener('click', () => enterResults.nontext.clicks++);
+        document.getElementById('nontext-form').addEventListener('submit', event => {
+            enterResults.nontext.submits++;
+            event.preventDefault();
+        });
+
+        document.getElementById('submit-input').addEventListener('click', event => {
+            enterResults.activation.inputClicks++;
+            enterResults.activation.trusted.push(event.isTrusted);
+        });
+        document.getElementById('submit-button').addEventListener('click', event => {
+            enterResults.activation.buttonClicks++;
+            enterResults.activation.trusted.push(event.isTrusted);
+        });
+        document.getElementById('activation-form').addEventListener('submit', event => {
+            enterResults.activation.submits++;
+            enterResults.activation.submitters.push(event.submitter && event.submitter.id);
+            event.preventDefault();
+        });
+
+        document.getElementById('single-form').addEventListener('submit', event => {
+            enterResults.single.submits++;
+            enterResults.single.submitterIsNull = event.submitter === null;
+            event.preventDefault();
+        });
+        document.getElementById('two-form').addEventListener('submit', event => {
+            enterResults.two.submits++;
+            event.preventDefault();
+        });
+    </script>
 </body>
 </html>

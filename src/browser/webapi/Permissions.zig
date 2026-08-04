@@ -16,6 +16,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+const std = @import("std");
 const lp = @import("lightpanda");
 
 const js = @import("../js/js.zig");
@@ -44,17 +45,44 @@ const QueryDescriptor = struct {
 // Report the state set via CDP Browser.grantPermissions / setPermission, or
 // 'prompt' (the default safe value — neither granted nor denied) when unset.
 pub fn query(_: *const Permissions, qd: QueryDescriptor, exec: *const Execution) !js.Promise {
+    const default_state = defaultState(qd.name) orelse {
+        return exec.js.local.?.rejectPromise(.{
+            .type_error = "Permission name is not supported",
+        });
+    };
+    const configured_state = exec.session.browser.permissions.get(qd.name);
+
     const arena = try exec.getArena(.tiny, "PermissionStatus");
     errdefer arena.release();
 
-    const state = exec.session.browser.permissions.get(qd.name) orelse .prompt;
     const status = try arena.create(PermissionStatus);
     status.* = .{
         ._arena = arena,
-        ._state = state,
+        ._state = configured_state orelse default_state,
         ._name = try arena.dupe(u8, qd.name),
     };
     return exec.js.local.?.resolvePromise(status);
+}
+
+// Chrome resolves ~20 permission names; rejecting the rest with a TypeError is
+// a fingerprint. null = unknown name (still a TypeError, like Chrome).
+fn defaultState(name: []const u8) ?State {
+    const granted = [_][]const u8{ "background-sync", "clipboard-write", "accessibility-events" };
+    const prompt = [_][]const u8{
+        "geolocation",              "notifications",     "camera",
+        "microphone",               "midi",              "persistent-storage",
+        "clipboard-read",           "payment-handler",   "accelerometer",
+        "gyroscope",                "magnetometer",      "screen-wake-lock",
+        "storage-access",           "window-management", "local-fonts",
+        "top-level-storage-access", "push",
+    };
+    for (granted) |n| {
+        if (std.mem.eql(u8, name, n)) return .granted;
+    }
+    for (prompt) |n| {
+        if (std.mem.eql(u8, name, n)) return .prompt;
+    }
+    return null;
 }
 
 const PermissionStatus = struct {

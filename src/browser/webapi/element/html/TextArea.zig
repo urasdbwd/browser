@@ -84,8 +84,9 @@ pub fn getValue(self: *const TextArea) []const u8 {
 }
 
 pub fn setValue(self: *TextArea, value: []const u8, frame: *Frame) !void {
-    const owned = try frame.arena.dupe(u8, value);
-    self._value = owned;
+    const changed = !std.mem.eql(u8, self.getValue(), value);
+    self._value = try frame._page.putMutableFormValue(self, value);
+    if (changed) frame.snapshotChanged();
 }
 
 pub fn getDefaultValue(self: *const TextArea) []const u8 {
@@ -102,7 +103,7 @@ pub fn setDefaultValue(self: *TextArea, value: []const u8, frame: *Frame) !void 
     const node = self.asNode();
     if (node.firstChild()) |child| {
         if (child.is(Node.CData.Text)) |txt| {
-            txt._proto._data = try frame.dupeSSO(value);
+            try txt._proto.setData(value, frame);
             return;
         }
     }
@@ -190,15 +191,14 @@ fn howSelected(self: *const TextArea) HowSelected {
 }
 
 pub fn innerInsert(self: *TextArea, str: []const u8, frame: *Frame) !void {
-    const arena = frame.arena;
+    const allocator = frame._page.session.browser.app.allocator;
 
     switch (self.howSelected()) {
         .full => {
             // if the text area is fully selected, replace the content.
-            const new_value = try arena.dupe(u8, str);
-            try self.setValue(new_value, frame);
-            self._selection_start = @intCast(new_value.len);
-            self._selection_end = @intCast(new_value.len);
+            try self.setValue(str, frame);
+            self._selection_start = @intCast(str.len);
+            self._selection_end = @intCast(str.len);
             self._selection_direction = .none;
             try self.dispatchSelectionChangeEvent(frame);
         },
@@ -209,10 +209,11 @@ pub fn innerInsert(self: *TextArea, str: []const u8, frame: *Frame) !void {
             const remaining = current_value[range[1]..];
 
             const new_value = try std.mem.concat(
-                arena,
+                allocator,
                 u8,
                 &.{ before, str, remaining },
             );
+            defer allocator.free(new_value);
             try self.setValue(new_value, frame);
 
             const new_pos = range[0] + str.len;
@@ -224,7 +225,8 @@ pub fn innerInsert(self: *TextArea, str: []const u8, frame: *Frame) !void {
         .none => {
             // if the text area is not selected, just insert at cursor.
             const current_value = self.getValue();
-            const new_value = try std.mem.concat(arena, u8, &.{ current_value, str });
+            const new_value = try std.mem.concat(allocator, u8, &.{ current_value, str });
+            defer allocator.free(new_value);
             try self.setValue(new_value, frame);
         },
     }
@@ -423,11 +425,16 @@ pub const JsApi = struct {
 };
 
 pub const Build = struct {
-    pub fn cloned(source_element: *Element, cloned_element: *Element, deep: bool, _: *Frame) !void {
+    pub fn cloned(source_element: *Element, cloned_element: *Element, deep: bool, frame: *Frame) !void {
         _ = deep;
         const source = source_element.as(TextArea);
         const clone = cloned_element.as(TextArea);
-        clone._value = source._value;
+        // A runtime value may be owned by another Page (Document.importNode).
+        // Copy it into the destination Page instead of aliasing that lifetime.
+        clone._value = if (source._value) |value|
+            try frame._page.putMutableFormValue(clone, value)
+        else
+            null;
     }
 };
 
@@ -435,4 +442,62 @@ const testing = @import("../../../../testing.zig");
 test "WebApi: HTML.TextArea" {
     try testing.htmlRunner("element/html/textarea.html", .{});
     try testing.htmlRunner("element/html/textarea-validity.html", .{});
+}
+
+test "HTML.TextArea defaultValue invalidates DOM snapshots once" {
+    var page = try testing.pageTest("dump_live_form.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    const textarea = frame.document.getElementById("notes", frame).?.is(TextArea).?;
+    const dom_version = frame._page.dom_version;
+    const snapshot_version = frame._page.snapshot_version;
+
+    try textarea.setDefaultValue("new default", frame);
+    try std.testing.expectEqual(dom_version + 1, frame._page.dom_version);
+    try std.testing.expectEqual(snapshot_version + 1, frame._page.snapshot_version);
+}
+
+test "HTML.TextArea runtime value storage stays bounded" {
+    var page = try testing.pageTest("dump_live_form.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    const textarea = frame.document.getElementById("notes", frame).?.is(TextArea).?;
+    var first: [16 * 1024]u8 = undefined;
+    var second: [16 * 1024]u8 = undefined;
+    @memset(&first, 'a');
+    @memset(&second, 'b');
+
+    try textarea.setValue(first[0..], frame);
+    const arena_bytes = frame._page._frame_arena.bytes;
+    for (0..2000) |i| {
+        try textarea.setValue(if (i % 2 == 0) second[0..] else first[0..], frame);
+    }
+
+    try testing.expectEqual(arena_bytes, frame._page._frame_arena.bytes);
+    const stored = frame._page.getMutableFormValue(textarea).?;
+    try testing.expectEqual(@intFromPtr(stored.ptr), @intFromPtr(textarea.getValue().ptr));
+    first[0] = 'z';
+    try testing.expectEqual(@as(u8, 'a'), textarea.getValue()[0]);
+}
+
+test "HTML.TextArea clone owns runtime value independently" {
+    var page = try testing.pageTest("dump_live_form.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    const source = frame.document.getElementById("notes", frame).?.is(TextArea).?;
+    try source.setValue("source-value", frame);
+
+    const clone = (try source.asNode().cloneNode(false, frame)).is(TextArea).?;
+    try testing.expectString("source-value", clone.getValue());
+    try testing.expect(source.getValue().ptr != clone.getValue().ptr);
+
+    try source.setValue("source-next", frame);
+    try testing.expectString("source-value", clone.getValue());
+
+    try clone.setValue("clone-value", frame);
+    try testing.expectString("source-next", source.getValue());
+    try testing.expectString("clone-value", clone.getValue());
 }

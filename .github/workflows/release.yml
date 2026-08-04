@@ -61,6 +61,9 @@ jobs:
       - name: zig build
         run: zig build -Dsnapshot_path=../../snapshot.bin -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast ${{ matrix.cpu_flag }} ${{ env.VERSION_FLAG }}
 
+      - name: Strip binary
+        run: strip zig-out/bin/lightpanda
+
       - name: Rename binary
         run: mv zig-out/bin/lightpanda lightpanda-${{ env.ARCH }}-${{ env.OS }}
 
@@ -120,6 +123,9 @@ jobs:
 
       - name: zig build
         run: zig build -Dsnapshot_path=../../snapshot.bin -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast ${{ env.VERSION_FLAG }}
+
+      - name: Strip binary
+        run: strip zig-out/bin/lightpanda
 
       - name: Rename binary
         run: mv zig-out/bin/lightpanda lightpanda-${{ env.ARCH }}-${{ env.OS }}

@@ -107,24 +107,72 @@ fn makeCidrV6(comptime bytes: Ipv6Addr, comptime prefix: u8) CidrV6 {
 
 // ── Comptime CIDR range tables ───────────────────────────────────────────────
 
+// Non-global-unicast ranges from the IANA IPv4 Special-Purpose Address
+// Registry, plus multicast from RFC 1112.
 const PRIVATE_V4 = [_]CidrV4{
-    makeCidrV4("127.0.0.0", 8), // localhost
     makeCidrV4("0.0.0.0", 8), // current network
     makeCidrV4("10.0.0.0", 8), // RFC1918
-    makeCidrV4("172.16.0.0", 12), // RFC1918
-    makeCidrV4("192.168.0.0", 16), // RFC1918
+    makeCidrV4("100.64.0.0", 10), // shared address space
+    makeCidrV4("127.0.0.0", 8), // loopback
     makeCidrV4("169.254.0.0", 16), // link-local
+    makeCidrV4("172.16.0.0", 12), // RFC1918
+    makeCidrV4("192.0.0.0", 24), // IETF protocol assignments
+    makeCidrV4("192.0.2.0", 24), // documentation
+    makeCidrV4("192.88.99.0", 24), // deprecated 6to4 relay anycast
+    makeCidrV4("192.168.0.0", 16), // RFC1918
+    makeCidrV4("198.18.0.0", 15), // benchmarking
+    makeCidrV4("198.51.100.0", 24), // documentation
+    makeCidrV4("203.0.113.0", 24), // documentation
+    makeCidrV4("224.0.0.0", 4), // multicast
+    makeCidrV4("240.0.0.0", 4), // reserved, including limited broadcast
 };
 
+const GLOBAL_V4_EXCEPTIONS = [_]CidrV4{
+    makeCidrV4("192.0.0.9", 32), // PCP anycast
+    makeCidrV4("192.0.0.10", 32), // TURN anycast
+};
+
+// Non-global-unicast ranges from the IANA IPv6 Special-Purpose Address
+// Registry, plus multicast from RFC 4291. IPv4-mapped and well-known NAT64
+// addresses are checked against the IPv4 policy by isBlockedV6.
 const PRIVATE_V6 = [_]CidrV6{
-    // ::/128 — IPv6 Unspecified
-    makeCidrV6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 128),
-    // ::1/128 — IPv6 localhost
-    makeCidrV6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 128),
-    // fe80::/10 — link-local
-    makeCidrV6(.{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 10),
+    // ::/96 — unspecified, loopback, and deprecated IPv4-compatible addresses
+    makeCidrV6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 96),
+    // 64:ff9b:1::/48 — local-use IPv4/IPv6 translation
+    makeCidrV6(.{ 0, 0x64, 0xff, 0x9b, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 48),
+    // 100::/64 — discard-only
+    makeCidrV6(.{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 64),
+    // 100:0:0:1::/64 — dummy prefix
+    makeCidrV6(.{ 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 }, 64),
+    // 2001::/23 — IETF protocol assignments
+    makeCidrV6(.{ 0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 23),
+    // 2001:db8::/32 — documentation
+    makeCidrV6(.{ 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 32),
+    // 2002::/16 — 6to4
+    makeCidrV6(.{ 0x20, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 16),
+    // 3fff::/20 — documentation
+    makeCidrV6(.{ 0x3f, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 20),
+    // 5f00::/16 — segment-routing SIDs
+    makeCidrV6(.{ 0x5f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 16),
     // fc00::/7 — ULA
     makeCidrV6(.{ 0xfc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 7),
+    // fe80::/10 — link-local
+    makeCidrV6(.{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 10),
+    // fec0::/10 — deprecated site-local
+    makeCidrV6(.{ 0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 10),
+    // ff00::/8 — multicast
+    makeCidrV6(.{ 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 8),
+};
+
+const GLOBAL_V6_EXCEPTIONS = [_]CidrV6{
+    // Globally reachable sub-allocations of 2001::/23.
+    makeCidrV6(.{ 0x20, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 128),
+    makeCidrV6(.{ 0x20, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 }, 128),
+    makeCidrV6(.{ 0x20, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3 }, 128),
+    makeCidrV6(.{ 0x20, 1, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 32),
+    makeCidrV6(.{ 0x20, 1, 0, 4, 1, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 48),
+    makeCidrV6(.{ 0x20, 1, 0, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 28),
+    makeCidrV6(.{ 0x20, 1, 0, 0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 28),
 };
 
 // ── Runtime IP parsing ───────────────────────────────────────────────────────
@@ -159,6 +207,15 @@ fn parseIpv6(str: []const u8) ?Ipv6Addr {
 fn isIpv4Mapped(addr: Ipv6Addr) ?Ipv4Addr {
     // IPv4-mapped prefix: 10 zero bytes + 2 0xFF bytes
     const prefix = [12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+    if (!std.mem.eql(u8, addr[0..12], &prefix)) return null;
+    return addr[12..16].*;
+}
+
+/// Detect the RFC 6052 well-known NAT64 prefix (64:ff9b::/96).
+/// Network-specific translation prefixes cannot be inferred from an address;
+/// operators must add their configured prefix to the custom block CIDRs.
+fn isIpv4Translated(addr: Ipv6Addr) ?Ipv4Addr {
+    const prefix = [12]u8{ 0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0 };
     if (!std.mem.eql(u8, addr[0..12], &prefix)) return null;
     return addr[12..16].*;
 }
@@ -256,8 +313,8 @@ pub fn parseCidrList(
     return .{ .v4 = v4, .v6 = v6, .allow_v4 = allow_v4, .allow_v6 = allow_v6 };
 }
 
-// Create a IpFilter. Set block_private to block outbound requests to RFC1918,
-// localhost, link-local, and ULA ranges. Pass parsed CIDRs for additional
+// Create an IpFilter. Set block_private to block outbound requests to
+// non-global-unicast and multicast ranges. Pass parsed CIDRs for additional
 // custom block/allow ranges; the filter takes ownership of the Cidrs and will
 // free them on deinit.
 pub fn init(
@@ -276,21 +333,58 @@ pub fn deinit(self: IpFilter, allocator: std.mem.Allocator) void {
     }
 }
 
-fn isBlockedV4(self: *const IpFilter, addr: Ipv4Addr) bool {
+pub fn hasBlockedRanges(self: *const IpFilter) bool {
+    if (self.block_private) return true;
+    const cidrs = self.cidrs orelse return false;
+    return cidrs.v4.len > 0 or cidrs.v6.len > 0;
+}
+
+fn isAllowedV4(self: *const IpFilter, addr: Ipv4Addr) bool {
     if (self.cidrs) |c| {
         for (c.allow_v4) |cidr| {
+            if (matchesCidrV4(addr, cidr)) return true;
+        }
+    }
+    return false;
+}
+
+fn isAllowedV6(self: *const IpFilter, addr: Ipv6Addr) bool {
+    if (self.cidrs) |c| {
+        for (c.allow_v6) |cidr| {
+            if (matchesCidrV6(addr, cidr)) return true;
+        }
+    }
+    return false;
+}
+
+fn isCustomBlockedV4(self: *const IpFilter, addr: Ipv4Addr) bool {
+    if (self.cidrs) |c| {
+        for (c.v4) |cidr| {
+            if (matchesCidrV4(addr, cidr)) return true;
+        }
+    }
+    return false;
+}
+
+fn isCustomBlockedV6(self: *const IpFilter, addr: Ipv6Addr) bool {
+    if (self.cidrs) |c| {
+        for (c.v6) |cidr| {
+            if (matchesCidrV6(addr, cidr)) return true;
+        }
+    }
+    return false;
+}
+
+fn isBlockedV4(self: *const IpFilter, addr: Ipv4Addr) bool {
+    if (self.isAllowedV4(addr)) return false;
+    if (self.isCustomBlockedV4(addr)) return true;
+
+    if (self.block_private) {
+        for (GLOBAL_V4_EXCEPTIONS) |cidr| {
             if (matchesCidrV4(addr, cidr)) {
                 return false;
             }
         }
-        for (c.v4) |cidr| {
-            if (matchesCidrV4(addr, cidr)) {
-                return true;
-            }
-        }
-    }
-
-    if (self.block_private) {
         for (PRIVATE_V4) |cidr| {
             if (matchesCidrV4(addr, cidr)) {
                 return true;
@@ -302,20 +396,27 @@ fn isBlockedV4(self: *const IpFilter, addr: Ipv4Addr) bool {
 }
 
 fn isBlockedV6(self: *const IpFilter, addr: Ipv6Addr) bool {
-    if (self.cidrs) |c| {
-        for (c.allow_v6) |cidr| {
+    if (self.isAllowedV6(addr)) return false;
+
+    const embedded_v4: ?Ipv4Addr = if (isIpv4Mapped(addr)) |v4|
+        v4
+    else
+        isIpv4Translated(addr);
+    if (embedded_v4) |v4| {
+        // Explicit allows take precedence across both representations.
+        if (self.isAllowedV4(v4)) return false;
+        if (self.isCustomBlockedV6(addr)) return true;
+        return self.isBlockedV4(v4);
+    }
+
+    if (self.isCustomBlockedV6(addr)) return true;
+
+    if (self.block_private) {
+        for (GLOBAL_V6_EXCEPTIONS) |cidr| {
             if (matchesCidrV6(addr, cidr)) {
                 return false;
             }
         }
-        for (c.v6) |cidr| {
-            if (matchesCidrV6(addr, cidr)) {
-                return true;
-            }
-        }
-    }
-
-    if (self.block_private) {
         for (PRIVATE_V6) |cidr| {
             if (matchesCidrV6(addr, cidr)) {
                 return true;
@@ -338,9 +439,7 @@ pub fn isBlockedSockaddr(self: *const IpFilter, sa: *const libcurl.CurlSockAddr)
         },
         posix.AF.INET6 => {
             const sin6: *const posix.sockaddr.in6 = @ptrCast(&sa.addr);
-            const addr: Ipv6Addr = sin6.addr;
-            if (isIpv4Mapped(addr)) |v4| return self.isBlockedV4(v4);
-            return self.isBlockedV6(addr);
+            return self.isBlockedV6(sin6.addr);
         },
         else => return true, // unknown family -> fail-closed
     }
@@ -383,6 +482,51 @@ test "IpFilter: IPv4 CIDR matching: private group boundaries" {
     try testing.expect(!filter.testBlocked("93.184.216.34")); // example.com
 }
 
+test "IpFilter: IPv4 special-purpose boundaries" {
+    const filter = IpFilter.init(true, null);
+    defer filter.deinit(testing.allocator);
+
+    const cases = [_]struct {
+        ip: []const u8,
+        blocked: bool,
+    }{
+        .{ .ip = "100.63.255.255", .blocked = false },
+        .{ .ip = "100.64.0.0", .blocked = true },
+        .{ .ip = "100.127.255.255", .blocked = true },
+        .{ .ip = "100.128.0.0", .blocked = false },
+        .{ .ip = "192.0.0.0", .blocked = true },
+        .{ .ip = "192.0.0.8", .blocked = true },
+        .{ .ip = "192.0.0.9", .blocked = false },
+        .{ .ip = "192.0.0.10", .blocked = false },
+        .{ .ip = "192.0.0.11", .blocked = true },
+        .{ .ip = "192.0.0.169", .blocked = true },
+        .{ .ip = "192.0.0.170", .blocked = true },
+        .{ .ip = "192.0.0.171", .blocked = true },
+        .{ .ip = "192.0.0.172", .blocked = true },
+        .{ .ip = "192.0.1.0", .blocked = false },
+        .{ .ip = "192.0.2.1", .blocked = true },
+        .{ .ip = "192.88.98.255", .blocked = false },
+        .{ .ip = "192.88.99.0", .blocked = true },
+        .{ .ip = "192.88.99.255", .blocked = true },
+        .{ .ip = "192.88.100.0", .blocked = false },
+        .{ .ip = "198.17.255.255", .blocked = false },
+        .{ .ip = "198.18.0.0", .blocked = true },
+        .{ .ip = "198.19.255.255", .blocked = true },
+        .{ .ip = "198.20.0.0", .blocked = false },
+        .{ .ip = "198.51.100.1", .blocked = true },
+        .{ .ip = "203.0.113.1", .blocked = true },
+        .{ .ip = "223.255.255.255", .blocked = false },
+        .{ .ip = "224.0.0.0", .blocked = true },
+        .{ .ip = "239.255.255.255", .blocked = true },
+        .{ .ip = "240.0.0.0", .blocked = true },
+        .{ .ip = "255.255.255.255", .blocked = true },
+    };
+
+    for (cases) |case| {
+        try testing.expectEqual(case.blocked, filter.testBlocked(case.ip));
+    }
+}
+
 test "IpFilter: IPv6 CIDR matching: private group" {
     const filter = IpFilter.init(true, null);
     defer filter.deinit(testing.allocator);
@@ -392,8 +536,64 @@ test "IpFilter: IPv6 CIDR matching: private group" {
     try testing.expect(filter.testBlocked("fe80::1")); // link-local
     try testing.expect(filter.testBlocked("fc00::1")); // ULA
     try testing.expect(filter.testBlocked("fd00::1")); // ULA (fd is fc00::/7)
-    try testing.expect(!filter.testBlocked("2001:db8::1")); // documentation range — public
+    try testing.expect(filter.testBlocked("2001:db8::1")); // documentation
+    try testing.expect(filter.testBlocked("3fff::1")); // documentation
+    try testing.expect(filter.testBlocked("100::1")); // discard-only
+    try testing.expect(filter.testBlocked("ff02::1")); // multicast
     try testing.expect(!filter.testBlocked("2606:4700::1111")); // Cloudflare
+}
+
+test "IpFilter: IPv6 special-purpose boundaries" {
+    const filter = IpFilter.init(true, null);
+    defer filter.deinit(testing.allocator);
+
+    const cases = [_]struct {
+        ip: []const u8,
+        blocked: bool,
+    }{
+        .{ .ip = "64:ff9b::1", .blocked = true },
+        .{ .ip = "64:ff9b::808:808", .blocked = false },
+        .{ .ip = "64:ff9b:1::", .blocked = true },
+        .{ .ip = "64:ff9b:1:ffff:ffff:ffff:ffff:ffff", .blocked = true },
+        .{ .ip = "64:ff9b:2::", .blocked = false },
+        .{ .ip = "100::", .blocked = true },
+        .{ .ip = "100::ffff:ffff:ffff:ffff", .blocked = true },
+        .{ .ip = "100:0:0:1::1", .blocked = true },
+        .{ .ip = "100:0:0:2::", .blocked = false },
+        .{ .ip = "2001::", .blocked = true },
+        .{ .ip = "2001:0:ffff:ffff:ffff:ffff:ffff:ffff", .blocked = true },
+        .{ .ip = "2001:1::1", .blocked = false },
+        .{ .ip = "2001:1::4", .blocked = true },
+        .{ .ip = "2001:2::1", .blocked = true },
+        .{ .ip = "2001:3::1", .blocked = false },
+        .{ .ip = "2001:4:112::1", .blocked = false },
+        .{ .ip = "2001:4:113::1", .blocked = true },
+        .{ .ip = "2001:f:ffff:ffff:ffff:ffff:ffff:ffff", .blocked = true },
+        .{ .ip = "2001:10::", .blocked = true },
+        .{ .ip = "2001:1f:ffff:ffff:ffff:ffff:ffff:ffff", .blocked = true },
+        .{ .ip = "2001:20::", .blocked = false },
+        .{ .ip = "2001:30::", .blocked = false },
+        .{ .ip = "2001:40::", .blocked = true },
+        .{ .ip = "2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff", .blocked = true },
+        .{ .ip = "2001:200::", .blocked = false },
+        .{ .ip = "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff", .blocked = true },
+        .{ .ip = "2001:db9::", .blocked = false },
+        .{ .ip = "2002::1", .blocked = true },
+        .{ .ip = "2003::1", .blocked = false },
+        .{ .ip = "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff", .blocked = true },
+        .{ .ip = "3fff:1000::", .blocked = false },
+        .{ .ip = "5f00::1", .blocked = true },
+        .{ .ip = "5f01::1", .blocked = false },
+        .{ .ip = "fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff", .blocked = false },
+        .{ .ip = "fe80::", .blocked = true },
+        .{ .ip = "febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff", .blocked = true },
+        .{ .ip = "fec0::", .blocked = true },
+        .{ .ip = "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", .blocked = true },
+    };
+
+    for (cases) |case| {
+        try testing.expectEqual(case.blocked, filter.testBlocked(case.ip));
+    }
 }
 
 test "IpFilter: IPv4-mapped IPv6 bypass prevention" {
@@ -404,8 +604,42 @@ test "IpFilter: IPv4-mapped IPv6 bypass prevention" {
     try testing.expect(filter.testBlocked("::ffff:127.0.0.1"));
     // ::ffff:10.0.0.1 must be blocked (maps to RFC1918)
     try testing.expect(filter.testBlocked("::ffff:10.0.0.1"));
+    // Mapped shared and documentation ranges must also be blocked
+    try testing.expect(filter.testBlocked("::ffff:100.64.0.1"));
+    try testing.expect(filter.testBlocked("::ffff:192.0.2.1"));
     // ::ffff:8.8.8.8 must NOT be blocked (maps to public)
     try testing.expect(!filter.testBlocked("::ffff:8.8.8.8"));
+}
+
+test "IpFilter: IPv6 CIDRs override embedded IPv4 decisions" {
+    const cidrs = try parseCidrList(
+        testing.allocator,
+        "-::ffff:127.0.0.1/128,-64:ff9b::7f00:1/128,::ffff:8.8.8.8/128,64:ff9b::808:808/128",
+    );
+    const filter = IpFilter.init(true, cidrs);
+    defer filter.deinit(testing.allocator);
+
+    try testing.expect(!filter.testBlocked("::ffff:127.0.0.1"));
+    try testing.expect(!filter.testBlocked("64:ff9b::7f00:1"));
+    try testing.expect(filter.testBlocked("::ffff:8.8.8.8"));
+    try testing.expect(filter.testBlocked("64:ff9b::808:808"));
+}
+
+test "IpFilter: allow CIDRs take precedence across embedded forms" {
+    const cidrs = try parseCidrList(
+        testing.allocator,
+        "-127.0.0.1/32,0:0:0:0:0:ffff:0:0/96,64:ff9b:0:0:0:0:0:0/96,8.8.8.8/32,-0:0:0:0:0:ffff:808:808/128,-64:ff9b:0:0:0:0:808:808/128",
+    );
+    const filter = IpFilter.init(true, cidrs);
+    defer filter.deinit(testing.allocator);
+
+    // An IPv4 allow overrides a block on the outer IPv6 form.
+    try testing.expect(!filter.testBlocked("::ffff:127.0.0.1"));
+    try testing.expect(!filter.testBlocked("64:ff9b::7f00:1"));
+
+    // An IPv6 allow overrides a block on the embedded IPv4 form.
+    try testing.expect(!filter.testBlocked("::ffff:8.8.8.8"));
+    try testing.expect(!filter.testBlocked("64:ff9b::808:808"));
 }
 
 test "IpFilter: fail-closed: unknown address family blocked by isBlockedSockaddr" {
@@ -463,19 +697,45 @@ test "IpFilter: parseCidrList: mixed IPv4 and IPv6" {
 }
 
 test "IpFilter: allow list exempts from private blocking" {
-    const cidrs = try parseCidrList(testing.allocator, "-10.0.0.42/32,-fc00::1/128");
+    const cidrs = try parseCidrList(testing.allocator, "-10.0.0.42/32,-100.64.0.1/32,-fc00::1/128,-100::1/128");
     const filter = IpFilter.init(true, cidrs);
     defer filter.deinit(testing.allocator);
 
     // Allowed IPs pass through despite being in private ranges
     try testing.expect(!filter.testBlocked("10.0.0.42"));
+    try testing.expect(!filter.testBlocked("100.64.0.1"));
+    try testing.expect(!filter.testBlocked("::ffff:100.64.0.1"));
+    try testing.expect(!filter.testBlocked("64:ff9b::6440:1"));
     try testing.expect(!filter.testBlocked("fc00::1"));
+    try testing.expect(!filter.testBlocked("100::1"));
 
     // Other private IPs still blocked
     try testing.expect(filter.testBlocked("10.0.0.43"));
+    try testing.expect(filter.testBlocked("::ffff:100.64.0.2"));
+    try testing.expect(filter.testBlocked("64:ff9b::6440:2"));
     try testing.expect(filter.testBlocked("10.0.0.41"));
     try testing.expect(filter.testBlocked("192.168.1.1"));
     try testing.expect(filter.testBlocked("fc00::2"));
+}
+
+test "IpFilter: hasBlockedRanges ignores allow-only CIDRs" {
+    const none = IpFilter.init(false, null);
+    defer none.deinit(testing.allocator);
+    try testing.expect(!none.hasBlockedRanges());
+
+    const private = IpFilter.init(true, null);
+    defer private.deinit(testing.allocator);
+    try testing.expect(private.hasBlockedRanges());
+
+    const blocked_cidrs = try parseCidrList(testing.allocator, "203.0.113.0/24");
+    const custom = IpFilter.init(false, blocked_cidrs);
+    defer custom.deinit(testing.allocator);
+    try testing.expect(custom.hasBlockedRanges());
+
+    const allowed_cidrs = try parseCidrList(testing.allocator, "-10.0.0.0/8");
+    const allow_only = IpFilter.init(false, allowed_cidrs);
+    defer allow_only.deinit(testing.allocator);
+    try testing.expect(!allow_only.hasBlockedRanges());
 }
 
 test "IpFilter: allow list exempts from custom CIDR blocking" {
@@ -616,9 +876,6 @@ test "IpFilter: matchesCidrV6: prefix > 64 bits (/96)" {
 /// Test inputs must be valid IPs; unreachable on parse failure.
 fn testBlocked(self: *const IpFilter, ip: []const u8) bool {
     if (parseIpv4(ip)) |v4| return self.isBlockedV4(v4);
-    if (parseIpv6(ip)) |v6| {
-        if (isIpv4Mapped(v6)) |v4| return self.isBlockedV4(v4);
-        return self.isBlockedV6(v6);
-    }
+    if (parseIpv6(ip)) |v6| return self.isBlockedV6(v6);
     unreachable;
 }

@@ -1,0 +1,9 @@
+<!DOCTYPE html>
+<!--
+Fake Turnstile-shaped page. Never talks to Cloudflare: the iframe src merely
+*contains* "challenges.cloudflare.com" so it matches the same detection the
+real widget does, while resolving to a local file.
+-->
+<div class="cf-turnstile" data-sitekey="0x0000000000000000000000"></div>
+<input type="hidden" name="cf-turnstile-response" value="">
+<iframe id="cf" src="challenges.cloudflare.com.html" width="300" height="65"></iframe>

@@ -55,6 +55,48 @@ pub fn click(node: *DOMNode, frame: *Frame) !void {
     };
 }
 
+pub fn clickAt(
+    node: *DOMNode,
+    x: f64,
+    y: f64,
+    modifiers: Frame.user_input.MouseModifiers,
+    frame: *Frame,
+) !void {
+    const el = node.is(Element) orelse return error.InvalidNodeType;
+    try Frame.user_input.triggerMouseClickOn(frame, el, x, y, modifiers);
+}
+
+/// Dispatch one already-hit-tested mouse event (mousedown, mouseup, mousemove,
+/// contextmenu, dblclick) on `node`.
+pub fn mouseEventAt(
+    node: *DOMNode,
+    kind: Frame.user_input.MouseEventKind,
+    x: f64,
+    y: f64,
+    button: i32,
+    buttons: u16,
+    detail: u32,
+    modifiers: Frame.user_input.MouseModifiers,
+    frame: *Frame,
+) !void {
+    const el = node.is(Element) orelse return error.InvalidNodeType;
+    try Frame.user_input.triggerMouseEventOn(frame, el, kind, x, y, button, buttons, detail, modifiers);
+}
+
+pub fn wheelAt(
+    node: *DOMNode,
+    x: f64,
+    y: f64,
+    delta_x: f64,
+    delta_y: f64,
+    buttons: u16,
+    modifiers: Frame.user_input.MouseModifiers,
+    frame: *Frame,
+) !void {
+    const el = node.is(Element) orelse return error.InvalidNodeType;
+    try Frame.user_input.triggerMouseWheelOn(frame, el, x, y, delta_x, delta_y, buttons, modifiers);
+}
+
 pub fn hover(node: *DOMNode, frame: *Frame) !void {
     const el = node.is(Element) orelse return error.InvalidNodeType;
 
@@ -99,14 +141,6 @@ pub fn press(node: ?*DOMNode, key: []const u8, frame: *Frame) !void {
         return error.ActionFailed;
     };
 
-    if (std.mem.eql(u8, canonical, "Enter") and !keydown_event.asEvent().getDefaultPrevented()) {
-        if (target_el) |el| implicitFormSubmit(el, frame) catch |err| {
-            // Don't skip keyup on a submit-listener throw — UIs that gate
-            // state on keyup (e.g. clearing a "submitting" flag) would hang.
-            lp.log.warn(.app, "implicit form submit failed", .{ .err = err });
-        };
-    }
-
     const keyup_event: *KeyboardEvent = try .initTrusted(comptime .wrap("keyup"), .{
         .bubbles = true,
         .cancelable = true,
@@ -116,6 +150,50 @@ pub fn press(node: ?*DOMNode, key: []const u8, frame: *Frame) !void {
 
     frame._event_manager.dispatch(target, keyup_event.asEvent()) catch |err| {
         lp.log.err(.app, "press keyup failed", .{ .err = err });
+        return error.ActionFailed;
+    };
+}
+
+pub const KeyEvent = struct {
+    down: bool,
+    key: []const u8,
+    code: []const u8 = "",
+    location: u32 = 0,
+    repeat: bool = false,
+    alt: bool = false,
+    control: bool = false,
+    meta: bool = false,
+    shift: bool = false,
+};
+
+/// Dispatch a single real keydown or keyup. `press` fuses both halves into one
+/// synthetic pair, which loses hold-to-repeat and held-modifier state;
+/// interactive clients transport the two halves separately through here.
+pub fn keyEvent(node: ?*DOMNode, ev: KeyEvent, frame: *Frame) !void {
+    const target_el: ?*Element = if (node) |n|
+        (n.is(Element) orelse return error.InvalidNodeType)
+    else
+        null;
+    const target = if (target_el) |el| el.asEventTarget() else frame.document.asNode().asEventTarget();
+    // Both fit the 12-byte SSO buffer, so this wrap allocates nothing.
+    const typ: lp.String = if (ev.down) lp.String.wrap("keydown") else lp.String.wrap("keyup");
+
+    const event: *KeyboardEvent = try .initTrusted(typ, .{
+        .bubbles = true,
+        .cancelable = true,
+        .composed = true,
+        .key = canonicalKey(ev.key),
+        .code = ev.code,
+        .location = ev.location,
+        .repeat = ev.repeat,
+        .altKey = ev.alt,
+        .ctrlKey = ev.control,
+        .metaKey = ev.meta,
+        .shiftKey = ev.shift,
+    }, frame);
+
+    frame._event_manager.dispatch(target, event.asEvent()) catch |err| {
+        lp.log.err(.app, "key event failed", .{ .err = err, .down = ev.down });
         return error.ActionFailed;
     };
 }
@@ -145,28 +223,6 @@ fn canonicalKey(key: []const u8) []const u8 {
         if (std.ascii.eqlIgnoreCase(key, a.in)) return a.out;
     }
     return key;
-}
-
-fn implicitFormSubmit(el: *Element, frame: *Frame) !void {
-    const Input = Element.Html.Input;
-    const Button = Element.Html.Button;
-
-    if (el.is(Input)) |input| {
-        const form = input.getForm(frame) orelse return;
-        const submitter: ?*Element = switch (input._input_type) {
-            .submit, .image => el,
-            // Non-text controls (checkbox, radio, file, ...) don't trigger
-            // implicit submission; only the text-like family does.
-            .text, .password, .email, .url, .tel, .search, .number, .date, .time, .@"datetime-local", .month, .week => null,
-            else => return,
-        };
-        return form.requestSubmit(submitter, frame);
-    }
-    if (el.is(Button)) |button| {
-        if (!std.ascii.eqlIgnoreCase(button.getType(), "submit")) return;
-        const form = button.getForm(frame) orelse return;
-        return form.requestSubmit(el, frame);
-    }
 }
 
 pub fn selectOption(node: *DOMNode, value: []const u8, frame: *Frame) !void {

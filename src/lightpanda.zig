@@ -34,7 +34,6 @@ pub const Page = @import("browser/Page.zig");
 pub const Frame = @import("browser/Frame.zig");
 pub const Browser = @import("browser/Browser.zig");
 pub const Session = @import("browser/Session.zig");
-pub const Fingerprint = @import("browser/Fingerprint.zig");
 pub const Turnstile = @import("browser/Turnstile.zig");
 
 pub const js = @import("browser/js/js.zig");

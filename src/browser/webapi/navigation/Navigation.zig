@@ -225,7 +225,7 @@ pub fn pushEntry(
             ._state = state,
         },
     });
-    entry._proto._type = .{ .navigation_history_entry = entry };
+    entry._proto._type = .navigation_history_entry;
 
     // we don't always have a current entry...
     const previous = if (self._entries.items.len > 0) self.getCurrentEntry() else null;
@@ -272,7 +272,7 @@ pub fn replaceEntry(
             ._state = state,
         },
     });
-    entry._proto._type = .{ .navigation_history_entry = entry };
+    entry._proto._type = .navigation_history_entry;
 
     const old_entry = self._entries.items[self._index];
     self._entries.items[self._index] = entry;
@@ -428,14 +428,16 @@ pub fn reload(self: *Navigation, _opts: ?ReloadOptions, frame: *Frame) !Navigati
     const entry = self.getCurrentEntry();
     if (opts.state) |state| {
         const previous = entry;
-        entry._state = .{ .source = .navigation, .value = state.toJson(arena) catch return error.DataClone };
+        entry._state = .{ .source = .navigation, .value = state.toJson(arena.allocator()) catch return error.DataClone };
 
-        const event = try NavigationCurrentEntryChangeEvent.initTrusted(
-            .wrap("currententrychange"),
-            .{ .from = previous, .navigationType = @tagName(.reload) },
-            frame,
-        );
-        try self.dispatch(.{ .currententrychange = event }, frame);
+        if (self._on_currententrychange) |cec| {
+            const event = (try NavigationCurrentEntryChangeEvent.initTrusted(
+                .wrap("currententrychange"),
+                .{ .from = previous, .navigationType = @tagName(.reload) },
+                frame,
+            )).asEvent();
+            try self.dispatch(cec, event, frame);
+        }
     }
 
     return self.navigateInner(entry._url, .reload, frame);

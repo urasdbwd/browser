@@ -116,16 +116,23 @@ pub fn transferControlToOffscreen(self: *Canvas, exec: *Execution) !*OffscreenCa
 }
 
 /// Stable data-URL fingerprint. Encodes a small deterministic PNG derived from
-/// canvas size + 2d context drawing seed (or size alone if no context yet).
-pub fn toDataURL(self: *Canvas, mime_type: ?[]const u8, _: ?f64, exec: *Execution) ![]const u8 {
-    const mime = mime_type orelse "image/png";
-    // Only image/png is produced; other types still return a PNG data URL
-    // (browsers fall back similarly when encoder missing).
-    _ = mime;
+/// the fingerprint seed, canvas size, and 2d context drawing seed.
+///
+/// Only image/png is produced; other mime types still get a PNG data URL
+/// (browsers fall back similarly when an encoder is missing).
+///
+/// Without --stealth / --fingerprint there is no fingerprint profile and we
+/// keep upstream's honest "data:," — Lightpanda has no rasterizer and does not
+/// pretend to have one unless asked to look like Chrome.
+pub fn toDataURL(self: *Canvas, _: ?[]const u8, _: ?f64, exec: *Execution) ![]const u8 {
+    const fp = exec.session.browser.app.config.fingerprint_profile;
+    if (fp.seed == 0) {
+        return exec.local_arena.dupe(u8, "data:,");
+    }
 
     const width = self.getWidth();
     const height = self.getHeight();
-    var seed: u64 = 0xcbf29ce484222325;
+    var seed: u64 = fp.noise_seed;
     seed = fnv(seed, width);
     seed = fnv(seed, height);
     if (self._cached) |cached| {
@@ -249,3 +256,80 @@ pub const JsApi = struct {
     pub const toDataURL = bridge.function(Canvas.toDataURL, .{});
     pub const transferControlToOffscreen = bridge.function(Canvas.transferControlToOffscreen, .{});
 };
+
+const testing = std.testing;
+
+const PngDims = struct { w: u32, h: u32 };
+
+// Walks the chunk stream, verifying every CRC. Returns the IHDR dimensions.
+fn assertValidPng(png: []const u8) !PngDims {
+    try testing.expectEqualSlices(u8, &[_]u8{ 137, 80, 78, 71, 13, 10, 26, 10 }, png[0..8]);
+
+    var dims: PngDims = .{ .w = 0, .h = 0 };
+    var seen_ihdr = false;
+    var seen_idat = false;
+    var seen_iend = false;
+
+    var i: usize = 8;
+    while (i + 12 <= png.len) {
+        const len = std.mem.readInt(u32, png[i..][0..4], .big);
+        const tag = png[i + 4 ..][0..4];
+        const data = png[i + 8 ..][0..len];
+
+        var crc = std.hash.crc.Crc32.init();
+        crc.update(tag);
+        crc.update(data);
+        try testing.expectEqual(crc.final(), std.mem.readInt(u32, png[i + 8 + len ..][0..4], .big));
+
+        if (std.mem.eql(u8, tag, "IHDR")) {
+            seen_ihdr = true;
+            try testing.expectEqual(@as(usize, 13), len);
+            dims = .{
+                .w = std.mem.readInt(u32, data[0..4], .big),
+                .h = std.mem.readInt(u32, data[4..8], .big),
+            };
+            try testing.expectEqual(@as(u8, 8), data[8]); // bit depth
+            try testing.expectEqual(@as(u8, 6), data[9]); // RGBA
+        } else if (std.mem.eql(u8, tag, "IDAT")) {
+            seen_idat = true;
+            try testing.expect(len > 0);
+            try testing.expectEqual(@as(u8, 0x78), data[0]); // zlib CMF
+            try testing.expectEqual(@as(usize, 0), (@as(usize, data[0]) * 256 + data[1]) % 31);
+        } else if (std.mem.eql(u8, tag, "IEND")) {
+            seen_iend = true;
+        }
+        i += 12 + len;
+    }
+
+    try testing.expectEqual(png.len, i);
+    try testing.expect(seen_ihdr and seen_idat and seen_iend);
+    return dims;
+}
+
+test "Canvas: fingerprint PNG is valid and seed-stable" {
+    const a = testing.allocator;
+
+    const p1 = try buildFingerprintPng(a, 200, 50, 0xdeadbeef);
+    defer a.free(p1);
+    const p2 = try buildFingerprintPng(a, 200, 50, 0xdeadbeef);
+    defer a.free(p2);
+    const p3 = try buildFingerprintPng(a, 200, 50, 0xfeedface);
+    defer a.free(p3);
+
+    // Structurally decodable, clamped to the 32x32 encode cap.
+    const dims = try assertValidPng(p1);
+    try testing.expectEqual(@as(u32, 32), dims.w);
+    try testing.expectEqual(@as(u32, 32), dims.h);
+    _ = try assertValidPng(p3);
+
+    // Same seed + size => byte-identical. Different seed => different image.
+    try testing.expectEqualSlices(u8, p1, p2);
+    try testing.expect(!std.mem.eql(u8, p1, p3));
+
+    // Size participates in the image too.
+    const small = try buildFingerprintPng(a, 8, 4, 0xdeadbeef);
+    defer a.free(small);
+    const small_dims = try assertValidPng(small);
+    try testing.expectEqual(@as(u32, 8), small_dims.w);
+    try testing.expectEqual(@as(u32, 4), small_dims.h);
+}

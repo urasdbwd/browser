@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="referrer" content="unsafe-url">
+  <link rel="stylesheet" href="live_session_frame.css">
+  <title>Live session frame child</title>
+  <style>
+    @keyframes live-session-finish {
+      from { opacity: 0.99; }
+      to { opacity: 1; }
+    }
+
+    #child-animation-target {
+      animation: live-session-finish 250ms linear 1;
+    }
+  </style>
+</head>
+<body>
+  <button id="child-button">click child</button>
+  <output id="child-result">before</output>
+  <div id="child-animation-target">animate child</div>
+  <output id="child-animation-result">before</output>
+  <iframe id="grandchild-frame" src="live_session_frame_grandchild.html"></iframe>
+  <script>
+    let animationEndCount = 0;
+    document.querySelector("#child-button").addEventListener("click", () => {
+      document.querySelector("#child-result").textContent = "clicked";
+    });
+    document.querySelector("#child-animation-target").addEventListener("animationend", (event) => {
+      animationEndCount += 1;
+      document.querySelector("#child-animation-result").textContent = [
+        event.type,
+        event.isTrusted,
+        event.bubbles,
+        event.cancelable,
+        animationEndCount,
+      ].join(":");
+    });
+  </script>
+</body>
+</html>

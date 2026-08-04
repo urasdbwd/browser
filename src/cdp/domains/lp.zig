@@ -46,6 +46,7 @@ pub fn processMessage(cmd: *CDP.Command) !void {
         handleJavaScriptDialog,
         configureCDP,
         configureLoading,
+        solveCaptchas,
         version,
     }, cmd.input.action) orelse return error.UnknownMethod;
 
@@ -64,6 +65,7 @@ pub fn processMessage(cmd: *CDP.Command) !void {
         .handleJavaScriptDialog => return handleJavaScriptDialog(cmd),
         .configureCDP => return configureCDP(cmd),
         .configureLoading => return configureLoading(cmd),
+        .solveCaptchas => return solveCaptchas(cmd),
         .version => return version(cmd),
     }
 }
@@ -101,6 +103,32 @@ fn configureLoading(cmd: *CDP.Command) !void {
     if (params.worker) |v| bc.session.worker_loading_enabled = v;
     if (params.externalStylesheets) |v| bc.session.load_external_stylesheets = v;
     if (params.speculativePreloading) |v| bc.session.speculative_loading_enabled = v;
+    return cmd.sendResult(null, .{});
+}
+
+// Drive a managed Cloudflare Turnstile on the current page: click the
+// challenge UI and wait for a `cf-turnstile-response` token.
+//
+// Returns as soon as the solver is armed — it does NOT block the CDP loop for
+// the duration of the solve, which would stall every other session's traffic.
+// The work runs as a self-rescheduling scheduler task (`Turnstile.AutoSolve`),
+// so subsequent commands keep being served while the challenge resolves. Poll
+// for completion the way you'd poll for any async page state, e.g.
+// `Runtime.evaluate` on the token input, or `LP.waitForSelector`.
+//
+// With `--stealth` / `--solve-captchas` this already runs automatically after
+// every navigation (see `Frame` load); the command is the explicit opt-in for
+// clients that leave the flag off.
+fn solveCaptchas(cmd: anytype) !void {
+    const Params = struct {
+        timeout: ?u32 = null,
+    };
+    const params = (try cmd.params(Params)) orelse Params{};
+
+    const bc = cmd.browser_context orelse return error.NoBrowserContext;
+    const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
+
+    lp.Turnstile.AutoSolve.arm(frame, params.timeout orelse lp.Turnstile.AutoSolve.default_timeout_ms);
     return cmd.sendResult(null, .{});
 }
 
@@ -756,6 +784,39 @@ test "cdp.lp: handleJavaScriptDialog controls confirm/prompt/alert return values
     // the response doesn't leak across dialogs.
     const c_after_alert = try ls.local.exec("confirm('leak?')", null);
     try testing.expectEqual(false, c_after_alert.toBool());
+}
+
+test "cdp.lp: solveCaptchas arms the solver without blocking the loop" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{});
+    const page = try bc.session.createPage();
+    const frame = page.frame().?;
+
+    // Fake Turnstile-shaped fixture served locally — the iframe src merely
+    // *contains* challenges.cloudflare.com. Never touches the real network.
+    const url = "http://localhost:9582/src/browser/tests/turnstile/widget.html";
+    try frame.navigate(url, .{ .reason = .address_bar, .kind = .{ .push = null } });
+    try testing.waitForPage(bc);
+
+    try testing.expectEqual(true, lp.Turnstile.hasWidget(bc.session));
+
+    // The command must return immediately: a 30s solve budget is spent on the
+    // scheduler, not inside processMessage.
+    const started: std.Io.Timestamp = .now(lp.io, .boot);
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "LP.solveCaptchas",
+        .params = .{ .timeout = 30_000 },
+    });
+    try ctx.expectSentResult(null, .{ .id = 1 });
+    try testing.expect(started.untilNow(lp.io, .boot).toMilliseconds() < 1_000);
+
+    // Pumping the loop runs the armed scheduler task, which clicks through to
+    // a token — no further CDP command needed.
+    try lp.actions.waitForScript(lp.Turnstile.token_wait_script, 5_000, frame._frame_id, bc.session);
+    try testing.expectEqual(true, lp.Turnstile.hasToken(bc.session));
 }
 
 test "cdp.lp: configureLoading toggles loading features independently" {

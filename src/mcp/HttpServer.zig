@@ -445,7 +445,7 @@ fn serve(self: *HttpServer, out: *ResponseBuffer, arena: std.mem.Allocator, requ
     self.queue.push(&job);
     job.done.waitUncancelable(lp.io);
 
-    const resp = if (out.failed) response_too_large else out.buffered();
+    const resp = if (out.failure != null) response_too_large else out.buffered();
     var headers: [2]std.http.Header = undefined;
     var n: usize = 0;
     headers[n] = .{ .name = "content-type", .value = "application/json" };
@@ -454,7 +454,7 @@ fn serve(self: *HttpServer, out: *ResponseBuffer, arena: std.mem.Allocator, requ
         headers[n] = .{ .name = "mcp-session-id", .value = job.assigned() };
         n += 1;
     }
-    const reuse = keep_alive and !out.failed;
+    const reuse = keep_alive and out.failure == null;
     try request.respond(resp, .{
         // An empty body means a notification (or a close): 202, no content.
         .status = if (resp.len == 0) .accepted else .ok,

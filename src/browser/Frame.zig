@@ -25,6 +25,7 @@ const Mime = @import("Mime.zig");
 const Page = @import("Page.zig");
 const Factory = @import("Factory.zig");
 const Session = @import("Session.zig");
+const Turnstile = @import("Turnstile.zig");
 const EventManager = @import("EventManager.zig");
 const ScriptManager = @import("ScriptManager.zig");
 const StyleManager = @import("StyleManager.zig");
@@ -129,6 +130,14 @@ _attribute_lookup: Element.Attribute.List.Lookup = .empty,
 // optimization (since we can compare strings by just their pointer)
 _attribute_names: std.StringHashMapUnmanaged(void) = .empty,
 
+// Same idea for attribute VALUES. Real pages repeat the same class/role/href
+// strings across hundreds of elements, and the arena never frees, so one dupe
+// per element is pure waste. Only short values go in the pool: long ones (inline
+// style, data: URIs, JSON payloads) are rarely repeated and would just grow the
+// map. Entries are immutable once stored - setValue swaps the pointer, it never
+// writes through it - so sharing is safe for the frame's lifetime.
+_attribute_values: std.StringHashMapUnmanaged(void) = .empty,
+
 // Same as _atlribute_lookup, but instead of individual attributes, this is for
 // the return of elements.attributes.
 _attribute_named_node_map_lookup: std.AutoHashMapUnmanaged(usize, *Element.Attribute.NamedNodeMap) = .empty,
@@ -194,6 +203,11 @@ _file_lists: std.ArrayList(*FileList) = .empty,
 _queued_events_1: std.ArrayList(QueuedEvent) = .empty,
 _queued_events_2: std.ArrayList(QueuedEvent) = .empty,
 _queued_events: *std.ArrayList(QueuedEvent) = undefined,
+
+// Element the synthetic pointer is currently over, so mouseover/mouseenter
+// fire on entry only rather than on every press or move. Compared by identity
+// and never dereferenced, so a detached element cannot dangle through it.
+_hover_element: ?*Element = null,
 
 _style_manager: StyleManager,
 _script_manager: ScriptManager,
@@ -310,6 +324,11 @@ parent: ?*Frame,
 window: *Window,
 document: *Document,
 iframe: ?*IFrame = null,
+
+// A discarded iframe browsing context is removed from the active frame tree
+// immediately, but remains Page-owned until Page.deinit so cached WindowProxy
+// references never point through freed native state.
+_retired: bool = false,
 
 child_frames_sorted: bool = true,
 child_frames: std.ArrayList(*Frame) = .empty,
@@ -477,12 +496,27 @@ pub fn deinit(self: *Frame) void {
 
     if (comptime IS_DEBUG) {
         log.debug(.frame, "frame.deinit", .{ .url = self.url, .type = self._type });
+    }
 
-        // Uncomment if you want slab statistics to print.
-        // const stats = self._factory._slab.getStats(self.arena) catch unreachable;
-        // var buffer: [256]u8 = undefined;
-        // var stream = std.Io.File.stderr().writerStreaming(lp.io, &buffer).interface;
-        // stats.print(&stream) catch unreachable;
+    // TEMP-SLAB-STATS
+    if (std.c.getenv("LP_SLAB_STATS") != null) {
+        var it = self._factory._slab.slabs.iterator();
+        var total: usize = 0;
+        while (it.next()) |entry| {
+            const slab = entry.value_ptr;
+            const slots = slab.bitset.bit_length;
+            const free_slots = slab.bitset.count();
+            const bytes = slots * slab.item_size;
+            total += bytes;
+            std.debug.print("SLAB size={d} align={d} slots={d} used={d} bytes={d}\n", .{
+                entry.key_ptr.size,
+                @intFromEnum(entry.key_ptr.alignment),
+                slots,
+                slots - free_slots,
+                bytes,
+            });
+        }
+        std.debug.print("SLAB TOTAL bytes={d}\n", .{total});
     }
 
     self._parse_state.deinit(self);
@@ -1020,6 +1054,9 @@ fn scheduleNavigationWithArena(originator: *Frame, arena: *lp.Arena, request_url
 // 4 - iframe.src =
 // Within, each category, it's last-one-wins.
 fn canScheduleNavigation(self: *Frame, new_target_type: NavigationType) bool {
+    if (self._retired) {
+        return false;
+    }
     if (self.parent) |parent| {
         if (parent.isGoingAway()) {
             return false;
@@ -1204,6 +1241,10 @@ fn _documentIsComplete(self: *Frame) !void {
         .loader_id = self._loader_id,
         .timestamp = lp.datetime.timestamp(.boot),
     });
+
+    // Scheduled (never blocking) managed-Turnstile solve, so CDP/MCP/agent get
+    // the same --stealth behaviour as the one-shot `fetch` path.
+    Turnstile.AutoSolve.start(self);
 
     if (self._event_manager.hasDirectListeners(window_target, "pageshow", self.window._on_pageshow)) {
         const pageshow_event = (try PageTransitionEvent.initTrusted(comptime .wrap("pageshow"), .{}, self)).asEvent();
@@ -1521,10 +1562,7 @@ fn frameDataCallback(transfer: *HttpClient.Transfer, data: []const u8) !void {
                     const name = info.name();
                     self.charset = if (html_prescan_found_charset and isUtf16Encoding(name)) "UTF-8" else name;
                 }
-                self._parse_state = .{ .html = .{
-                    .buffer = .empty,
-                    .arena = try self.getArena(.large, "Frame.navigate"),
-                } };
+                self._parse_state = .{ .html = .{} };
             },
             .application_json, .text_javascript, .text_css, .text_plain, .text_markdown => {
                 var arr: std.ArrayList(u8) = .empty;
@@ -1539,7 +1577,7 @@ fn frameDataCallback(transfer: *HttpClient.Transfer, data: []const u8) !void {
     }
 
     switch (self._parse_state) {
-        .html => |*html| try html.buffer.appendSlice(html.arena.allocator(), data),
+        .html => |*html| try html.append(self, transfer, data),
         .text => |*buf| {
             // we have to escape the data...
             var v = data;
@@ -1608,11 +1646,11 @@ fn frameDoneCallback(ctx: *anyopaque) !void {
         .html => |*html| {
             {
                 defer {
-                    html.arena.release();
+                    html.buffer.deinit(self._session.browser.allocator);
                     self._parse_state = .complete;
                 }
 
-                const raw_html = html.buffer.items;
+                const raw_html = html.body;
 
                 preload.prescan(self, raw_html);
 
@@ -1741,6 +1779,9 @@ fn frameErrorCallback(ctx: *anyopaque, err: anyerror) void {
     };
 }
 pub fn isGoingAway(self: *const Frame) bool {
+    if (self._retired) {
+        return true;
+    }
     if (self._queued_navigation != null) {
         return true;
     }
@@ -1988,11 +2029,16 @@ pub fn openPopup(self: *Frame, opts: OpenPopupOpts) !*Frame {
 
 pub fn domChanged(self: *Frame) void {
     self._page.dom_version += 1;
+    self.snapshotChanged();
 
     // A DOM change is our "rendering opportunity": re-evaluate the layout
     // observers. Both are no-ops unless something they track actually changed.
     observers.scheduleIntersectionChecks(self);
     observers.scheduleResizeChecks(self);
+}
+
+pub fn snapshotChanged(self: *Frame) void {
+    self._page.snapshot_version +%= 1;
 }
 
 const ElementIdMaps = struct { lookup: *std.StringHashMapUnmanaged(*Element), removed_ids: *std.StringHashMapUnmanaged(void) };
@@ -2010,9 +2056,10 @@ fn getElementIdMap(frame: *Frame, node: *Node) ElementIdMaps {
 
         const parent = current._parent orelse {
             if (current._type == .document) {
+                const doc = current.typed().document;
                 return .{
-                    .lookup = &current._type.document._elements_by_id,
-                    .removed_ids = &current._type.document._removed_ids,
+                    .lookup = &doc._elements_by_id,
+                    .removed_ids = &doc._removed_ids,
                 };
             }
             // Detached nodes should not have IDs registered
@@ -2063,7 +2110,7 @@ pub fn getElementByIdFromNode(self: *Frame, node: *Node, id: []const u8) ?*Eleme
     // shadow DOM. Walk to the root once and consult the matching map.
     const root = node.getRootNode(.{});
     if (root._type == .document) {
-        return root._type.document.getElementById(id, self);
+        return root.typed().document.getElementById(id, self);
     }
     if (root.is(ShadowRoot)) |shadow_root| {
         return shadow_root.getElementById(id, self);
@@ -2302,6 +2349,9 @@ fn dispatchQueuedEvents(self: *Frame) !void {
     for (to_process.items) |queued| {
         const html_element = queued.element;
         const element = html_element.asElement();
+        if (element.is(IFrame) != null and element.asNode().isConnected() == false) {
+            continue;
+        }
         switch (queued.kind) {
             // hasAttributeFunction only sees handlers compiled via property
             // access; a parsed `onload="..."` attribute is compiled lazily at
@@ -2445,12 +2495,110 @@ pub fn dupeSSO(self: *Frame, value: []const u8) !String {
     return String.init(self.arena, value, .{ .dupe = true });
 }
 
+fn retireSubtree(self: *Frame) void {
+    if (self._retired) {
+        return;
+    }
+    self._retired = true;
+
+    if (self.iframe) |iframe| {
+        if (iframe._window == self.window) {
+            iframe._window = null;
+        }
+        iframe._executed = false;
+    }
+    self.iframe = null;
+    self.parent = null;
+    self.window._closed = true;
+    self.window._detached = true;
+
+    if (self._queued_navigation) |navigation| {
+        self._queued_navigation = null;
+        navigation.arena.release();
+    }
+
+    if (self.window._cookie_store) |cookie_store| {
+        cookie_store.detach();
+    }
+    self._session.idb.detachContext(self.js);
+    self.window._timers.shutdown();
+    self.js.deactivate();
+    self._script_manager.base.shutdown = true;
+
+    const http_client = &self._session.browser.http_client;
+    for (self.workers.items) |worker| {
+        worker.terminate();
+        const scope = worker._worker_scope._proto;
+        if (scope._cookie_store) |cookie_store| {
+            cookie_store.detach();
+        }
+        self._session.idb.detachContext(scope.js);
+        scope._timers.shutdown();
+        scope.js.deactivate();
+        scope._script_manager.shutdown = true;
+        http_client.abortOwner(&scope._http_owner);
+    }
+
+    for (self.child_frames.items) |child| {
+        child.retireSubtree();
+    }
+}
+
+fn retireChildFrame(self: *Frame, child: *Frame) void {
+    if (child._retired) {
+        return;
+    }
+
+    const was_delaying_parent = child._delays_parent_load and !child._parent_notified;
+    child.abortTransfers();
+    child.retireSubtree();
+
+    // The old Window/Document may still be referenced by parent-realm JS.
+    // Keep the native graph alive, but inactive, until the Page owns teardown.
+    self._page.closed_frames.append(self._page.frame_arena, child) catch @panic("OOM");
+
+    if (was_delaying_parent) {
+        child._parent_notified = true;
+        if (self._pending_loads > 0) {
+            self.pendingLoadCompleted();
+        }
+    }
+}
+
+pub fn retireDescendantFrames(self: *Frame) void {
+    for (self.child_frames.items) |child| {
+        self.retireChildFrame(child);
+    }
+    self.child_frames.clearRetainingCapacity();
+}
+
+fn retireDisconnectedChildFrames(self: *Frame) void {
+    var i: usize = 0;
+    while (i < self.child_frames.items.len) {
+        const child = self.child_frames.items[i];
+        const iframe = child.iframe orelse {
+            i += 1;
+            continue;
+        };
+        if (iframe.asNode().isConnected()) {
+            i += 1;
+            continue;
+        }
+
+        self.child_frames_sorted = false;
+        _ = self.child_frames.swapRemove(i);
+        self.retireChildFrame(child);
+    }
+}
+
 const RemoveNodeOpts = struct {
     will_be_reconnected: bool,
     // Set to false when the caller queues its own combined mutation record
     notify_observers: bool = true,
 };
 pub fn removeNode(self: *Frame, parent: *Node, child: *Node, opts: RemoveNodeOpts) void {
+    const owner_frame = child.ownerFrame(self);
+
     // NodeIterator pre-removing steps must run while the tree is intact.
     if (self._live_node_iterators.first != null) {
         var it: ?*std.DoublyLinkedList.Node = self._live_node_iterators.first;
@@ -2541,6 +2689,11 @@ pub fn removeNode(self: *Frame, parent: *Node, child: *Node, opts: RemoveNodeOpt
             }
         }
     }
+
+    // Scan the owning frame's active children instead of only the light-DOM
+    // walker above. This also catches iframes under removed shadow hosts and
+    // resolves self-removal from a child realm against the parent document.
+    owner_frame.retireDisconnectedChildFrames();
 }
 
 pub fn appendNode(self: *Frame, parent: *Node, child: *Node, opts: InsertNodeOpts) !void {
@@ -3001,19 +3154,43 @@ const ParseState = union(enum) {
     pre,
     complete,
     err: anyerror,
-    html: struct {
-        arena: *lp.Arena,
-        buffer: std.ArrayList(u8),
-    },
+    html: Html,
     text: std.ArrayList(u8),
     image: std.ArrayList(u8),
     raw: std.ArrayList(u8),
     raw_done: []const u8,
     download: Download,
 
-    fn deinit(self: *ParseState, _: *Frame) void {
+    // A non-streaming transfer has already buffered the whole response body and
+    // hands it over in a single data event, alive until after done_callback (and
+    // so after the parse) returns. Copying it into `buffer` would make a second
+    // full-document copy resident for the entire parse — measurably ~1x the
+    // document size at peak RSS. So we borrow it instead, and only fall back to
+    // owning a copy when the body arrives in more than one piece (streaming,
+    // where each delivered chunk is only valid for the duration of its call).
+    const Html = struct {
+        // The bytes so far: either borrowed from the transfer or `buffer.items`.
+        body: []const u8 = &.{},
+        buffer: std.ArrayList(u8) = .empty,
+
+        fn append(self: *Html, frame: *Frame, transfer: *HttpClient.Transfer, data: []const u8) !void {
+            if (self.body.len == 0 and self.buffer.capacity == 0 and !transfer.req.streaming) {
+                self.body = data;
+                return;
+            }
+            const allocator = frame._session.browser.allocator;
+            if (self.buffer.items.len == 0 and self.body.len > 0) {
+                // Second piece of a body whose first piece we were borrowing.
+                try self.buffer.appendSlice(allocator, self.body);
+            }
+            try self.buffer.appendSlice(allocator, data);
+            self.body = self.buffer.items;
+        }
+    };
+
+    fn deinit(self: *ParseState, frame: *Frame) void {
         switch (self.*) {
-            .html => |html| html.arena.release(),
+            .html => |*html| html.buffer.deinit(frame._session.browser.allocator),
             // Only reached when a frame is torn down mid-download (the normal
             // completion path in frameDoneCallback already closes the file and
             // transitions to .complete).
@@ -3488,6 +3665,44 @@ test "Frame: urlBasename" {
     try testing.expectEqualSlices(u8, "report.csv", (try urlBasename(a, "http://x.com/a/b/report.csv")).?);
     try testing.expectEqualSlices(u8, "report.csv", (try urlBasename(a, "http://x.com/report.csv?v=1#x")).?);
     try testing.expect((try urlBasename(a, "http://x.com/")) == null);
+}
+
+test "Frame: chunked large HTML releases buffer capacities" {
+    var gpa: std.heap.DebugAllocator(.{ .enable_memory_limit = true }) = .{};
+    defer testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    // Reclaiming growth stays below 6 MiB; arena growth retains about 7.1 MiB.
+    gpa.requested_memory_limit = 6 * 1024 * 1024;
+    const allocator = gpa.allocator();
+
+    var browser: @TypeOf(testing.test_browser) = undefined;
+    browser.allocator = allocator;
+    var session: Session = undefined;
+    session.browser = &browser;
+
+    var frame: Frame = undefined;
+    frame._session = &session;
+    frame._parse_state = .{ .html = .{} };
+    defer frame._parse_state.deinit(&frame);
+
+    var transfer: HttpClient.Transfer = undefined;
+    transfer.req.ctx = &frame;
+    transfer.req.streaming = false;
+
+    const chunk = [_]u8{'x'} ** 4096;
+    for (0..512) |_| {
+        try frameDataCallback(&transfer, &chunk);
+    }
+
+    // The first chunk is borrowed; the second materializes it, so every byte
+    // still ends up in the owned buffer exactly once.
+    const html = &frame._parse_state.html;
+    try testing.expectEqual(2 * 1024 * 1024, html.body.len);
+    try testing.expectEqual(2 * 1024 * 1024, html.buffer.items.len);
+    try testing.expectEqual(html.buffer.capacity, gpa.total_requested_bytes);
+
+    frame._parse_state.deinit(&frame);
+    frame._parse_state = .complete;
+    try testing.expectEqual(0, gpa.total_requested_bytes);
 }
 
 test "WebApi: Frame" {

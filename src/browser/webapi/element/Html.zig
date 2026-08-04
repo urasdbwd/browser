@@ -131,7 +131,80 @@ pub fn upgradeConstruct(frame: *Frame) !*Element {
     return node.is(Element) orelse return error.TypeError;
 }
 
-pub const Type = union(enum) {
+pub const Type = enum(u8) {
+    anchor,
+    area,
+    base,
+    body,
+    br,
+    button,
+    canvas,
+    custom,
+    data,
+    datalist,
+    details,
+    dialog,
+    directory,
+    div,
+    dl,
+    embed,
+    fieldset,
+    font,
+    form,
+    frameset,
+    generic,
+    heading,
+    head,
+    html,
+    hr,
+    img,
+    iframe,
+    input,
+    label,
+    legend,
+    li,
+    link,
+    map,
+    marquee,
+    media,
+    meta,
+    meter,
+    mod,
+    object,
+    ol,
+    optgroup,
+    option,
+    output,
+    p,
+    picture,
+    param,
+    pre,
+    progress,
+    quote,
+    script,
+    select,
+    slot,
+    source,
+    span,
+    style,
+    table,
+    table_caption,
+    table_cell,
+    table_col,
+    table_row,
+    table_section,
+    template,
+    textarea,
+    time,
+    title,
+    track,
+    ul,
+    unknown,
+};
+
+// `_type` only stores the tag: the payload is the next member of the
+// (contiguous) factory chain, resolved by Factory.typedOf.
+pub const Typed = union(Type) {
     anchor: *Anchor,
     area: *Area,
     base: *Base,
@@ -202,15 +275,14 @@ pub const Type = union(enum) {
     unknown: *Unknown,
 };
 
+pub fn typed(self: *const HtmlElement) Typed {
+    return Factory.typedOf(self);
+}
+
 pub fn is(self: *HtmlElement, comptime T: type) ?*T {
-    inline for (@typeInfo(Type).@"union".fields) |f| {
-        if (@field(Type, f.name) == self._type) {
-            if (f.type == T) {
-                return &@field(self._type, f.name);
-            }
-            if (f.type == *T) {
-                return @field(self._type, f.name);
-            }
+    inline for (@typeInfo(Typed).@"union".fields) |f| {
+        if (f.type == *T and @field(Type, f.name) == self._type) {
+            return Factory.childOf(self, T);
         }
     }
     return null;
@@ -304,7 +376,7 @@ pub fn insertAdjacentHTML(
 }
 
 pub fn click(self: *HtmlElement, frame: *Frame) !void {
-    switch (self._type) {
+    switch (self.typed()) {
         inline .button, .input, .textarea, .select => |i| {
             if (i.getDisabled()) {
                 return;
@@ -330,7 +402,7 @@ pub fn click(self: *HtmlElement, frame: *Frame) !void {
 
     if (event._prevent_default == false) {
         // toggle the popover_target
-        const explicit: ?*Element = switch (self._type) {
+        const explicit: ?*Element = switch (self.typed()) {
             .button => |b| b._popover_target,
             .input => |i| i._popover_target,
             else => null,
@@ -544,7 +616,7 @@ fn setAttributeListener(
 ) !void {
     if (comptime IS_DEBUG) {
         log.debug(.event, "Html.setAttributeListener", .{
-            .type = std.meta.activeTag(self._type),
+            .type = self._type,
             .listener_type = listener_type,
         });
     }
@@ -1488,8 +1560,8 @@ fn collectInnerText(self: *HtmlElement, state: *InnerTextState) std.Io.Writer.Er
 
     var it = el.asNode().childrenIterator();
     while (it.next()) |child| {
-        switch (child._type) {
-            .element => |e| switch (e._type) {
+        switch (child.typed()) {
+            .element => |e| switch (e.typed()) {
                 .svg => {},
                 .html => |he| {
                     const tag = e.getTag();
@@ -1865,7 +1937,7 @@ pub const Build = struct {
     // Calls `func_name` with `args` on the most specific type where it is
     // implement. This could be on the HtmlElement itself.
     pub fn call(self: *const HtmlElement, comptime func_name: []const u8, args: anytype) !bool {
-        inline for (@typeInfo(HtmlElement.Type).@"union".fields) |f| {
+        inline for (@typeInfo(HtmlElement.Typed).@"union".fields) |f| {
             if (@field(HtmlElement.Type, f.name) == self._type) {
                 // The inner type implements this function. Call it and we're done.
                 const S = reflect.Struct(f.type);

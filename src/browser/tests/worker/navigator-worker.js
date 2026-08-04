@@ -38,6 +38,14 @@ onmessage = async function(event) {
 
       // [Exposed=Window] members must NOT leak into the worker realm.
       no_plugins: navigator.plugins === undefined,
+      no_mime_types: navigator.mimeTypes === undefined,
+      no_vendor: navigator.vendor === undefined,
+      no_product_sub: navigator.productSub === undefined,
+      no_vendor_sub: navigator.vendorSub === undefined,
+      no_oscpu: navigator.oscpu === undefined,
+      no_pdf_viewer: navigator.pdfViewerEnabled === undefined,
+      no_java_enabled: navigator.javaEnabled === undefined,
+      no_taint_enabled: navigator.taintEnabled === undefined,
       no_register_protocol_handler: navigator.registerProtocolHandler === undefined,
       no_model_context: navigator.modelContext === undefined,
     };

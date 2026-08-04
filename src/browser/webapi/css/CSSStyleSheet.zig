@@ -54,8 +54,11 @@ pub fn getDisabled(self: *const CSSStyleSheet) bool {
     return self._disabled;
 }
 
-pub fn setDisabled(self: *CSSStyleSheet, disabled: bool) void {
+pub fn setDisabled(self: *CSSStyleSheet, disabled: bool, frame: *Frame) void {
+    if (self._disabled == disabled) return;
     self._disabled = disabled;
+    frame._style_manager.sheetModified();
+    frame.snapshotChanged();
 }
 
 pub fn getCssRules(self: *CSSStyleSheet, frame: *Frame) !*CSSRuleList {
@@ -67,7 +70,7 @@ pub fn getCssRules(self: *CSSStyleSheet, frame: *Frame) !*CSSRuleList {
     if (self.getOwnerNode()) |owner| {
         if (owner.is(Element.Html.Style)) |style| {
             const text = try style.asNode().getTextContentAlloc(frame.local_arena);
-            try self.replaceSync(text, frame);
+            try self.replaceRules(text, frame);
         }
     }
 
@@ -76,6 +79,46 @@ pub fn getCssRules(self: *CSSStyleSheet, frame: *Frame) !*CSSRuleList {
 
 pub fn getOwnerRule(self: *const CSSStyleSheet) ?*CSSRule {
     return self._owner_rule;
+}
+
+pub fn writeCssRules(
+    self: *CSSStyleSheet,
+    writer: *std.Io.Writer,
+    frame: *Frame,
+) error{ OutOfMemory, WriteFailed }!void {
+    if (self._disabled) return;
+
+    const rules = self.getCssRules(frame) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.WriteFailed,
+    };
+    for (rules._rules.items, 0..) |rule, index| {
+        if (index > 0) try writer.writeByte('\n');
+        const text = switch (rule._type) {
+            .style => |style_rule| style_rule.getCssText(frame) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.WriteFailed,
+            },
+            else => rule._text,
+        };
+        try writeStyleElementText(text, writer);
+    }
+}
+
+fn writeStyleElementText(text: []const u8, writer: *std.Io.Writer) !void {
+    const end_tag = "</style";
+    var remaining = text;
+    while (remaining.len >= end_tag.len) {
+        var index: usize = 0;
+        while (index + end_tag.len <= remaining.len) : (index += 1) {
+            if (std.ascii.eqlIgnoreCase(remaining[index..][0..end_tag.len], end_tag)) break;
+        } else break;
+
+        try writer.writeAll(remaining[0..index]);
+        try writer.writeAll("\\3C ");
+        remaining = remaining[index + 1 ..];
+    }
+    try writer.writeAll(remaining);
 }
 
 pub fn insertRule(self: *CSSStyleSheet, rule: []const u8, maybe_index: ?u32, frame: *Frame) !u32 {
@@ -117,6 +160,7 @@ pub fn insertRule(self: *CSSStyleSheet, rule: []const u8, maybe_index: ?u32, fra
 
     // Notify StyleManager that rules have changed
     frame._style_manager.sheetModified();
+    frame.snapshotChanged();
 
     return index;
 }
@@ -157,6 +201,7 @@ pub fn deleteRule(self: *CSSStyleSheet, index: u32, frame: *Frame) !void {
 
     // Notify StyleManager that rules have changed
     frame._style_manager.sheetModified();
+    frame.snapshotChanged();
 }
 
 pub fn replace(self: *CSSStyleSheet, text: []const u8, frame: *Frame) CSSError!js.Promise {
@@ -165,6 +210,14 @@ pub fn replace(self: *CSSStyleSheet, text: []const u8, frame: *Frame) CSSError!j
 }
 
 pub fn replaceSync(self: *CSSStyleSheet, text: []const u8, frame: *Frame) CSSError!void {
+    try self.replaceRules(text, frame);
+
+    // Notify StyleManager that rules have changed
+    frame._style_manager.sheetModified();
+    frame.snapshotChanged();
+}
+
+fn replaceRules(self: *CSSStyleSheet, text: []const u8, frame: *Frame) CSSError!void {
     const rules = try self.getCssRules(frame);
     rules.clear();
 
@@ -187,9 +240,6 @@ pub fn replaceSync(self: *CSSStyleSheet, text: []const u8, frame: *Frame) CSSErr
         try rules.insert(index, inserted, frame);
         index += 1;
     }
-
-    // Notify StyleManager that rules have changed
-    frame._style_manager.sheetModified();
 }
 
 pub const JsApi = struct {
@@ -226,4 +276,68 @@ test "WebApi: layer @-rule cascade" {
 
 test "WebApi: layer order cascade" {
     try testing.htmlRunner("css/layer_order_cascade.html", .{});
+}
+
+test "CSSOM mutations invalidate render snapshots without DOM changes" {
+    var page = try testing.pageTest("dump.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    const sheet = try CSSStyleSheet.init(frame);
+    const dom_version = frame._page.dom_version;
+    var snapshot_version = frame._page.snapshot_version;
+
+    _ = try sheet.getCssRules(frame);
+    try testing.expectEqual(snapshot_version, frame._page.snapshot_version);
+
+    _ = try sheet.insertRule(".rule { color: red; }", null, frame);
+    snapshot_version += 1;
+    try testing.expectEqual(snapshot_version, frame._page.snapshot_version);
+
+    try sheet.deleteRule(0, frame);
+    snapshot_version += 1;
+    try testing.expectEqual(snapshot_version, frame._page.snapshot_version);
+
+    try sheet.replaceSync(".rule { color: red; }", frame);
+    snapshot_version += 1;
+    try testing.expectEqual(snapshot_version, frame._page.snapshot_version);
+
+    sheet.setDisabled(true, frame);
+    snapshot_version += 1;
+    try testing.expectEqual(snapshot_version, frame._page.snapshot_version);
+    sheet.setDisabled(true, frame);
+    try testing.expectEqual(snapshot_version, frame._page.snapshot_version);
+    sheet.setDisabled(false, frame);
+    snapshot_version += 1;
+    try testing.expectEqual(snapshot_version, frame._page.snapshot_version);
+
+    const rules = try sheet.getCssRules(frame);
+    const style_rule = switch (rules._rules.items[0]._type) {
+        .style => |style| style,
+        else => unreachable,
+    };
+    const style = try style_rule.getStyle(frame);
+
+    try style.setNamed("color", "blue", frame);
+    snapshot_version += 1;
+    try testing.expectEqual(snapshot_version, frame._page.snapshot_version);
+    try style.setNamed("color", "blue", frame);
+    try testing.expectEqual(snapshot_version, frame._page.snapshot_version);
+
+    try style.setProperty("margin", "1px", null, frame);
+    snapshot_version += 1;
+    try testing.expectEqual(snapshot_version, frame._page.snapshot_version);
+
+    _ = try style.removeProperty("margin", frame);
+    snapshot_version += 1;
+    try testing.expectEqual(snapshot_version, frame._page.snapshot_version);
+
+    try style.setCssText("display: block;", frame);
+    snapshot_version += 1;
+    try testing.expectEqual(snapshot_version, frame._page.snapshot_version);
+
+    try style.setFloat("left", frame);
+    snapshot_version += 1;
+    try testing.expectEqual(snapshot_version, frame._page.snapshot_version);
+    try testing.expectEqual(dom_version, frame._page.dom_version);
 }

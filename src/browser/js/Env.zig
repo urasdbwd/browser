@@ -43,6 +43,10 @@ const IS_DEBUG = builtin.mode == .Debug;
 
 const MAX_CONTEXTS = if (lp.build_config.wpt_extensions) 8192 else 128;
 
+fn orderContextId(id: usize, context: *Context) std.math.Order {
+    return std.math.order(id, context.id);
+}
+
 fn initClassIds() void {
     inline for (JsApis, 0..) |JsApi, i| {
         JsApi.Meta.class_id = i;
@@ -68,7 +72,12 @@ platform: *const Platform,
 // the global isolate
 isolate: js.Isolate,
 
+// Owns every Context until teardown for WindowProxy/native lifetime correctness.
 contexts: std.ArrayList(*Context),
+
+// Compact scheduling view in creation order; inactive Contexts remain owned by
+// contexts above. Ordered removal keeps IDs ascending for mutation-safe scans.
+active_contexts: std.ArrayList(*Context),
 
 // just kept around because we need to free it on deinit
 isolate_params: *v8.CreateParams,
@@ -197,6 +206,7 @@ pub fn init(app: *App, opts: InitOpts) !Env {
         .context_id = 0,
         .allocator = allocator,
         .contexts = .empty,
+        .active_contexts = .empty,
         .isolate = isolate,
         .platform = &app.platform,
         .templates = templates,
@@ -211,11 +221,13 @@ pub fn init(app: *App, opts: InitOpts) !Env {
 pub fn deinit(self: *Env) void {
     if (comptime IS_DEBUG) {
         std.debug.assert(self.contexts.items.len == 0);
+        std.debug.assert(self.active_contexts.items.len == 0);
     }
     for (self.contexts.items) |ctx| {
         ctx.deinit();
     }
     self.contexts.deinit(self.allocator);
+    self.active_contexts.deinit(self.allocator);
 
     const app = self.app;
     const allocator = app.allocator;
@@ -294,6 +306,27 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context 
     // Get the global object for the context
     const global_obj = v8.v8__Context__Global(v8_context).?;
 
+    // Capture Object.freeze before page code can replace Object or freeze.
+    const object_value = v8.v8__Object__Get(
+        global_obj,
+        v8_context,
+        isolate.initStringHandle("Object"),
+    ) orelse return error.JsException;
+    if (!v8.v8__Value__IsObject(object_value)) {
+        return error.JsException;
+    }
+    const freeze_value = v8.v8__Object__Get(
+        @ptrCast(object_value),
+        v8_context,
+        isolate.initStringHandle("freeze"),
+    ) orelse return error.JsException;
+    if (!v8.v8__Value__IsFunction(freeze_value)) {
+        return error.JsException;
+    }
+    var object_freeze: v8.Global = undefined;
+    v8.v8__Global__New(isolate.handle, freeze_value, &object_freeze);
+    errdefer v8.v8__Global__Reset(&object_freeze);
+
     // Store our TAO inside the internal field of the global object. This
     // maps the v8::Object -> Zig instance.
     const tao = try params.identity_arena.create(@import("TaggedOpaque.zig"));
@@ -335,6 +368,7 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context 
         .isolate = isolate,
         .arena = context_arena,
         .handle = context_global,
+        .object_freeze = object_freeze,
         .templates = self.templates,
         .call_arena = params.call_arena,
         .local_arena = params.local_arena,
@@ -380,6 +414,8 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context 
         return error.TooManyContexts;
     }
     try self.contexts.append(self.allocator, context);
+    errdefer _ = self.contexts.pop();
+    try self.active_contexts.append(self.allocator, context);
 
     return context;
 }
@@ -424,12 +460,18 @@ pub fn runMicrotasks(self: *Env) void {
         self.microtask_queues_are_running = true;
         defer self.microtask_queues_are_running = false;
 
-        // Re-read len/items each iteration: a checkpoint can run JS that creates
-        // a new context (e.g. an iframe), appending to (and reallocating) the list.
+        // Re-read len/items each iteration: a checkpoint can create or deactivate
+        // a context, reallocating or removing from the active list.
         var i: usize = 0;
-        while (i < self.contexts.items.len) : (i += 1) {
-            const ctx = self.contexts.items[i];
+        while (i < self.active_contexts.items.len) {
+            const ctx = self.active_contexts.items[i];
+            const context_id = ctx.id;
+            if (ctx.active == false) {
+                i += 1;
+                continue;
+            }
             v8.v8__MicrotaskQueue__PerformCheckpoint(ctx.microtask_queue, v8_isolate);
+            i = std.sort.upperBound(*Context, self.active_contexts.items, context_id, orderContextId);
         }
     }
 }
@@ -439,17 +481,23 @@ pub fn runMacrotasks(self: *Env) !void {
         return;
     }
 
-    // Re-read len/items each iteration: scheduler.run() can create a new context
-    // (e.g. an iframe), appending to (and reallocating) the list.
+    // Re-read len/items each iteration: scheduler.run() can create or deactivate
+    // a context, reallocating or removing from the active list.
     var i: usize = 0;
-    while (i < self.contexts.items.len) : (i += 1) {
-        const ctx = self.contexts.items[i];
+    while (i < self.active_contexts.items.len) {
+        const ctx = self.active_contexts.items[i];
+        const context_id = ctx.id;
+        if (ctx.active == false) {
+            i += 1;
+            continue;
+        }
         if (comptime builtin.is_test == false) {
             // I hate this comptime check as much as you do. But we have tests
             // which rely on short execution before shutdown. In real world, it's
             // underterministic whether a timer will or won't run before the
             // frame shutsdown. But for tests, we need to run them to their end.
             if (ctx.scheduler.hasReadyTasks() == false) {
+                i += 1;
                 continue;
             }
         }
@@ -458,11 +506,15 @@ pub fn runMacrotasks(self: *Env) !void {
         const entered = ctx.enter(&hs);
         defer entered.exit();
         try ctx.scheduler.run();
+        i = std.sort.upperBound(*Context, self.active_contexts.items, context_id, orderContextId);
     }
 }
 
 pub fn hasMacrotasks(self: *Env) bool {
-    for (self.contexts.items) |ctx| {
+    for (self.active_contexts.items) |ctx| {
+        if (ctx.active == false) {
+            continue;
+        }
         if (ctx.scheduler.high_priority.count() > 0) {
             return true;
         }
@@ -472,7 +524,10 @@ pub fn hasMacrotasks(self: *Env) bool {
 
 pub fn msToNextTask(self: *Env) ?u64 {
     var next_task: u64 = std.math.maxInt(u64);
-    for (self.contexts.items) |ctx| {
+    for (self.active_contexts.items) |ctx| {
+        if (ctx.active == false) {
+            continue;
+        }
         const candidate = ctx.scheduler.msToNext() orelse continue;
         next_task = @min(candidate, next_task);
     }
@@ -695,15 +750,18 @@ const PrivateSymbols = struct {
     const Private = @import("Private.zig");
 
     child_nodes: Private,
+    navigator_array: Private,
 
     fn init(isolate: *v8.Isolate) PrivateSymbols {
         return .{
             .child_nodes = Private.init(isolate, "child_nodes"),
+            .navigator_array = Private.init(isolate, "navigator_array"),
         };
     }
 
     fn deinit(self: *PrivateSymbols) void {
         self.child_nodes.deinit();
+        self.navigator_array.deinit();
     }
 };
 
@@ -755,4 +813,85 @@ test "Env: Frame context" {
     try testing.expectEqual(true, (try ls.local.exec("typeof Node !== 'undefined'", null)).isTrue());
     try testing.expectEqual(true, (try ls.local.exec("typeof WorkerGlobalScope === 'undefined'", null)).isTrue());
     try testing.expectEqual(true, (try ls.local.exec("typeof DedicatedWorkerGlobalScope === 'undefined'", null)).isTrue());
+}
+
+test "Env: active context scheduling list stays compact under churn" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    const env = &testing.test_browser.env;
+    const owned_before = env.contexts.items.len;
+    const active_before = env.active_contexts.items.len;
+    const params: ContextParams = .{
+        .identity = &frame._page.identity,
+        .identity_arena = frame.arena,
+        .call_arena = frame.call_arena,
+        .local_arena = frame.local_arena,
+        .debug_name = "active context churn test",
+    };
+
+    var created: [67]*Context = undefined;
+    var created_len: usize = 0;
+    defer {
+        for (created[0..created_len]) |ctx| {
+            env.destroyContext(ctx);
+        }
+    }
+
+    for (0..64) |_| {
+        const ctx = try env.createContext(frame, params);
+        created[created_len] = ctx;
+        created_len += 1;
+        ctx.deactivate();
+    }
+
+    try testing.expectEqual(owned_before + 64, env.contexts.items.len);
+    try testing.expectEqual(active_before, env.active_contexts.items.len);
+    for (env.active_contexts.items) |ctx| {
+        try testing.expectEqual(true, ctx.active);
+    }
+
+    const TaskState = struct {
+        context: *Context,
+        prior_context: ?*Context,
+        runs: *usize,
+
+        fn run(ptr: *anyopaque) !?u32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.runs.* += 1;
+            if (self.prior_context) |ctx| {
+                ctx.deactivate();
+                self.context.deactivate();
+            }
+            return null;
+        }
+    };
+
+    const first = try env.createContext(frame, params);
+    created[created_len] = first;
+    created_len += 1;
+    const second = try env.createContext(frame, params);
+    created[created_len] = second;
+    created_len += 1;
+    const third = try env.createContext(frame, params);
+    created[created_len] = third;
+    created_len += 1;
+
+    var second_runs: usize = 0;
+    var third_runs: usize = 0;
+    var second_state: TaskState = .{ .context = second, .prior_context = first, .runs = &second_runs };
+    var third_state: TaskState = .{ .context = third, .prior_context = null, .runs = &third_runs };
+    try second.scheduler.add(&second_state, TaskState.run, 0, .{});
+    try third.scheduler.add(&third_state, TaskState.run, 0, .{});
+
+    try env.runMacrotasks();
+
+    try testing.expectEqual(1, second_runs);
+    try testing.expectEqual(1, third_runs);
+    try testing.expectEqual(false, first.active);
+    try testing.expectEqual(false, second.active);
+    try testing.expectEqual(active_before + 1, env.active_contexts.items.len);
+
+    third.deactivate();
+    try testing.expectEqual(active_before, env.active_contexts.items.len);
 }

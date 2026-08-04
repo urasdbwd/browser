@@ -71,6 +71,11 @@ viewport_override: ?Viewport = null,
 // used by sessions to allocate pages.
 page_pool: std.heap.MemoryPool(Page),
 
+// Page storage is pooled and loader IDs wrap at 2^32. Give each Page a
+// non-reused identity so cached state never becomes valid again when both the
+// allocation address and loader ID are reused.
+page_incarnation_gen: u64 = 0,
+
 // Registered with App.watchdog for the lifetime of the env. The watchdog
 // checker thread reads it until Browser.deinit unregisters.
 watchdog_entry: Watchdog.Entry,
@@ -105,6 +110,14 @@ pub fn nextFrameId(self: *Browser) u32 {
     const id = self.frame_id_gen +% 1;
     self.frame_id_gen = id;
     return id;
+}
+
+pub fn nextPageIncarnation(self: *Browser) error{PageIncarnationExhausted}!u64 {
+    if (self.page_incarnation_gen == std.math.maxInt(u64)) {
+        return error.PageIncarnationExhausted;
+    }
+    self.page_incarnation_gen += 1;
+    return self.page_incarnation_gen;
 }
 
 pub fn init(self: *Browser, app: *App, opts: InitOpts, cdp: ?*CDP) !void {
@@ -181,10 +194,11 @@ pub fn clearPermissions(self: *Browser) void {
 // otherwise the compile-time default.
 pub fn getViewport(self: *const Browser) Viewport {
     if (self.viewport_override) |v| return v;
-    // CloakBrowser-style seed-derived screen when fingerprint is active.
+    // A fingerprint profile picks a screen resolution; back out the content
+    // viewport so `screen` reports that resolution exactly.
     const fp = self.app.config.fingerprint_profile;
-    if (fp.seed != 0 or self.app.config.stealth()) {
-        return .{ .width = fp.screen_width, .height = fp.screen_height };
+    if (fp.seed != 0) {
+        return Viewport.fromScreen(fp.screen_width, fp.screen_height);
     }
     return Viewport.default;
 }
@@ -248,4 +262,13 @@ pub fn msToNextTask(self: *Browser) ?u64 {
 
 pub fn runIdleTasks(self: *const Browser) void {
     self.env.runIdleTasks();
+}
+
+test "Browser: page incarnations never wrap" {
+    var browser: Browser = undefined;
+    browser.page_incarnation_gen = std.math.maxInt(u64) - 1;
+
+    try std.testing.expectEqual(std.math.maxInt(u64), try browser.nextPageIncarnation());
+    try std.testing.expectError(error.PageIncarnationExhausted, browser.nextPageIncarnation());
+    try std.testing.expectEqual(std.math.maxInt(u64), browser.page_incarnation_gen);
 }

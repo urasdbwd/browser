@@ -7,10 +7,11 @@
 
 //! Bounded HTTP transport for client-side visual rendering.
 //!
-//! Connection threads only parse HTTP and encode responses. Exactly one worker
-//! owns exactly one V8 isolate and reuses it across requests; `lp.fetch` creates
-//! a clean Session per URL. The response is a script-free DOM snapshot. A real
-//! browser, attached through client.js, performs CSS/layout/paint/rasterization.
+//! Connection threads only parse HTTP/WebSocket traffic and encode responses.
+//! The worker creates and owns one V8 isolate on the first render/live job.
+//! One-shot renders use a fresh Session; the live endpoint keeps one Session
+//! alive between commands. Both return
+//! script-free DOM snapshots for client.js to lay out and paint in a real browser.
 
 const std = @import("std");
 const lp = @import("lightpanda");
@@ -18,7 +19,9 @@ const lp = @import("lightpanda");
 const App = @import("../App.zig");
 const ResponseBuffer = @import("../mcp/ResponseBuffer.zig");
 const Compression = @import("Compression.zig");
+const LiveSession = @import("LiveSession.zig");
 const sys_net = @import("../sys/net.zig");
+const WS = @import("../network/WS.zig");
 
 const HttpServer = @This();
 const posix = std.posix;
@@ -29,17 +32,93 @@ const worker_stack_size = 4 * 1024 * 1024;
 // tables/history in this frame. The OS commits only touched stack pages.
 const connection_stack_size = 768 * 1024;
 const worker_retained_arena_bytes = 64 * 1024;
+const live_socket_timeout_ms = 5 * 60 * 1000;
+const live_ticket_ttl_ms = 30_000;
 
 const client_js = @embedFile("client.js");
 const client_etag = blk: {
-    @setEvalBranchQuota(10_000);
+    @setEvalBranchQuota(100_000);
     break :blk std.fmt.comptimePrint("W/\"{x}\"", .{std.hash.Wyhash.hash(0, client_js)});
 };
 const client_cache_control = "public,max-age=0,must-revalidate";
 
+const LiveTickets = struct {
+    mutex: std.Io.Mutex = .init,
+    entries: []Entry,
+
+    const Entry = struct {
+        value: [32]u8 = undefined,
+        issued: std.Io.Timestamp = .zero,
+        valid: bool = false,
+    };
+
+    fn init(allocator: std.mem.Allocator, capacity: usize) !LiveTickets {
+        std.debug.assert(capacity > 0);
+        const entries = try allocator.alloc(Entry, capacity);
+        @memset(entries, .{});
+        return .{ .entries = entries };
+    }
+
+    fn deinit(self: *LiveTickets, allocator: std.mem.Allocator) void {
+        allocator.free(self.entries);
+    }
+
+    fn issue(self: *LiveTickets) ![32]u8 {
+        var random: [16]u8 = undefined;
+        try std.Io.randomSecure(lp.io, &random);
+        const value = std.fmt.bytesToHex(random, .lower);
+        self.insertAt(value, .now(lp.io, .boot));
+        return value;
+    }
+
+    fn insertAt(self: *LiveTickets, value: [32]u8, issued: std.Io.Timestamp) void {
+        self.mutex.lockUncancelable(lp.io);
+        defer self.mutex.unlock(lp.io);
+
+        var target = &self.entries[0];
+        for (self.entries) |*entry| {
+            if (!entry.valid or expired(entry.*, issued)) {
+                target = entry;
+                break;
+            }
+            if (entry.issued.nanoseconds < target.issued.nanoseconds) target = entry;
+        }
+        target.* = .{ .value = value, .issued = issued, .valid = true };
+    }
+
+    fn consume(self: *LiveTickets, candidate: []const u8) bool {
+        return self.consumeAt(candidate, .now(lp.io, .boot));
+    }
+
+    fn consumeAt(self: *LiveTickets, candidate: []const u8, now: std.Io.Timestamp) bool {
+        self.mutex.lockUncancelable(lp.io);
+        defer self.mutex.unlock(lp.io);
+
+        for (self.entries) |*entry| {
+            if (!entry.valid) continue;
+            if (expired(entry.*, now)) {
+                entry.valid = false;
+                continue;
+            }
+            if (!tokenEqual(candidate, &entry.value)) continue;
+            entry.valid = false;
+            return true;
+        }
+        return false;
+    }
+
+    fn expired(entry: Entry, now: std.Io.Timestamp) bool {
+        return entry.issued.durationTo(now).toMilliseconds() > live_ticket_ttl_ms;
+    }
+};
+
 const Result = enum {
     ok,
     bad_request,
+    live_session_closed,
+    live_session_active,
+    node_not_found,
+    stale_target,
     timeout,
     navigation_failed,
     response_too_large,
@@ -50,6 +129,10 @@ const Result = enum {
         return switch (self) {
             .ok => .ok,
             .bad_request => .bad_request,
+            .live_session_closed => .not_found,
+            .live_session_active => .conflict,
+            .node_not_found => .not_found,
+            .stale_target => .conflict,
             .timeout => .gateway_timeout,
             .navigation_failed => .bad_gateway,
             .response_too_large => .payload_too_large,
@@ -62,6 +145,10 @@ const Result = enum {
         return switch (self) {
             .ok => "",
             .bad_request => "{\"error\":\"invalid render request\"}\n",
+            .live_session_closed => "{\"error\":\"live session is not active\"}\n",
+            .live_session_active => "{\"error\":\"a live session owns the browser\"}\n",
+            .node_not_found => "{\"error\":\"live target was not found\"}\n",
+            .stale_target => "{\"error\":\"live target is stale\"}\n",
             .timeout => "{\"error\":\"render deadline exceeded\"}\n",
             .navigation_failed => "{\"error\":\"page navigation failed\"}\n",
             .response_too_large => "{\"error\":\"render snapshot too large\"}\n",
@@ -71,10 +158,16 @@ const Result = enum {
     }
 };
 
+const JobKind = enum { render, live, live_close };
+
 const Job = struct {
+    kind: JobKind = .render,
     body: []const u8,
     out: *std.Io.Writer,
-    max_wait_ms: u32,
+    response: ?*ResponseBuffer = null,
+    deadline: std.Io.Timestamp = .zero,
+    owner: u64 = 0,
+    live_outcome: LiveSession.Outcome = .{ .id = 0 },
     result: Result = .ok,
     done: std.Io.Event = .unset,
     next: ?*Job = null,
@@ -104,10 +197,40 @@ const Queue = struct {
         while (self.head == null and !self.closed.load(.acquire)) {
             self.cond.waitUncancelable(lp.io, &self.mutex);
         }
+        return self.takeHead();
+    }
+
+    fn tryPop(self: *Queue) ?*Job {
+        self.mutex.lockUncancelable(lp.io);
+        defer self.mutex.unlock(lp.io);
+        return self.takeHead();
+    }
+
+    fn popFor(self: *Queue, timeout_ms: u64) ?*Job {
+        return self.popForWaiting(timeout_ms, null);
+    }
+
+    fn popForWaiting(self: *Queue, timeout_ms: u64, waiting: ?*std.Io.Event) ?*Job {
+        self.mutex.lockUncancelable(lp.io);
+        defer self.mutex.unlock(lp.io);
+        if (self.head == null and timeout_ms > 0 and !self.closed.load(.acquire)) {
+            if (waiting) |event| event.set(lp.io);
+            lp.timedWait(&self.cond, &self.mutex, timeout_ms * ns_per_ms) catch {};
+        }
+        return self.takeHead();
+    }
+
+    fn takeHead(self: *Queue) ?*Job {
         const job = self.head orelse return null;
         self.head = job.next;
         if (self.head == null) self.tail = null;
         return job;
+    }
+
+    fn closedAndEmpty(self: *Queue) bool {
+        self.mutex.lockUncancelable(lp.io);
+        defer self.mutex.unlock(lp.io);
+        return self.closed.load(.acquire) and self.head == null;
     }
 
     fn close(self: *Queue) void {
@@ -127,6 +250,7 @@ max_wait_ms: u32,
 client_timeout_ms: u32,
 cors_origin: ?[]const u8,
 auth_token: ?[]const u8,
+live_tickets: LiveTickets,
 
 queue: Queue = .{},
 active_conns: std.atomic.Value(u32) = .init(0),
@@ -134,25 +258,26 @@ conn_mutex: std.Io.Mutex = .init,
 conns: std.ArrayList(posix.socket_t) = .empty,
 
 worker_thread: std.Thread = undefined,
-worker_ready: std.Io.Event = .unset,
-worker_ok: bool = false,
 browser_mutex: std.Io.Mutex = .init,
 active_browser: ?*lp.Browser = null,
 
 pub fn init(allocator: std.mem.Allocator, app: *App) !*HttpServer {
     const self = try allocator.create(HttpServer);
     errdefer allocator.destroy(self);
+    const max_connections = app.config.maxConnections();
     self.* = .{
         .allocator = allocator,
         .app = app,
-        .max_connections = app.config.maxConnections(),
+        .max_connections = max_connections,
         .max_request_size = app.config.renderMaxRequestSize(),
         .max_response_size = app.config.renderMaxResponseSize(),
         .max_wait_ms = app.config.renderMaxWaitMs(),
         .client_timeout_ms = app.config.renderClientTimeoutMs(),
         .cors_origin = app.config.renderCorsOrigin(),
         .auth_token = app.config.renderAuthToken(),
+        .live_tickets = try .init(allocator, max_connections),
     };
+    errdefer self.live_tickets.deinit(allocator);
     if (self.auth_token) |token| {
         if (token.len < 16) return error.WeakAuthToken;
     }
@@ -160,11 +285,6 @@ pub fn init(allocator: std.mem.Allocator, app: *App) !*HttpServer {
     try self.conns.ensureTotalCapacity(allocator, self.max_connections);
 
     self.worker_thread = try std.Thread.spawn(.{ .stack_size = worker_stack_size }, worker, .{self});
-    self.worker_ready.waitUncancelable(lp.io);
-    if (!self.worker_ok) {
-        self.worker_thread.join();
-        return error.WorkerInitFailed;
-    }
     return self;
 }
 
@@ -182,6 +302,7 @@ pub fn deinit(self: *HttpServer) void {
     self.worker_thread.join();
 
     self.conns.deinit(self.allocator);
+    self.live_tickets.deinit(self.allocator);
     self.allocator.destroy(self);
 }
 
@@ -234,12 +355,21 @@ fn onAccept(ctx: *anyopaque, socket: posix.socket_t) void {
 }
 
 fn setSocketTimeout(socket: posix.socket_t, timeout_ms: u32) !void {
-    const timeout = std.mem.toBytes(posix.timeval{
+    try setSocketReceiveTimeout(socket, timeout_ms);
+    const timeout = socketTimeout(timeout_ms);
+    try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &timeout);
+}
+
+fn setSocketReceiveTimeout(socket: posix.socket_t, timeout_ms: u32) !void {
+    const timeout = socketTimeout(timeout_ms);
+    try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout);
+}
+
+fn socketTimeout(timeout_ms: u32) [@sizeOf(posix.timeval)]u8 {
+    return std.mem.toBytes(posix.timeval{
         .sec = @intCast(timeout_ms / 1000),
         .usec = @intCast((timeout_ms % 1000) * 1000),
     });
-    try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout);
-    try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &timeout);
 }
 
 fn isLoopback(address: sys_net.IpAddress) bool {
@@ -270,37 +400,143 @@ fn unregister(self: *HttpServer, socket: posix.socket_t) void {
 
 fn worker(self: *HttpServer) void {
     var browser: lp.Browser = undefined;
-    browser.init(self.app, .{}, null) catch |err| {
-        lp.log.err(.app, "client render browser init", .{ .err = err });
-        self.worker_ready.set(lp.io);
-        return;
-    };
-    defer browser.deinit();
-    {
-        self.browser_mutex.lockUncancelable(lp.io);
-        self.active_browser = &browser;
-        self.browser_mutex.unlock(lp.io);
-    }
+    var browser_initialized = false;
+    defer if (browser_initialized) browser.deinit();
     defer {
         self.browser_mutex.lockUncancelable(lp.io);
         self.active_browser = null;
         self.browser_mutex.unlock(lp.io);
     }
 
-    self.worker_ok = true;
-    self.worker_ready.set(lp.io);
-
     var arena: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena.deinit();
-    while (self.queue.pop()) |job| {
+    var live: ?LiveSession = null;
+    defer if (live) |*session| session.deinit();
+    while (true) {
+        if (browser_initialized and live == null) browser.http_client.heartbeat.disarm();
+        const job = job: {
+            if (live == null) break :job self.queue.pop();
+            if (self.queue.tryPop()) |queued| break :job queued;
+            const delay_ms = if (live) |*session| session.pump() else unreachable;
+            break :job self.queue.popFor(liveWaitMs(delay_ms));
+        } orelse {
+            if (self.queue.closedAndEmpty()) break;
+            continue;
+        };
         if (self.queue.closed.load(.acquire)) {
             job.result = .shutting_down;
+        } else if (job.kind == .live_close) {
+            LiveSession.closeOwner(&live, job.owner);
+            job.result = .ok;
+        } else if (remainingWaitMs(job.deadline, .now(lp.io, .boot)) != null) process: {
+            if (!browser_initialized) {
+                const initialized = initialized: {
+                    self.browser_mutex.lockUncancelable(lp.io);
+                    defer self.browser_mutex.unlock(lp.io);
+                    browser.init(self.app, .{}, null) catch |err| {
+                        lp.log.err(.app, "client render browser init", .{ .err = err });
+                        break :initialized false;
+                    };
+                    browser_initialized = true;
+                    self.active_browser = &browser;
+                    break :initialized true;
+                };
+                if (!initialized) {
+                    job.result = .internal_error;
+                    break :process;
+                }
+            }
+
+            switch (job.kind) {
+                .render => render: {
+                    // One-shot renders share the browser with the live session.
+                    // Tearing an active one down here would let any client on
+                    // this port evict another user's session.
+                    if (live != null) {
+                        job.result = .live_session_active;
+                        break :render;
+                    }
+                    const prepared = prepareRender(arena.allocator(), job) orelse break :render;
+                    const render_wait_ms = remainingWaitMs(job.deadline, .now(lp.io, .boot)) orelse {
+                        job.result = .timeout;
+                        break :render;
+                    };
+                    processRender(self, &browser, job, prepared, render_wait_ms);
+                },
+                .live => processLive(self, &browser, &live, arena.allocator(), job),
+                .live_close => unreachable,
+            }
         } else {
-            processRender(self, &browser, arena.allocator(), job);
+            job.result = .timeout;
         }
         _ = arena.reset(.{ .retain_with_limit = worker_retained_arena_bytes });
         job.done.set(lp.io);
     }
+}
+
+fn liveWaitMs(delay_ms: u31) u64 {
+    return @max(1, @as(u64, delay_ms));
+}
+
+fn jobDeadline(max_wait_ms: u32) std.Io.Timestamp {
+    return std.Io.Timestamp.now(lp.io, .boot).addDuration(
+        .fromMilliseconds(@intCast(max_wait_ms)),
+    );
+}
+
+fn remainingWaitMs(deadline: std.Io.Timestamp, now: std.Io.Timestamp) ?u32 {
+    const remaining_ns = now.durationTo(deadline).toNanoseconds();
+    if (remaining_ns <= 0) return null;
+    const rounded_ms = @divTrunc(remaining_ns + ns_per_ms - 1, ns_per_ms);
+    return std.math.cast(u32, rounded_ms) orelse std.math.maxInt(u32);
+}
+
+fn processLive(
+    self: *HttpServer,
+    browser: *lp.Browser,
+    live: *?LiveSession,
+    arena: std.mem.Allocator,
+    job: *Job,
+) void {
+    const command = LiveSession.parseCommand(arena, job.body) catch |err| {
+        if (err == error.BadRequest) {
+            const Peek = struct { id: u32 = 0 };
+            if (std.json.parseFromSliceLeaky(Peek, arena, job.body, .{
+                .ignore_unknown_fields = true,
+            }) catch null) |peek| {
+                job.live_outcome.id = peek.id;
+            }
+        }
+        job.result = if (err == error.InternalError) .internal_error else .bad_request;
+        return;
+    };
+    job.live_outcome.id = command.id;
+
+    job.live_outcome = LiveSession.processParsed(
+        live,
+        self.app,
+        browser,
+        arena,
+        job.owner,
+        command,
+        job.deadline,
+        job.out,
+    ) catch |err| {
+        job.result = switch (err) {
+            error.BadRequest => .bad_request,
+            // An `open` that loses the race is refused because someone else
+            // holds the browser, not because this client's session vanished.
+            // Only the latter closes the connection.
+            error.NotOwner => if (command.type == .open) .live_session_active else .live_session_closed,
+            error.NodeNotFound => .node_not_found,
+            error.StaleTarget => .stale_target,
+            error.Timeout => .timeout,
+            error.NavigationFailed => .navigation_failed,
+            error.InternalError => .internal_error,
+        };
+        return;
+    };
+    job.result = .ok;
 }
 
 const RenderRequest = struct {
@@ -310,58 +546,89 @@ const RenderRequest = struct {
     wait_selector: ?[]const u8 = null,
     width: u32 = 1280,
     height: u32 = 720,
+    direct_resources: bool = false,
 };
 
-fn processRender(self: *HttpServer, browser: *lp.Browser, arena: std.mem.Allocator, job: *Job) void {
+const PreparedRender = struct {
+    url: [:0]const u8,
+    wait_ms: u32,
+    wait_until: ?lp.Config.WaitUntil,
+    wait_selector: ?[:0]const u8,
+    width: u32,
+    height: u32,
+    direct_resources: bool,
+};
+
+fn prepareRender(arena: std.mem.Allocator, job: *Job) ?PreparedRender {
     const request = std.json.parseFromSliceLeaky(RenderRequest, arena, job.body, .{
         .ignore_unknown_fields = true,
-    }) catch {
-        job.result = .bad_request;
-        return;
+    }) catch |err| {
+        job.result = if (err == error.OutOfMemory) .internal_error else .bad_request;
+        return null;
     };
     if (request.url.len == 0 or request.url.len > 8 * 1024 or
         request.width == 0 or request.width > 8192 or request.height == 0 or request.height > 8192)
     {
         job.result = .bad_request;
-        return;
+        return null;
     }
     if (request.wait_selector) |selector| {
         if (selector.len == 0 or selector.len > 1024) {
             job.result = .bad_request;
-            return;
+            return null;
         }
     }
 
-    const canonical = lp.URL.resolveNavigation(arena, request.url, .{}) catch {
-        job.result = .bad_request;
-        return;
+    const canonical = lp.URL.resolveNavigation(arena, request.url, .{}) catch |err| {
+        job.result = if (err == error.OutOfMemory) .internal_error else .bad_request;
+        return null;
     };
     const protocol = lp.URL.getProtocol(canonical);
     if ((!std.mem.eql(u8, protocol, "http:") and !std.mem.eql(u8, protocol, "https:")) or
         lp.URL.getUsername(canonical).len != 0 or lp.URL.getPassword(canonical).len != 0)
     {
         job.result = .bad_request;
-        return;
+        return null;
     }
 
     const selector: ?[:0]const u8 = if (request.wait_selector) |value|
         arena.dupeZ(u8, value) catch {
             job.result = .internal_error;
-            return;
+            return null;
         }
     else
         null;
-    browser.viewport_override = .{ .width = request.width, .height = request.height };
-
-    var urls = [_][:0]const u8{canonical};
-    lp.fetch(self.app, browser, &urls, .{
-        .wait_ms = @min(request.wait_ms, job.max_wait_ms),
+    return .{
+        .url = canonical,
+        .wait_ms = request.wait_ms,
         .wait_until = request.wait_until,
         .wait_selector = selector,
+        .width = request.width,
+        .height = request.height,
+        .direct_resources = request.direct_resources,
+    };
+}
+
+fn processRender(
+    self: *HttpServer,
+    browser: *lp.Browser,
+    job: *Job,
+    request: PreparedRender,
+    max_wait_ms: u32,
+) void {
+    browser.viewport_override = .{ .width = request.width, .height = request.height };
+
+    var urls = [_][:0]const u8{request.url};
+    lp.fetch(self.app, browser, &urls, .{
+        .wait_ms = @min(request.wait_ms, max_wait_ms),
+        .wait_until = request.wait_until,
+        .wait_selector = request.wait_selector,
         .dump = .{
             .with_base = true,
             .with_frames = false,
             .strip = .{ .js = true, .meta = true },
+            .with_render_csp = true,
+            .direct_render_resources = request.direct_resources,
         },
         .dump_mode = .html,
         .writer = job.out,
@@ -386,7 +653,7 @@ fn handleConn(self: *HttpServer, socket: posix.socket_t) void {
     defer stream.close(lp.io);
     defer self.unregister(socket);
 
-    var recv_buf: [8 * 1024]u8 = undefined;
+    var recv_buf: [64 * 1024]u8 = undefined;
     var send_buf: [8 * 1024]u8 = undefined;
     var stream_reader = stream.reader(lp.io, &recv_buf);
     var stream_writer = stream.writer(lp.io, &send_buf);
@@ -397,10 +664,16 @@ fn handleConn(self: *HttpServer, socket: posix.socket_t) void {
     defer arena.deinit();
     var out: ResponseBuffer = .init(self.allocator, self.max_response_size);
     defer out.deinit();
-    self.serve(&out, arena.allocator(), &request) catch {};
+    self.serve(&out, arena.allocator(), socket, &request) catch {};
 }
 
-fn serve(self: *HttpServer, out: *ResponseBuffer, arena: std.mem.Allocator, request: *std.http.Server.Request) !void {
+fn serve(
+    self: *HttpServer,
+    out: *ResponseBuffer,
+    arena: std.mem.Allocator,
+    socket: posix.socket_t,
+    request: *std.http.Server.Request,
+) !void {
     if (request.head.expect != null) {
         return request.respond("", .{ .status = .expectation_failed, .keep_alive = false });
     }
@@ -416,6 +689,48 @@ fn serve(self: *HttpServer, out: *ResponseBuffer, arena: std.mem.Allocator, requ
 
     if (request.head.method == .OPTIONS) {
         return respondPreflight(request, cors_value);
+    }
+
+    if (request.head.method == .POST and std.mem.eql(u8, path, "/v1/live-ticket")) {
+        if (origin == null or !self.allowedLiveOrigin(origin.?)) {
+            return respondJson(request, .forbidden, "{\"error\":\"exact origin required for live view\"}\n", null);
+        }
+        if (!authorized(request, self.auth_token)) {
+            return respondJson(request, .unauthorized, "{\"error\":\"authentication required\"}\n", cors_value);
+        }
+        const ticket = self.live_tickets.issue() catch
+            return respondJson(request, .internal_server_error, "{\"error\":\"ticket generation failed\"}\n", cors_value);
+        var response_buf: [64]u8 = undefined;
+        const body = try std.fmt.bufPrint(&response_buf, "{{\"ticket\":\"{s}\"}}\n", .{ticket});
+        return respondJson(request, .ok, body, cors_value);
+    }
+
+    if (request.head.method == .GET and std.mem.eql(u8, path, "/v1/live")) {
+        if (origin == null or !self.allowedLiveOrigin(origin.?)) {
+            return respondJson(request, .forbidden, "{\"error\":\"exact origin required for live view\"}\n", null);
+        }
+        const key = switch (request.upgradeRequested()) {
+            .websocket => |value| value orelse
+                return respondJson(request, .bad_request, "{\"error\":\"missing websocket key\"}\n", cors_value),
+            else => return respondJson(request, .bad_request, "{\"error\":\"websocket upgrade required\"}\n", cors_value),
+        };
+        if (!validWebSocketHandshake(request, key)) {
+            return respondJson(request, .bad_request, "{\"error\":\"invalid websocket handshake\"}\n", cors_value);
+        }
+        const ticket = (queryValue(arena, target, "ticket") catch
+            return respondJson(request, .internal_server_error, Result.internal_error.body(), cors_value)) orelse
+            return respondJson(request, .unauthorized, "{\"error\":\"live ticket required\"}\n", cors_value);
+        if (!self.live_tickets.consume(ticket)) {
+            return respondJson(request, .unauthorized, "{\"error\":\"authentication required\"}\n", cors_value);
+        }
+        const snapshot_encodings = (queryValue(arena, target, "snapshot_encodings") catch
+            return respondJson(request, .internal_server_error, Result.internal_error.body(), cors_value));
+        const compression_preferences = liveCompressionPreferences(snapshot_encodings);
+
+        try setSocketReceiveTimeout(socket, @max(self.client_timeout_ms, live_socket_timeout_ms));
+        var websocket = try request.respondWebSocket(.{ .key = key });
+        try websocket.output.flush();
+        return self.serveLiveWebSocket(out, &websocket, compression_preferences);
     }
 
     var negotiator: Compression.Negotiator = .{};
@@ -459,21 +774,42 @@ fn serve(self: *HttpServer, out: *ResponseBuffer, arena: std.mem.Allocator, requ
         null;
     var body_buf: [8 * 1024]u8 = undefined;
     const body_reader = request.readerExpectNone(&body_buf);
-    const body = readRequestBody(arena, body_reader, content_length, self.max_request_size) catch {
-        return respondJson(request, .payload_too_large, "{\"error\":\"request too large\"}\n", cors_value);
+    const body = readRequestBody(arena, body_reader, content_length, self.max_request_size) catch |err| {
+        return switch (err) {
+            error.OutOfMemory => respondJson(
+                request,
+                .internal_server_error,
+                Result.internal_error.body(),
+                cors_value,
+            ),
+            error.StreamTooLong => respondJson(
+                request,
+                .payload_too_large,
+                "{\"error\":\"request too large\"}\n",
+                cors_value,
+            ),
+            else => err,
+        };
     };
 
     var job: Job = .{
         .body = body,
         .out = &out.writer,
-        .max_wait_ms = self.max_wait_ms,
+        .response = out,
+        .deadline = jobDeadline(self.max_wait_ms),
     };
     if (!self.queue.push(&job)) {
         return respondJson(request, .service_unavailable, Result.shutting_down.body(), cors_value);
     }
     job.done.waitUncancelable(lp.io);
 
-    if (out.failed and job.result == .ok) job.result = .response_too_large;
+    if (out.failure) |failure| {
+        if (failure == .out_of_memory) {
+            job.result = .internal_error;
+        } else if (job.result == .ok) {
+            job.result = .response_too_large;
+        }
+    }
     if (job.result != .ok) {
         return respondJson(request, job.result.status(), job.result.body(), cors_value);
     }
@@ -487,6 +823,270 @@ fn serve(self: *HttpServer, out: *ResponseBuffer, arena: std.mem.Allocator, requ
         preferences,
         cors_value,
     );
+}
+
+const live_close_internal_error = [_]u8{ 0x88, 0x02, 0x03, 0xf3 }; // 1011
+
+fn readLiveMessage(
+    input: *std.Io.Reader,
+    reader: *WS.Reader(true),
+) !WS.Message {
+    while (true) {
+        if (try reader.next()) |message| return message;
+        reader.compact();
+
+        const dst = reader.readBuf();
+        std.debug.assert(dst.len != 0);
+
+        // The HTTP parser may have already read bytes beyond the upgrade
+        // request. Drain those before attempting another socket read.
+        const buffered = input.buffered();
+        if (buffered.len != 0) {
+            const n = @min(buffered.len, dst.len);
+            @memcpy(dst[0..n], buffered[0..n]);
+            input.toss(n);
+            reader.len += n;
+            continue;
+        }
+
+        var vecs: [1][]u8 = .{dst};
+        const n = try input.readVec(&vecs);
+        reader.len += n;
+    }
+}
+
+fn liveCloseFrameForError(err: anyerror) ?[]const u8 {
+    if (WS.errorReply(err)) |frame| return frame;
+    if (err == error.OutOfMemory) return &live_close_internal_error;
+    return null;
+}
+
+fn writeRawWebSocketFrame(
+    websocket: *std.http.Server.WebSocket,
+    frame: []const u8,
+) std.Io.Writer.Error!void {
+    try websocket.output.writeAll(frame);
+    try websocket.output.flush();
+}
+
+fn serveLiveWebSocket(
+    self: *HttpServer,
+    out: *ResponseBuffer,
+    websocket: *std.http.Server.WebSocket,
+    compression_preferences: Compression.Preferences,
+) !void {
+    var encoded: ResponseBuffer = .init(self.allocator, self.max_response_size);
+    defer encoded.deinit();
+
+    var reader = WS.Reader(true).init(
+        self.allocator,
+        self.max_request_size,
+    ) catch |err| {
+        if (liveCloseFrameForError(err)) |frame| {
+            writeRawWebSocketFrame(websocket, frame) catch {};
+            return;
+        }
+        return err;
+    };
+    defer reader.deinit();
+
+    var owner: u64 = undefined;
+    std.Io.random(lp.io, std.mem.asBytes(&owner));
+    if (owner == 0) owner = 1;
+    var last_snapshot_hash: ?u64 = null;
+    var last_snapshot_len: usize = 0;
+
+    defer {
+        var close_job: Job = .{
+            .kind = .live_close,
+            .body = "",
+            .out = &out.writer,
+            .owner = owner,
+        };
+        if (self.queue.push(&close_job)) close_job.done.waitUncancelable(lp.io);
+    }
+
+    while (true) {
+        const message = readLiveMessage(websocket.input, &reader) catch |err| {
+            if (liveCloseFrameForError(err)) |frame| {
+                writeRawWebSocketFrame(websocket, frame) catch {};
+                return;
+            }
+            switch (err) {
+                error.EndOfStream, error.ReadFailed => return,
+                else => return err,
+            }
+        };
+        defer if (message.cleanup_fragment) reader.cleanup();
+
+        switch (message.type) {
+            .ping => {
+                try websocket.writeMessage(message.data, .pong);
+                continue;
+            },
+            .pong => continue,
+            .close => {
+                try websocket.writeMessage(message.data, .connection_close);
+                return;
+            },
+            .binary => {
+                try websocket.writeMessage(
+                    "{\"id\":0,\"ok\":false,\"error\":\"invalid live command\"}",
+                    .text,
+                );
+                continue;
+            },
+            .text => {},
+        }
+
+        out.reset(worker_retained_arena_bytes);
+        var job: Job = .{
+            .kind = .live,
+            .body = message.data,
+            .out = &out.writer,
+            .response = out,
+            .deadline = jobDeadline(self.max_wait_ms),
+            .owner = owner,
+        };
+        if (!self.queue.push(&job)) {
+            try websocket.writeMessage(
+                "{\"id\":0,\"ok\":false,\"error\":\"render server shutting down\"}",
+                .text,
+            );
+            return;
+        }
+        job.done.waitUncancelable(lp.io);
+
+        if (out.failure) |failure| {
+            if (failure == .out_of_memory) {
+                job.result = .internal_error;
+            } else if (job.result == .ok and job.live_outcome.snapshot) {
+                job.result = .response_too_large;
+            }
+        }
+        if (job.result == .ok and job.live_outcome.snapshot) {
+            const snapshot = out.buffered();
+            const hash = std.hash.Wyhash.hash(0, snapshot);
+            if (last_snapshot_hash == hash and last_snapshot_len == snapshot.len) {
+                job.live_outcome.snapshot = false;
+                job.live_outcome.target_version = null;
+            } else {
+                last_snapshot_hash = hash;
+                last_snapshot_len = snapshot.len;
+            }
+        }
+        try sendLiveResult(
+            websocket,
+            &job,
+            out.buffered(),
+            compression_preferences,
+            &encoded,
+        );
+        out.reset(worker_retained_arena_bytes);
+        if (job.result == .live_session_closed) {
+            websocket.writeMessage("", .connection_close) catch {};
+            return;
+        }
+    }
+}
+
+const EncodedLiveSnapshot = struct {
+    bytes: []const u8,
+    encoding: Compression.Encoding,
+};
+
+fn encodeLiveSnapshot(
+    snapshot: []const u8,
+    preferences: Compression.Preferences,
+    encoded: *ResponseBuffer,
+) EncodedLiveSnapshot {
+    encoded.reset(worker_retained_arena_bytes);
+    var compression = Compression.Stream.init(preferences, snapshot) orelse
+        return .{ .bytes = snapshot, .encoding = .identity };
+    defer compression.deinit();
+
+    if (compression.encoding == .identity) {
+        return .{ .bytes = snapshot, .encoding = .identity };
+    }
+    compression.writeAll(snapshot, &encoded.writer) catch {
+        encoded.reset(worker_retained_arena_bytes);
+        return .{ .bytes = snapshot, .encoding = .identity };
+    };
+    const compressed = encoded.buffered();
+    if (encoded.failure != null or compressed.len >= snapshot.len) {
+        encoded.reset(worker_retained_arena_bytes);
+        return .{ .bytes = snapshot, .encoding = .identity };
+    }
+    return .{ .bytes = compressed, .encoding = compression.encoding };
+}
+
+fn sendLiveResult(
+    websocket: *std.http.Server.WebSocket,
+    job: *const Job,
+    snapshot: []const u8,
+    compression_preferences: Compression.Preferences,
+    encoded_buffer: *ResponseBuffer,
+) !void {
+    const payload = if (job.result == .ok and job.live_outcome.snapshot)
+        encodeLiveSnapshot(snapshot, compression_preferences, encoded_buffer)
+    else
+        EncodedLiveSnapshot{ .bytes = &.{}, .encoding = .identity };
+
+    var buffer: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writeLiveMetadata(job, payload.encoding, snapshot.len, &writer);
+    try websocket.writeMessage(writer.buffered(), .text);
+    if (job.result == .ok and job.live_outcome.snapshot) {
+        try websocket.writeMessage(payload.bytes, .binary);
+    }
+}
+
+fn writeLiveMetadata(
+    job: *const Job,
+    encoding: Compression.Encoding,
+    snapshot_bytes: usize,
+    writer: *std.Io.Writer,
+) !void {
+    if (job.result == .ok) {
+        const has_snapshot = job.live_outcome.snapshot;
+        const version_storage = job.live_outcome.target_version;
+        const target_version: ?[]const u8 = if (version_storage) |*version| version else null;
+        const snapshot_encoding: ?[]const u8 = if (has_snapshot) @tagName(encoding) else null;
+        try std.json.Stringify.value(.{
+            .id = job.live_outcome.id,
+            .ok = true,
+            .snapshot = has_snapshot,
+            .closed = job.live_outcome.closed,
+            .warning = job.live_outcome.warning,
+            .target_version = target_version,
+            .snapshot_encoding = snapshot_encoding,
+            .snapshot_bytes = if (has_snapshot) snapshot_bytes else 0,
+            .can_go_back = job.live_outcome.can_go_back,
+            .can_go_forward = job.live_outcome.can_go_forward,
+        }, .{}, writer);
+    } else {
+        try std.json.Stringify.value(.{
+            .id = job.live_outcome.id,
+            .ok = false,
+            .@"error" = liveError(job.result),
+        }, .{}, writer);
+    }
+}
+
+fn liveError(result: Result) []const u8 {
+    return switch (result) {
+        .ok => "",
+        .bad_request => "invalid live command",
+        .live_session_closed => "live session is not active",
+        .live_session_active => "a live session owns the browser",
+        .node_not_found => "live target was not found",
+        .stale_target => "live target is stale",
+        .timeout => "live command deadline exceeded",
+        .navigation_failed => "page navigation failed",
+        .response_too_large => "render snapshot too large",
+        .shutting_down => "render server shutting down",
+        .internal_error => "live command failed",
+    };
 }
 
 fn isJsonContentType(raw: []const u8) bool {
@@ -643,11 +1243,52 @@ fn authorized(request: *std.http.Server.Request, expected: ?[]const u8) bool {
     const value = headerValue(request, "authorization") orelse return false;
     const prefix = "Bearer ";
     if (!std.ascii.startsWithIgnoreCase(value, prefix)) return false;
-    const actual = value[prefix.len..];
-    if (actual.len != token.len) return false;
+    return tokenEqual(value[prefix.len..], token);
+}
+
+fn tokenEqual(actual: []const u8, expected: []const u8) bool {
+    if (actual.len != expected.len) return false;
     var difference: u8 = 0;
-    for (actual, token) |a, b| difference |= a ^ b;
+    for (actual, expected) |a, b| difference |= a ^ b;
     return difference == 0;
+}
+
+fn validWebSocketHandshake(request: *std.http.Server.Request, key: []const u8) bool {
+    if (request.head.version != .@"HTTP/1.1") return false;
+    if (!headerHasToken(request, "connection", "upgrade")) return false;
+    const version = headerValue(request, "sec-websocket-version") orelse return false;
+    if (!std.mem.eql(u8, version, "13")) return false;
+
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(key) catch return false;
+    if (decoded_len != 16) return false;
+    var decoded: [16]u8 = undefined;
+    std.base64.standard.Decoder.decode(&decoded, key) catch return false;
+    return true;
+}
+
+fn liveCompressionPreferences(encodings: ?[]const u8) Compression.Preferences {
+    var negotiator: Compression.Negotiator = .{};
+    if (encodings) |value| negotiator.add(value);
+    return negotiator.preferences();
+}
+
+fn queryValue(
+    arena: std.mem.Allocator,
+    target: []const u8,
+    name: []const u8,
+) error{OutOfMemory}!?[]const u8 {
+    const query_start = std.mem.indexOfScalar(u8, target, '?') orelse return null;
+    var fields = std.mem.splitScalar(u8, target[query_start + 1 ..], '&');
+    while (fields.next()) |field| {
+        const separator = std.mem.indexOfScalar(u8, field, '=') orelse continue;
+        if (!std.mem.eql(u8, field[0..separator], name)) continue;
+        const decoded = try arena.dupe(u8, field[separator + 1 ..]);
+        for (decoded) |*byte| {
+            if (byte.* == '+') byte.* = ' ';
+        }
+        return std.Uri.percentDecodeInPlace(decoded);
+    }
+    return null;
 }
 
 fn allowedCorsValue(self: *const HttpServer, origin: ?[]const u8) ?[]const u8 {
@@ -655,6 +1296,11 @@ fn allowedCorsValue(self: *const HttpServer, origin: ?[]const u8) ?[]const u8 {
     const allowed = self.cors_origin orelse return null;
     if (std.mem.eql(u8, allowed, "*") or std.mem.eql(u8, allowed, requested)) return allowed;
     return null;
+}
+
+fn allowedLiveOrigin(self: *const HttpServer, requested: []const u8) bool {
+    const allowed = self.cors_origin orelse return false;
+    return !std.mem.eql(u8, allowed, "*") and std.mem.eql(u8, allowed, requested);
 }
 
 fn addAcceptEncodings(request: *std.http.Server.Request, negotiator: *Compression.Negotiator) void {
@@ -675,6 +1321,15 @@ fn headerValue(request: *std.http.Server.Request, name: []const u8) ?[]const u8 
 fn headerEquals(request: *std.http.Server.Request, name: []const u8, expected: []const u8) bool {
     const value = headerValue(request, name) orelse return false;
     return std.mem.eql(u8, value, expected);
+}
+
+fn headerHasToken(request: *std.http.Server.Request, name: []const u8, expected: []const u8) bool {
+    const value = headerValue(request, name) orelse return false;
+    var tokens = std.mem.tokenizeAny(u8, value, ", \t");
+    while (tokens.next()) |token| {
+        if (std.ascii.eqlIgnoreCase(token, expected)) return true;
+    }
+    return false;
 }
 
 fn readRequestBody(
@@ -701,6 +1356,159 @@ test "render server: connection slots are bounded" {
     try std.testing.expect(!acquireConnectionSlot(&active, 2));
 }
 
+test "render server: live waits never spin on a zero deadline" {
+    try std.testing.expectEqual(@as(u64, 1), liveWaitMs(0));
+    try std.testing.expectEqual(@as(u64, 1), liveWaitMs(1));
+    try std.testing.expectEqual(@as(u64, 250), liveWaitMs(250));
+}
+
+test "render server: live metadata carries target version and stale error" {
+    try std.testing.expectEqual(std.http.Status.conflict, Result.stale_target.status());
+    // A one-shot render must not be able to evict another user's live session.
+    try std.testing.expectEqual(std.http.Status.conflict, Result.live_session_active.status());
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"live target is stale\"}\n",
+        Result.stale_target.body(),
+    );
+
+    var sink_buffer: [1]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buffer);
+    const version: [16]u8 = "0123456789abcdef".*;
+    var job: Job = .{
+        .body = "",
+        .out = &sink,
+        .live_outcome = .{
+            .id = 7,
+            .snapshot = true,
+            .target_version = version,
+        },
+    };
+
+    var metadata_buffer: [512]u8 = undefined;
+    var metadata: std.Io.Writer = .fixed(&metadata_buffer);
+    try writeLiveMetadata(&job, .br, 4_096, &metadata);
+    try std.testing.expectEqualStrings(
+        "{\"id\":7,\"ok\":true,\"snapshot\":true,\"closed\":false,\"warning\":null,\"target_version\":\"0123456789abcdef\",\"snapshot_encoding\":\"br\",\"snapshot_bytes\":4096,\"can_go_back\":false,\"can_go_forward\":false}",
+        metadata.buffered(),
+    );
+
+    job.live_outcome = .{ .id = 7 };
+    metadata = .fixed(&metadata_buffer);
+    try writeLiveMetadata(&job, .identity, 0, &metadata);
+    try std.testing.expectEqualStrings(
+        "{\"id\":7,\"ok\":true,\"snapshot\":false,\"closed\":false,\"warning\":null,\"target_version\":null,\"snapshot_encoding\":null,\"snapshot_bytes\":0,\"can_go_back\":false,\"can_go_forward\":false}",
+        metadata.buffered(),
+    );
+
+    job.result = .stale_target;
+    job.live_outcome = .{ .id = 8 };
+    metadata = .fixed(&metadata_buffer);
+    try writeLiveMetadata(&job, .identity, 0, &metadata);
+    try std.testing.expectEqualStrings(
+        "{\"id\":8,\"ok\":false,\"error\":\"live target is stale\"}",
+        metadata.buffered(),
+    );
+
+    job.result = .response_too_large;
+    job.live_outcome = .{ .id = 9 };
+    metadata = .fixed(&metadata_buffer);
+    try writeLiveMetadata(&job, .identity, 0, &metadata);
+    try std.testing.expectEqualStrings(
+        "{\"id\":9,\"ok\":false,\"error\":\"render snapshot too large\"}",
+        metadata.buffered(),
+    );
+}
+
+test "render server: live snapshot compression is negotiated and bounded" {
+    const input = "<!doctype html><main>Lightpanda live snapshot</main>" ** 256;
+
+    const preferences = liveCompressionPreferences("br,gzip,identity");
+    var encoded: ResponseBuffer = .init(std.testing.allocator, input.len);
+    defer encoded.deinit();
+
+    const compressed = encodeLiveSnapshot(input, preferences, &encoded);
+    try std.testing.expectEqual(Compression.Encoding.br, compressed.encoding);
+    try std.testing.expect(compressed.bytes.len < input.len);
+
+    const small = encodeLiveSnapshot("small", preferences, &encoded);
+    try std.testing.expectEqual(Compression.Encoding.identity, small.encoding);
+    try std.testing.expectEqualStrings("small", small.bytes);
+
+    var randomish: [2_048]u8 = undefined;
+    for (&randomish, 0..) |*byte, i| byte.* = @truncate(i *% 131 +% i / 7);
+    const entropy = encodeLiveSnapshot(&randomish, preferences, &encoded);
+    try std.testing.expectEqual(Compression.Encoding.identity, entropy.encoding);
+    try std.testing.expectEqualSlices(u8, &randomish, entropy.bytes);
+
+    var bounded: ResponseBuffer = .init(std.testing.allocator, 8);
+    defer bounded.deinit();
+    const fallback = encodeLiveSnapshot(input, preferences, &bounded);
+    try std.testing.expectEqual(Compression.Encoding.identity, fallback.encoding);
+    try std.testing.expectEqualStrings(input, fallback.bytes);
+
+    const unsupported = liveCompressionPreferences(null);
+    try std.testing.expectEqual(Compression.Encoding.identity, unsupported.preferred());
+}
+
+test "render server: job deadlines preserve only remaining time" {
+    const deadline = std.Io.Timestamp.fromNanoseconds(500 * ns_per_ms);
+    try std.testing.expectEqual(
+        @as(?u32, 250),
+        remainingWaitMs(deadline, .fromNanoseconds(250 * ns_per_ms)),
+    );
+    try std.testing.expectEqual(
+        @as(?u32, 1),
+        remainingWaitMs(deadline, .fromNanoseconds(500 * ns_per_ms - 1)),
+    );
+    try std.testing.expectEqual(@as(?u32, null), remainingWaitMs(deadline, deadline));
+    try std.testing.expectEqual(
+        @as(?u32, null),
+        remainingWaitMs(deadline, .fromNanoseconds(501 * ns_per_ms)),
+    );
+}
+
+test "render server: queue push wakes a timed waiter" {
+    var queue: Queue = .{};
+    var output_buffer: [1]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&output_buffer);
+    var job: Job = .{
+        .body = "",
+        .out = &output,
+    };
+    var waiter: struct {
+        queue: *Queue,
+        ready: std.Io.Event = .unset,
+        result: ?*Job = null,
+
+        fn run(self: *@This()) void {
+            self.result = self.queue.popForWaiting(1_000, &self.ready);
+        }
+    } = .{ .queue = &queue };
+
+    const thread = try std.Thread.spawn(.{}, @TypeOf(waiter).run, .{&waiter});
+    waiter.ready.waitUncancelable(lp.io);
+    try std.testing.expect(queue.push(&job));
+    thread.join();
+    try std.testing.expect(waiter.result == &job);
+}
+
+test "render server: closed queue drains jobs accepted before close" {
+    var queue: Queue = .{};
+    var output_buffer: [1]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&output_buffer);
+    var job: Job = .{
+        .body = "",
+        .out = &output,
+    };
+
+    try std.testing.expect(queue.popFor(0) == null);
+    try std.testing.expect(queue.push(&job));
+    queue.close();
+    try std.testing.expect(!queue.closedAndEmpty());
+    try std.testing.expect(queue.tryPop() == &job);
+    try std.testing.expect(queue.closedAndEmpty());
+}
+
 test "render server: public binds require authentication" {
     try std.testing.expect(isLoopback(.{ .ip4 = .loopback(9223) }));
     try std.testing.expect(isLoopback(.{ .ip6 = .loopback(9223) }));
@@ -715,6 +1523,80 @@ test "render server: JSON content type requires a token boundary" {
     try std.testing.expect(!isJsonContentType("text/plain"));
 }
 
+test "render server: invalid render requests fail during preparation" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var output_buffer: [1]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&output_buffer);
+
+    const bodies = [_][]const u8{
+        "{",
+        "{\"url\":\"file:///etc/passwd\"}",
+        "{\"url\":\"https://example.com\",\"width\":0}",
+    };
+    for (bodies) |body| {
+        var job: Job = .{ .body = body, .out = &output };
+        try std.testing.expect(prepareRender(arena.allocator(), &job) == null);
+        try std.testing.expectEqual(Result.bad_request, job.result);
+    }
+}
+
+test "render server: direct client resources are explicit" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var output_buffer: [1]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&output_buffer);
+    var job: Job = .{
+        .body = "{\"url\":\"https://example.com\",\"direct_resources\":true}",
+        .out = &output,
+    };
+
+    const request = prepareRender(arena.allocator(), &job).?;
+    try std.testing.expect(request.direct_resources);
+}
+
+test "render server: websocket ticket is decoded and single use" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    const target = "/v1/live?other=x&ticket=a%2Bb+c";
+    try std.testing.expectEqualStrings("a+b c", (try queryValue(arena.allocator(), target, "ticket")).?);
+    try std.testing.expect(tokenEqual("0123456789abcdef", "0123456789abcdef"));
+    try std.testing.expect(!tokenEqual("0123456789abcdee", "0123456789abcdef"));
+    try std.testing.expect(!tokenEqual("short", "0123456789abcdef"));
+
+    var tickets = try LiveTickets.init(std.testing.allocator, 2);
+    defer tickets.deinit(std.testing.allocator);
+    const first = try tickets.issue();
+    const second = try tickets.issue();
+    try std.testing.expect(tickets.consume(&first));
+    try std.testing.expect(tickets.consume(&second));
+    try std.testing.expect(!tickets.consume(&first));
+}
+
+test "render server: live ticket capacity and TTL are deterministic" {
+    var tickets = try LiveTickets.init(std.testing.allocator, 2);
+    defer tickets.deinit(std.testing.allocator);
+
+    const first = "11111111111111111111111111111111".*;
+    const second = "22222222222222222222222222222222".*;
+    const third = "33333333333333333333333333333333".*;
+    const one_ms = std.Io.Timestamp.fromNanoseconds(ns_per_ms);
+    const two_ms = std.Io.Timestamp.fromNanoseconds(2 * ns_per_ms);
+    const three_ms = std.Io.Timestamp.fromNanoseconds(3 * ns_per_ms);
+
+    tickets.insertAt(first, one_ms);
+    tickets.insertAt(second, two_ms);
+    tickets.insertAt(third, three_ms);
+    try std.testing.expect(!tickets.consumeAt(&first, three_ms));
+    try std.testing.expect(tickets.consumeAt(&second, three_ms));
+    try std.testing.expect(tickets.consumeAt(&third, three_ms));
+
+    tickets.insertAt(first, one_ms);
+    const expired_at = std.Io.Timestamp.fromNanoseconds((live_ticket_ttl_ms + 2) * ns_per_ms);
+    try std.testing.expect(!tickets.consumeAt(&first, expired_at));
+}
+
 test "render server: known body is borrowed and bounded" {
     var transfer_buf: [32]u8 = undefined;
     var reader: std.testing.Reader = .init(&transfer_buf, &.{.{ .buffer = "request body" }});
@@ -727,6 +1609,64 @@ test "render server: known body is borrowed and bounded" {
     try std.testing.expectError(
         error.StreamTooLong,
         readRequestBody(arena.allocator(), &reader.interface, 1025, 1024),
+    );
+}
+
+test "render server: websocket bridge drains buffered upgrade bytes" {
+    const frame = [_]u8{
+        0x81,    0x82,
+        1,       2,
+        3,       4,
+        'o' ^ 1, 'k' ^ 2,
+    };
+    var transfer_buf: [32]u8 = undefined;
+    var input: std.testing.Reader = .init(
+        &transfer_buf,
+        &.{.{ .buffer = "unexpected socket read" }},
+    );
+    @memcpy(input.interface.buffer[0..frame.len], &frame);
+    input.interface.end = frame.len;
+
+    var reader = try WS.Reader(true).init(std.testing.allocator, 1024);
+    defer reader.deinit();
+
+    const message = try readLiveMessage(&input.interface, &reader);
+    try std.testing.expectEqual(WS.Message.Type.text, message.type);
+    try std.testing.expectEqualStrings("ok", message.data);
+    try std.testing.expectEqual(0, input.next_call_index);
+}
+
+test "render server: websocket bridge progresses after an indirect read" {
+    const frame = [_]u8{
+        0x81,    0x82,
+        5,       6,
+        7,       8,
+        'o' ^ 5, 'k' ^ 6,
+    };
+    var source_buf: [16]u8 = undefined;
+    var source: std.testing.Reader = .init(
+        &source_buf,
+        &.{.{ .buffer = &frame }},
+    );
+    var indirect_buf: [32]u8 = undefined;
+    var indirect: std.testing.ReaderIndirect = .init(
+        &source.interface,
+        &indirect_buf,
+    );
+    var reader = try WS.Reader(true).init(std.testing.allocator, 1024);
+    defer reader.deinit();
+
+    const message = try readLiveMessage(&indirect.interface, &reader);
+    try std.testing.expectEqual(WS.Message.Type.text, message.type);
+    try std.testing.expectEqualStrings("ok", message.data);
+    try std.testing.expectEqual(1, source.next_call_index);
+}
+
+test "render server: websocket bridge maps internal allocation failure" {
+    try std.testing.expectEqualSlices(
+        u8,
+        &live_close_internal_error,
+        liveCloseFrameForError(error.OutOfMemory).?,
     );
 }
 

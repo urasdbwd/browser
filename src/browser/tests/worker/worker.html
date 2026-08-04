@@ -290,6 +290,14 @@
 
       // [Exposed=Window] members aren't part of WorkerNavigator.
       testing.expectEqual(true, r.no_plugins);
+      testing.expectEqual(true, r.no_mime_types);
+      testing.expectEqual(true, r.no_vendor);
+      testing.expectEqual(true, r.no_product_sub);
+      testing.expectEqual(true, r.no_vendor_sub);
+      testing.expectEqual(true, r.no_oscpu);
+      testing.expectEqual(true, r.no_pdf_viewer);
+      testing.expectEqual(true, r.no_java_enabled);
+      testing.expectEqual(true, r.no_taint_enabled);
       testing.expectEqual(true, r.no_register_protocol_handler);
       testing.expectEqual(true, r.no_model_context);
     });

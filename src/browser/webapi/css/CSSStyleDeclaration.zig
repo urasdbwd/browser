@@ -801,7 +801,7 @@ fn getDefaultPropertyValue(self: *const CSSStyleDeclaration, name: String) []con
 }
 
 fn getDefaultDisplay(element: *const Element) []const u8 {
-    switch (element._type) {
+    switch (element.typed()) {
         .html => |html| {
             return switch (html._type) {
                 .anchor, .br, .span, .label, .time, .font, .mod, .quote => "inline",
@@ -834,7 +834,7 @@ fn isInlineTag(tag_name: []const u8) bool {
 }
 
 fn getDefaultColor(element: *const Element) []const u8 {
-    switch (element._type) {
+    switch (element.typed()) {
         .html => |html| {
             return switch (html._type) {
                 .anchor => "rgb(0, 0, 238)", // blue

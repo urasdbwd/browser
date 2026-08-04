@@ -27,6 +27,7 @@ const brave = zenai.search.brave;
 const DOMNode = @import("webapi/Node.zig");
 const CDPNode = @import("../cdp/Node.zig");
 const Selector = @import("webapi/selector/Selector.zig");
+const Turnstile = @import("Turnstile.zig");
 
 /// Conventions any LLM driving Lightpanda should follow. The standalone
 /// agent prepends this to its own system prompt; the MCP server returns
@@ -245,6 +246,7 @@ pub const Tool = enum {
     waitForSelector,
     waitForScript,
     waitForState,
+    solveCaptchas,
     hover,
     press,
     selectOption,
@@ -261,7 +263,7 @@ pub const Tool = enum {
     pub fn isRecorded(self: Tool) bool {
         return switch (self) {
             .goto, .evaluate, .extract, .click, .fill, .scroll, .waitForSelector, .waitForScript, .waitForState, .hover, .press, .selectOption, .setChecked => true,
-            .search, .markdown, .html, .links, .tree, .nodeDetails, .interactiveElements, .structuredData, .detectForms, .findElement, .consoleLogs, .getUrl, .getCookies, .getEnv => false,
+            .search, .markdown, .html, .links, .tree, .nodeDetails, .interactiveElements, .structuredData, .detectForms, .findElement, .consoleLogs, .getUrl, .getCookies, .getEnv, .solveCaptchas => false,
         };
     }
 
@@ -272,7 +274,7 @@ pub const Tool = enum {
     pub fn isAsync(self: Tool) bool {
         return switch (self) {
             .goto => true,
-            .evaluate, .extract, .click, .fill, .scroll, .waitForSelector, .waitForScript, .waitForState, .hover, .press, .selectOption, .setChecked, .search, .markdown, .html, .links, .tree, .nodeDetails, .interactiveElements, .structuredData, .detectForms, .findElement, .consoleLogs, .getUrl, .getCookies, .getEnv => false,
+            .evaluate, .extract, .click, .fill, .scroll, .waitForSelector, .waitForScript, .waitForState, .hover, .press, .selectOption, .setChecked, .search, .markdown, .html, .links, .tree, .nodeDetails, .interactiveElements, .structuredData, .detectForms, .findElement, .consoleLogs, .getUrl, .getCookies, .getEnv, .solveCaptchas => false,
         };
     }
 
@@ -283,7 +285,7 @@ pub const Tool = enum {
     pub fn navigatesToUrl(self: Tool) bool {
         return switch (self) {
             .markdown, .html, .links, .tree, .interactiveElements, .structuredData, .detectForms => true,
-            .goto, .search, .evaluate, .extract, .nodeDetails, .click, .fill, .scroll, .waitForSelector, .waitForScript, .waitForState, .hover, .press, .selectOption, .setChecked, .findElement, .consoleLogs, .getUrl, .getCookies, .getEnv => false,
+            .goto, .search, .evaluate, .extract, .nodeDetails, .click, .fill, .scroll, .waitForSelector, .waitForScript, .waitForState, .hover, .press, .selectOption, .setChecked, .findElement, .consoleLogs, .getUrl, .getCookies, .getEnv, .solveCaptchas => false,
         };
     }
 
@@ -293,7 +295,7 @@ pub const Tool = enum {
     pub fn needsLocator(self: Tool) bool {
         return switch (self) {
             .click, .fill, .hover, .selectOption, .setChecked => true,
-            .goto, .search, .markdown, .html, .links, .evaluate, .extract, .tree, .nodeDetails, .interactiveElements, .structuredData, .detectForms, .scroll, .waitForSelector, .waitForScript, .waitForState, .press, .findElement, .consoleLogs, .getUrl, .getCookies, .getEnv => false,
+            .goto, .search, .markdown, .html, .links, .evaluate, .extract, .tree, .nodeDetails, .interactiveElements, .structuredData, .detectForms, .scroll, .waitForSelector, .waitForScript, .waitForState, .press, .findElement, .consoleLogs, .getUrl, .getCookies, .getEnv, .solveCaptchas => false,
         };
     }
 
@@ -302,7 +304,7 @@ pub const Tool = enum {
     pub fn producesData(self: Tool) bool {
         return switch (self) {
             .search, .markdown, .html, .links, .evaluate, .extract, .tree, .nodeDetails, .interactiveElements, .structuredData, .detectForms, .findElement, .consoleLogs, .getUrl, .getCookies, .getEnv => true,
-            .goto, .click, .fill, .scroll, .waitForSelector, .waitForScript, .waitForState, .hover, .press, .selectOption, .setChecked => false,
+            .goto, .click, .fill, .scroll, .waitForSelector, .waitForScript, .waitForState, .hover, .press, .selectOption, .setChecked, .solveCaptchas => false,
         };
     }
 
@@ -558,6 +560,18 @@ pub const Tool = enum {
                     \\    "timeout": { "type": "integer", "description": "Optional timeout in milliseconds. Defaults to 5000." }
                     \\  },
                     \\  "required": ["state"]
+                    \\}
+                ),
+            },
+            .solveCaptchas => .{
+                .description = "Drive a managed Cloudflare Turnstile challenge on the current page: click the challenge checkbox and wait for a token. Only useful when a read shows a Turnstile widget or an interstitial \"Verifying you are human\" page — it does nothing on ordinary pages and returns promptly there. Does NOT solve image/visual puzzles.",
+                .summary = "Solve a managed Cloudflare Turnstile challenge",
+                .input_schema = minify(
+                    \\{
+                    \\  "type": "object",
+                    \\  "properties": {
+                    \\    "timeout": { "type": "integer", "description": "Optional timeout in milliseconds. Defaults to 30000." }
+                    \\  }
                     \\}
                 ),
             },
@@ -830,6 +844,7 @@ fn dispatch(
         .waitForSelector => .{ .text = try execWaitForSelector(arena, session, registry, substituted) },
         .waitForScript => .{ .text = try execWaitForScript(arena, session, substituted) },
         .waitForState => .{ .text = try execWaitForState(arena, session, substituted) },
+        .solveCaptchas => .{ .text = try execSolveCaptchas(arena, session, substituted) },
         .hover => .{ .text = try execHover(arena, session, registry, substituted) },
         .press => .{ .text = try execPress(arena, session, registry, substituted) },
         .selectOption => .{ .text = try execSelectOption(arena, session, registry, substituted) },
@@ -1695,6 +1710,32 @@ fn execWaitForState(arena: std.mem.Allocator, session: *lp.Session, arguments: ?
     };
 
     return std.fmt.allocPrint(arena, "Page reached {s}.", .{@tagName(args.state)}) catch return ToolError.InternalError;
+}
+
+// Unlike the CDP command (which arms a scheduler task so the shared loop keeps
+// serving), a tool call IS the unit of work for MCP/agent — the caller is
+// waiting on this one result, so it blocks like `waitForState` does. Bounded by
+// `timeout`, and `solveTurnstile` bails out early on a page with no widget.
+fn execSolveCaptchas(arena: std.mem.Allocator, session: *lp.Session, arguments: ?std.json.Value) ToolError![]const u8 {
+    const Params = struct {
+        timeout: ?u32 = null,
+    };
+    const args = try parseArgs(Params, arena, arguments);
+    _ = try requireFrame(session);
+
+    var r = session.runner(.{});
+    r.solveTurnstile(args.timeout orelse Turnstile.AutoSolve.default_timeout_ms) catch |err| switch (err) {
+        error.Cancelled => return ToolError.Cancelled,
+        else => {
+            log.debug(.browser, "solveCaptchas error", .{ .err = @errorName(err) });
+            return ToolError.InternalError;
+        },
+    };
+
+    return if (Turnstile.hasToken(session))
+        "Captcha solved: token acquired."
+    else
+        "No captcha token. The page may have no challenge, or it needs a visual puzzle this browser cannot solve.";
 }
 
 fn execHover(arena: std.mem.Allocator, session: *lp.Session, registry: *CDPNode.Registry, arguments: ?std.json.Value) ToolError![]const u8 {

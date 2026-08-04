@@ -83,6 +83,21 @@
   testing.expectEqual(false, $('#opt2').selected)
 </script>
 
+<script id="selected_set_single_select">
+  {
+    const select = document.createElement('select')
+    select.innerHTML = '<option value="a" selected>A</option><option value="b">B</option>'
+    const selectedOptions = select.selectedOptions
+
+    select.options[1].selected = true
+
+    testing.expectEqual(1, select.selectedIndex)
+    testing.expectEqual('b', select.value)
+    testing.expectEqual(1, selectedOptions.length)
+    testing.expectEqual('b', selectedOptions[0].value)
+  }
+</script>
+
 <script id="defaultSelected">
   testing.expectEqual(false, $('#opt1').defaultSelected)
   testing.expectEqual(true, $('#opt2').defaultSelected)

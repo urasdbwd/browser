@@ -144,6 +144,8 @@
     \\
     \\Endpoints:
     \\  POST /v1/render                JSON request, HTML snapshot response
+    \\  POST /v1/live-ticket           single-use live WebSocket ticket
+    \\  GET  /v1/live                  persistent virtual-browser WebSocket
     \\  GET  /lightpanda-renderer.js   zero-dependency browser ESM library
     \\  GET  /healthz                  liveness check
     \\
@@ -152,15 +154,16 @@
     \\          Allow targets and subresources on private, loopback and link-local
     \\          addresses. Disabled by default to prevent SSRF.
     \\  --auth-token <TOKEN>
-    \\          Bearer token required by POST /v1/render. At least 16 bytes.
-    \\          Required whenever --host is not a loopback address.
+    \\          Bearer token required by POST /v1/render and /v1/live-ticket.
+    \\          At least 16 bytes. Required when --host is not loopback.
     \\  --client-timeout-ms <INT>
     \\          Maximum time a client may block socket reads or writes. Defaults
     \\          to 15000 with the pi profile or 30000 with standard.
     \\  --cors-origin <ORIGIN>
     \\          Exact browser origin allowed to call/import the render service, or
     \\          * to allow every origin. Browser cross-origin requests are rejected
-    \\          when omitted; command-line requests without Origin remain allowed.
+    \\          when omitted; live control requires an exact origin and rejects *.
+    \\          Command-line requests without Origin remain allowed.
     \\  --host <HOST>
     \\          Host to bind. Defaults to "127.0.0.1".
     \\  --max-connections <INT>
@@ -398,9 +401,9 @@
     \\          Disable V8 background idle work. This lowers background CPU use but can
     \\          delay garbage collection. Implied by --resource-profile pi.
     \\  --disable-workers
-    \\          Skip loading dedicated Web Workers. The Worker constructor still
-    \\          returns a Worker object, but no script fetch is initiated and its scope
-    \\          never runs.
+    \\          Skip loading dedicated and shared Web Workers. Their constructors
+    \\          still return objects, but no script fetch is initiated and their
+    \\          scopes never run.
     \\          Defaults to false.
     \\  --enable-external-stylesheets
     \\          Fetch external <link rel=stylesheet> resources so their rules
@@ -456,9 +459,13 @@
     \\          Proxy-Authorization: Bearer <token>.
     \\  --resource-profile <PROFILE>
     \\          Select resource limits. "pi" caps V8 at 64 MiB, uses one V8 worker,
-    \\          lowers network/CDP concurrency and response limits, and skips iframe
-    \\          and Web Worker loading plus speculative script preloads.
-    \\          LP.configureLoading can re-enable loading per client session.
+    \\          lowers network/CDP concurrency and response limits, and disables V8
+    \\          idle tasks, optional telemetry and speculative script preloads.
+    \\          It also passes V8 --optimize-for-size --no-concurrent-recompilation
+    \\          (about 7% lower peak RSS). Any --v8-flags-unsafe you pass is applied
+    \\          after these, so it overrides them.
+    \\          Iframe and Web Worker loading remain enabled; disable them explicitly
+    \\          only when a workload does not need them.
     \\          Allowed values: "standard", "pi".
     \\          Defaults to "standard"; binaries built with
     \\          -Dlow_resource_default=true default to "pi".
@@ -470,27 +477,28 @@
     \\          Path to the SQLite database file for persistent storage.
     \\          Use ":memory:" for in-memory storage.
     \\  --stealth
-    \\          Chrome-aligned fingerprint for challenge widgets (managed Turnstile,
-    \\          etc.): Chrome UA, Sec-Ch-Ua brands, navigator.userAgentData, plus a
-    \\          CloakBrowser-style random fingerprint seed (GPU/screen/hw/canvas/audio).
-    \\          Also enables interactive Turnstile click-solve (see --solve-captchas).
-    \\  --solve-captchas <MODE>
-    \\          After load, click managed Turnstile checkboxes and wait for a token
-    \\          (remaining --wait-ms budget). Modes: auto (default; on with --stealth),
-    \\          on, off. Visual puzzle CAPTCHAs still need a human or external solver.
+    \\          Present as Chrome instead of Lightpanda: Chrome User-Agent, Sec-Ch-Ua
+    \\          brands, navigator.userAgentData, a Chrome TLS ClientHello, and a random
+    \\          fingerprint seed (GPU/screen/cores/memory). Off by default — without it
+    \\          Lightpanda identifies itself honestly.
     \\  --fingerprint <INT>
-    \\          Deterministic fingerprint seed (CloakBrowser --fingerprint=N). Same seed
-    \\          yields the same GPU, screen, cores, deviceMemory, and canvas/audio noise.
-    \\          Use with --stealth for full Chrome identity.
+    \\          Deterministic fingerprint seed. The same seed yields the same GPU,
+    \\          screen, cores and deviceMemory. Activates the fingerprint profile on its
+    \\          own; combine with --stealth for the full Chrome identity.
     \\  --fingerprint-platform <PLATFORM>
-    \\          Platform for the fingerprint profile: windows, macos, or linux.
-    \\          With --stealth defaults to windows (native macOS → macos).
+    \\          Platform the fingerprint profile reports: windows, macos, or linux.
+    \\          Defaults to macos on a macOS host, windows elsewhere.
+    \\  --solve-captchas <MODE>
+    \\          After load, click managed Turnstile checkboxes and wait for a token.
+    \\          Modes: auto (default; on with --stealth), on, off. Visual puzzle
+    \\          CAPTCHAs still need a human or an external solver.
     \\  --user-agent <STRING>
     \\          Override the User-Agent header entirely. CDP rejects values containing
-    \\          "Mozilla" unless --stealth is set. The browser still sends Sec-Ch-Ua.
+    \\          "Mozilla". The browser still sends Sec-Ch-Ua.
     \\          Incompatible with --user-agent-suffix.
     \\  --user-agent-suffix <STRING>
-    \\          Suffix appended to the Lightpanda/X.Y User-Agent (ignored with --stealth).
+    \\          Suffix appended to the Lightpanda/X.Y User-Agent (ignored with
+    \\          --stealth).
     \\  --v8-flags-unsafe <FLAGS>
     \\          Flags passed as-is to the V8 JavaScript engine, space-separated.
     \\          e.g. --v8-flags-unsafe "--expose-gc --stack-size 1000".

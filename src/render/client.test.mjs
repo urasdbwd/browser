@@ -1,0 +1,452 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+
+class FakeElement {
+  children = [];
+
+  append(child) {
+    child.isConnected = true;
+    child.parent = this;
+    this.children.push(child);
+  }
+
+  replaceChildren(child) {
+    for (const current of this.children) current.isConnected = false;
+    child.isConnected = true;
+    child.parent = this;
+    this.children = [child];
+  }
+
+  getBoundingClientRect() {
+    return { width: 1280, height: 720 };
+  }
+}
+
+class FakeSnapshotElement {
+  #attributes;
+  nodeType = 1;
+  localName = "button";
+  namespaceURI = "http://www.w3.org/1999/xhtml";
+  type = "button";
+
+  constructor(version) {
+    this.#attributes = new Map([
+      [`data-lp-t-${version}`, "1"],
+      [`data-lp-k-${version}`, "0123456789abcdef"],
+    ]);
+  }
+
+  getAttribute(name) {
+    return this.#attributes.get(name) ?? null;
+  }
+
+  removeAttribute(name) {
+    this.#attributes.delete(name);
+  }
+}
+
+class FakeDocument {
+  #element;
+  #version;
+
+  constructor(html) {
+    this.#version = html.match(/data-lp-t-([0-9a-f]{16})/)?.[1] ??
+      "0000000000000001";
+    this.#element = new FakeSnapshotElement(this.#version);
+    this.baseURI = html.match(/<base href="([^"]+)"/)?.[1] ?? "https://example.com/";
+    this.title = html.match(/<title>([^<]*)<\/title>/)?.[1] ?? "";
+    this.documentElement = {
+      localName: "html",
+      namespaceURI: "http://www.w3.org/1999/xhtml",
+    };
+    this.body = {};
+    this.activeElement = this.body;
+    this.defaultView = null;
+  }
+
+  querySelectorAll(selector) {
+    if (selector === `[data-lp-t-${this.#version}]` ||
+        selector === `[data-lp-k-${this.#version}]`) return [this.#element];
+    return [];
+  }
+
+  #listeners = new Map();
+
+  addEventListener(type, listener) {
+    const listeners = this.#listeners.get(type) ?? new Set();
+    listeners.add(listener);
+    this.#listeners.set(type, listeners);
+  }
+
+  removeEventListener(type, listener) {
+    this.#listeners.get(type)?.delete(listener);
+  }
+
+  target() {
+    return this.#element;
+  }
+
+  dispatch(type, event) {
+    for (const listener of [...(this.#listeners.get(type) ?? [])]) listener(event);
+  }
+}
+
+class FakeIframe extends FakeElement {
+  #attributes = new Map();
+  #listeners = new Map();
+  style = {};
+  isConnected = false;
+  contentDocument = null;
+
+  setAttribute(name, value) {
+    this.#attributes.set(name, String(value));
+  }
+
+  getAttribute(name) {
+    if (name === "style") return this.style.cssText ?? null;
+    return this.#attributes.get(name) ?? null;
+  }
+
+  removeAttribute(name) {
+    this.#attributes.delete(name);
+  }
+
+  cloneNode() {
+    const clone = new FakeIframe();
+    clone.style.cssText = this.style.cssText;
+    return clone;
+  }
+
+  addEventListener(type, listener) {
+    const listeners = this.#listeners.get(type) ?? new Set();
+    listeners.add(listener);
+    this.#listeners.set(type, listeners);
+  }
+
+  removeEventListener(type, listener) {
+    this.#listeners.get(type)?.delete(listener);
+  }
+
+  #dispatch(type) {
+    for (const listener of [...(this.#listeners.get(type) ?? [])]) listener();
+  }
+
+  set src(value) {
+    this._src = value;
+    queueMicrotask(() => this.#dispatch("load"));
+  }
+
+  set srcdoc(value) {
+    this._srcdoc = value;
+    this.contentDocument = new FakeDocument(value);
+    queueMicrotask(() => this.#dispatch("load"));
+  }
+
+  after(sibling) {
+    sibling.isConnected = this.isConnected;
+    sibling.parent = this.parent;
+    this.parent?.children.push(sibling);
+  }
+
+  remove() {
+    this.isConnected = false;
+  }
+}
+
+class FakeWebSocket extends EventTarget {
+  static CONNECTING = 0;
+  static OPEN = 1;
+  static CLOSING = 2;
+  static CLOSED = 3;
+  static instances = [];
+  static onSend = null;
+
+  readyState = FakeWebSocket.CONNECTING;
+
+  constructor(url) {
+    super();
+    this.url = url;
+    FakeWebSocket.instances.push(this);
+    queueMicrotask(() => {
+      if (this.readyState !== FakeWebSocket.CONNECTING) return;
+      this.readyState = FakeWebSocket.OPEN;
+      this.dispatchEvent(new Event("open"));
+    });
+  }
+
+  send(data) {
+    FakeWebSocket.onSend?.(this, JSON.parse(data));
+  }
+
+  message(data) {
+    const event = new Event("message");
+    Object.defineProperty(event, "data", { value: data });
+    this.dispatchEvent(event);
+  }
+
+  close() {
+    if (this.readyState >= FakeWebSocket.CLOSING) return;
+    this.readyState = FakeWebSocket.CLOSED;
+    queueMicrotask(() => this.dispatchEvent(new Event("close")));
+  }
+}
+
+async function loadRenderer() {
+  const path = new URL("./client.js", import.meta.url);
+  let source = await readFile(path, "utf8");
+  source = source.replace(
+    /^const DEFAULT_ENDPOINT = .*;$/m,
+    'const DEFAULT_ENDPOINT = "https://renderer.test/v1/render";',
+  );
+  return import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
+}
+
+async function waitFor(predicate, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("timed out waiting for condition");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function successfulSnapshot(socket, command, title) {
+  const version = "0000000000000001";
+  const html = `<base href="https://example.com/"><title>${title}</title>` +
+    `<button data-lp-t-${version}="1" data-lp-k-${version}="0123456789abcdef">ok</button>`;
+  const bytes = new TextEncoder().encode(html).buffer;
+  queueMicrotask(() => {
+    socket.message(JSON.stringify({
+      id: command.id,
+      ok: true,
+      snapshot: true,
+      closed: false,
+      can_go_back: false,
+      can_go_forward: false,
+      target_version: version,
+      snapshot_encoding: "identity",
+      snapshot_bytes: bytes.byteLength,
+    }));
+    socket.message(bytes);
+  });
+}
+
+test("identical in-flight renders share one fetch", async () => {
+  const original = {
+    Element: globalThis.Element,
+    document: globalThis.document,
+    fetch: globalThis.fetch,
+  };
+  const requests = [];
+  globalThis.Element = FakeElement;
+  globalThis.document = {
+    baseURI: "https://client.test/",
+    createElement: () => new FakeIframe(),
+    querySelector: () => null,
+  };
+  globalThis.fetch = async (_endpoint, request) => {
+    requests.push(request);
+    return { ok: true, blob: async () => new Blob(["snapshot"]) };
+  };
+  try {
+    const { LightpandaRenderer } = await loadRenderer();
+    const renderer = new LightpandaRenderer(new FakeElement());
+    await Promise.all([
+      renderer.render("https://example.com/", { waitUntil: "done" }),
+      renderer.render("https://example.com/", { waitUntil: "done" }),
+    ]);
+    try {
+      assert.equal(requests.length, 1);
+    } finally {
+      renderer.destroy();
+    }
+  } finally {
+    globalThis.Element = original.Element;
+    globalThis.document = original.document;
+    globalThis.fetch = original.fetch;
+  }
+});
+
+test("successful reconnect emits once after the reopened snapshot is usable", async () => {
+  const original = {
+    CustomEvent: globalThis.CustomEvent,
+    Element: globalThis.Element,
+    WebSocket: globalThis.WebSocket,
+    document: globalThis.document,
+    fetch: globalThis.fetch,
+  };
+  let ticketRequests = 0;
+  FakeWebSocket.instances = [];
+  globalThis.CustomEvent ??= class CustomEvent extends Event {
+    constructor(type, options = {}) {
+      super(type);
+      this.detail = options.detail;
+    }
+  };
+  globalThis.Element = FakeElement;
+  globalThis.WebSocket = FakeWebSocket;
+  globalThis.document = {
+    baseURI: "https://client.test/",
+    createElement: () => new FakeIframe(),
+    querySelector: () => null,
+  };
+  globalThis.fetch = async () => {
+    ticketRequests += 1;
+    if (ticketRequests === 2) {
+      return { ok: false, status: 503, text: async () => "restarting" };
+    }
+    return {
+      ok: true,
+      json: async () => ({ ticket: `ticket-${ticketRequests}` }),
+    };
+  };
+  FakeWebSocket.onSend = (socket, command) => {
+    successfulSnapshot(
+      socket,
+      command,
+      FakeWebSocket.instances.length === 1 ? "Initial" : "Reopened",
+    );
+  };
+
+  let browser = null;
+  try {
+    const { LightpandaVirtualBrowser } = await loadRenderer();
+    browser = new LightpandaVirtualBrowser(new FakeElement(), {
+      endpoint: "wss://renderer.test/v1/live",
+      pollInterval: 60_000,
+    });
+    const lifecycle = [];
+    browser.addEventListener("reconnecting", () => lifecycle.push("reconnecting"));
+    browser.addEventListener("reconnect", () => {
+      lifecycle.push("reconnect");
+      assert.equal(browser.iframe.contentDocument?.title, "Reopened");
+      assert.equal(browser.iframe.isConnected, true);
+    });
+
+    await browser.open("https://example.com/");
+    FakeWebSocket.instances[0].close();
+    await waitFor(() => ticketRequests === 2);
+    assert.deepEqual(lifecycle, ["reconnecting"]);
+    await waitFor(() => lifecycle.includes("reconnect"));
+    assert.deepEqual(lifecycle, ["reconnecting", "reconnect"]);
+  } finally {
+    browser?.destroy();
+    FakeWebSocket.onSend = null;
+    globalThis.CustomEvent = original.CustomEvent;
+    globalThis.Element = original.Element;
+    globalThis.WebSocket = original.WebSocket;
+    globalThis.document = original.document;
+    globalThis.fetch = original.fetch;
+  }
+});
+
+test("keydown and keyup are forwarded separately with full key state", async () => {
+  const original = {
+    CustomEvent: globalThis.CustomEvent,
+    Element: globalThis.Element,
+    WebSocket: globalThis.WebSocket,
+    document: globalThis.document,
+    fetch: globalThis.fetch,
+  };
+  FakeWebSocket.instances = [];
+  globalThis.CustomEvent ??= class CustomEvent extends Event {
+    constructor(type, options = {}) {
+      super(type);
+      this.detail = options.detail;
+    }
+  };
+  globalThis.Element = FakeElement;
+  globalThis.WebSocket = FakeWebSocket;
+  globalThis.document = {
+    baseURI: "https://client.test/",
+    createElement: () => new FakeIframe(),
+    querySelector: () => null,
+  };
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ ticket: "t" }) });
+
+  const sent = [];
+  FakeWebSocket.onSend = (socket, command) => {
+    sent.push(command);
+    if (command.type === "open") return successfulSnapshot(socket, command, "Keys");
+    queueMicrotask(() => socket.message(JSON.stringify({
+      id: command.id,
+      ok: true,
+      snapshot: false,
+      closed: false,
+      can_go_back: false,
+      can_go_forward: false,
+      target_version: null,
+      snapshot_encoding: null,
+      snapshot_bytes: 0,
+    })));
+  };
+
+  let browser = null;
+  try {
+    const { LightpandaVirtualBrowser } = await loadRenderer();
+    browser = new LightpandaVirtualBrowser(new FakeElement(), {
+      endpoint: "wss://renderer.test/v1/live",
+      pollInterval: 60_000,
+    });
+    await browser.open("https://example.com/");
+
+    const doc = browser.iframe.contentDocument;
+    let prevented = 0;
+    const keyEvent = (overrides) => ({
+      target: doc.target(),
+      key: "w",
+      code: "KeyW",
+      location: 0,
+      repeat: false,
+      isComposing: false,
+      altKey: false,
+      ctrlKey: false,
+      metaKey: false,
+      shiftKey: true,
+      preventDefault: () => { prevented += 1; },
+      ...overrides,
+    });
+
+    // A plain letter used to be dropped outside text fields.
+    doc.dispatch("keydown", keyEvent({}));
+    doc.dispatch("keyup", keyEvent({}));
+    await waitFor(() => sent.some((command) => command.type === "keyup"));
+
+    const down = sent.find((command) => command.type === "keydown");
+    const up = sent.find((command) => command.type === "keyup");
+    assert.equal(down.key, "w");
+    assert.equal(down.code, "KeyW");
+    assert.equal(down.repeat, false);
+    assert.equal(down.location, 0);
+    assert.equal(down.shift_key, true);
+    assert.equal(down.ctrl_key, false);
+    assert.deepEqual(down.target, { version: "0000000000000001", id: 1 });
+    assert.equal(up.key, "w");
+    assert.equal(up.code, "KeyW");
+    // keydown suppresses the local default; keyup has none worth suppressing.
+    assert.equal(prevented, 1);
+
+    // Ctrl chords forward but must not steal the viewer's own shortcuts.
+    prevented = 0;
+    doc.dispatch("keydown", keyEvent({ key: "c", code: "KeyC", ctrlKey: true }));
+    await waitFor(() => sent.filter((command) => command.type === "keydown").length === 2);
+    assert.equal(prevented, 0);
+    assert.equal(sent.filter((command) => command.type === "keydown")[1].ctrl_key, true);
+
+    // Auto-repeat coalesces instead of building an unbounded backlog.
+    const before = sent.length;
+    for (let i = 0; i < 40; i++) {
+      doc.dispatch("keydown", keyEvent({ repeat: true }));
+    }
+    await waitFor(() => sent.length > before);
+    assert.ok(sent.length - before < 40, `expected coalescing, sent ${sent.length - before}`);
+  } finally {
+    browser?.destroy();
+    FakeWebSocket.onSend = null;
+    globalThis.CustomEvent = original.CustomEvent;
+    globalThis.Element = original.Element;
+    globalThis.WebSocket = original.WebSocket;
+    globalThis.document = original.document;
+    globalThis.fetch = original.fetch;
+  }
+});

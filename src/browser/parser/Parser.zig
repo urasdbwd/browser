@@ -601,7 +601,7 @@ fn getTemplateContentsCallback(ctx: *anyopaque, target_ref: *anyopaque) callconv
 
 fn _getTemplateContentsCallback(self: *Parser, node: *Node) !*anyopaque {
     const element = node.as(Element);
-    const template = element._type.html.is(Element.Html.Template) orelse unreachable;
+    const template = element.typed().html.is(Element.Html.Template) orelse unreachable;
     const content_node = template.getContent().asNode();
 
     // Create a ParsedNode wrapper for the content DocumentFragment

@@ -242,10 +242,10 @@ fn createIsolatedWorld(cmd: *CDP.Command) !void {
         // or otherwise access a DOM or other JS Object from another context that should fail.
     }
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+    const frame_id = try id.parseFrameId(params.frameId);
+    const frame = bc.session.findFrameByFrameId(frame_id) orelse return error.FrameNotFound;
 
     const world = try bc.createIsolatedWorld(params.worldName, params.grantUniveralAccess);
-    const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
-
     const js_context = try world.createContext(frame);
     const aux_data = try std.fmt.allocPrint(cmd.arena, "{{\"isDefault\":false,\"type\":\"isolated\",\"frameId\":\"{s}\"}}", .{params.frameId});
 
@@ -289,20 +289,7 @@ fn navigate(cmd: *CDP.Command) !void {
 
     const encoded_url = try URL.resolveNavigation(frame.call_arena, params.url, .{});
 
-    // Fast path: a freshly-created target whose root frame hasn't navigated
-    // yet has nothing to preserve across the HTTP round-trip. Skip the
-    // pending-Page allocation (which would create a V8 context just to
-    // throw the OLD blank one away at commit) and navigate the active
-    // frame in place.
-    if (frame._load_state == .waiting) {
-        return frame.navigate(encoded_url, .{
-            .reason = .address_bar,
-            .cdp_id = cmd.input.id,
-            .kind = .{ .push = null },
-        });
-    }
-
-    try session.initiateRootNavigation(frame._frame_id, encoded_url, .{
+    try session.navigateRoot(frame._frame_id, encoded_url, .{
         .reason = .address_bar,
         .cdp_id = cmd.input.id,
         .kind = .{ .push = null },
@@ -338,7 +325,7 @@ fn doReload(cmd: *CDP.Command) !void {
         };
     };
 
-    try session.initiateRootNavigation(frame._frame_id, reload_url, .{
+    try session.navigateRoot(frame._frame_id, reload_url, .{
         .reason = .address_bar,
         .cdp_id = cmd.input.id,
         .kind = .reload,
@@ -422,11 +409,7 @@ fn navigateToHistoryEntry(cmd: *CDP.Command) !void {
         .kind = .{ .traverse = idx },
     };
 
-    if (frame._load_state == .waiting) {
-        return frame.navigate(url, opts);
-    }
-
-    try session.initiateRootNavigation(frame._frame_id, url, opts);
+    try session.navigateRoot(frame._frame_id, url, opts);
 }
 
 pub fn frameNavigate(bc: *CDP.BrowserContext, event: *const Notification.FrameNavigate) !void {
@@ -1158,6 +1141,29 @@ test "cdp.frame: child frame metadata" {
             }},
         },
     }, .{ .id = 13 });
+}
+
+test "cdp.frame: createIsolatedWorld uses requested child frame" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{ .url = "cdp/empty_iframe.html" });
+    const root = bc.mainFrame() orelse unreachable;
+    const child = root.child_frames.items[0];
+    const child_id = id.toFrameId(child._frame_id);
+
+    try ctx.processMessage(.{
+        .id = 14,
+        .method = "Page.createIsolatedWorld",
+        .params = .{
+            .frameId = &child_id,
+            .worldName = "child-world",
+            .grantUniveralAccess = true,
+        },
+    });
+
+    const world = bc.isolated_worlds.items[0];
+    try testing.expectEqual(child, world.context.?.global.frame);
 }
 
 test "cdp.frame: frameAttached" {

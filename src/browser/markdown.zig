@@ -202,7 +202,7 @@ const Context = struct {
     }
 
     fn render(self: *Context, node: *Node) error{WriteFailed}!void {
-        switch (node._type) {
+        switch (node.typed()) {
             .document, .document_fragment => {
                 try self.renderChildren(node);
             },

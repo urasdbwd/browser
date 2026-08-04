@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head></head>
+<body>
+  <input id="text" value="old">
+  <input id="password" type="password" value="default-secret">
+  <input id="file" type="file" value="spoof-file-value">
+  <input id="check" type="checkbox" value="default-check" checked>
+  <input id="radio" type="radio" value="default-radio" checked>
+  <input id="indeterminate" type="checkbox">
+  <input id="not-indeterminate" type="checkbox" data-lightpanda-live-indeterminate>
+  <select id="choice">
+    <option value="a" selected>A</option>
+    <option value="b">B</option>
+  </select>
+  <select id="none">
+    <option value="a">A</option>
+    <option value="b">B</option>
+  </select>
+  <select id="selected-spoof" data-lightpanda-live-selected-none>
+    <option value="a">A</option>
+  </select>
+  <select id="duplicate">
+    <option value="same">First</option>
+    <option value="same">Second</option>
+  </select>
+  <textarea id="notes">old</textarea>
+  <textarea id="leading">old</textarea>
+  <script>
+    document.querySelector("#text").value = 'A&B"';
+    document.querySelector("#password").value = "runtime-secret";
+    document.querySelector("#check").value = "runtime-check";
+    document.querySelector("#check").checked = false;
+    document.querySelector("#radio").value = "runtime-radio";
+    document.querySelector("#indeterminate").indeterminate = true;
+    document.querySelector("#choice").value = "b";
+    document.querySelector("#none").selectedIndex = -1;
+    document.querySelector("#duplicate").value = "same";
+    document.querySelector("#notes").value = "<new>";
+    document.querySelector("#leading").value = "\nlead";
+  </script>
+</body>
+</html>

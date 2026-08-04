@@ -185,12 +185,33 @@
 
 <script id=screen>
   testing.expectEqual(1920, screen.width);
-  testing.expectEqual(1080, screen.height);
+  testing.expectEqual(1200, screen.height);
   testing.expectEqual(1920, screen.availWidth);
-  testing.expectEqual(1040, screen.availHeight);
+  testing.expectEqual(1160, screen.availHeight);
+
+  // No real browser has outerHeight === innerHeight (the tab strip and omnibox
+  // sit between them) or a window taller than the space available to it.
+  testing.expectEqual(true, screen.height >= screen.availHeight);
+  testing.expectEqual(true, screen.availHeight >= outerHeight);
+  testing.expectEqual(true, outerHeight > innerHeight);
+  testing.expectEqual(true, screen.width >= screen.availWidth);
+  testing.expectEqual(true, screen.availWidth >= outerWidth);
+  testing.expectEqual(true, outerWidth >= innerWidth);
   testing.expectEqual(24, screen.colorDepth);
   testing.expectEqual(24, screen.pixelDepth);
   testing.expectEqual(screen, window.screen);
+</script>
+
+<script id=chrome_surface>
+  // Bot scanners (sannysoft, CreepJS) treat a missing window.chrome on a
+  // Chrome-shaped browser as automation.
+  testing.expectEqual('object', typeof window.chrome);
+  testing.expectEqual('object', typeof chrome.runtime);
+  testing.expectEqual('function', typeof chrome.csi);
+  testing.expectEqual('function', typeof chrome.loadTimes);
+  // Undefined outside an extension, as in real Chrome.
+  testing.expectEqual(undefined, chrome.runtime.id);
+  testing.expectEqual(false, chrome.app.isInstalled);
 </script>
 
 <script id=structuredClone>

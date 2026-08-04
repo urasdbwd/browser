@@ -44,13 +44,9 @@ _event_counts: EventCounts = .{},
 _observers: std.ArrayList(*PerformanceObserver) = .empty,
 _delivery_scheduled: bool = false,
 
-/// Get high-resolution timestamp in microseconds, rounded to 5μs increments
-/// to match browser behavior (prevents fingerprinting)
+/// Get the monotonic timestamp in microseconds.
 pub fn highResTimestamp() u64 {
-    const micros = lp.datetime.microTimestamp(.boot);
-    // Round to nearest 5 microseconds (like Firefox default)
-    const rounded = @divTrunc(micros + 2, 5) * 5;
-    return rounded;
+    return lp.datetime.microTimestamp(.boot);
 }
 
 pub fn init() Performance {

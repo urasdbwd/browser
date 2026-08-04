@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style id="inserted"></style>
+  <style id="replaced">.stale { color: red; }</style>
+  <style id="raw" type="text/plain">
+    .raw{content:"original";}
+  </style>
+  <script>
+    const inserted = document.querySelector("#inserted").sheet;
+    inserted.insertRule(".deleted { color: red; }", 0);
+    inserted.insertRule("@media screen { .media { display: block; } }", 1);
+    inserted.insertRule(".kept { color: green; }", 2);
+    inserted.deleteRule(0);
+
+    const replaced = document.querySelector("#replaced").sheet;
+    replaced.replaceSync('.replacement::before { content: "</STYLE>"; } @keyframes spin { from { opacity: 0; } to { opacity: 1; } }');
+  </script>
+</head>
+<body></body>
+</html>

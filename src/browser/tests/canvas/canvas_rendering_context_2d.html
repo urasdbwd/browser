@@ -198,9 +198,9 @@
   ctx.fillText("Cwm fjordbank", 2, 15);
   const url1 = c.toDataURL();
   const url2 = c.toDataURL();
-  testing.expectEqual(true, typeof url1 === "string");
-  testing.expectEqual(true, url1.startsWith("data:image/png;base64,"));
-  testing.expectEqual(true, url1.length > 40);
+  // No fingerprint profile in tests (no --stealth/--fingerprint): honest "data:,".
+  // The seeded-PNG path is covered by the Zig unit test in Canvas.zig.
+  testing.expectEqual("data:,", url1);
   testing.expectEqual(url1, url2);
   // Second canvas with same ops → same fingerprint.
   const c2 = document.createElement('canvas');

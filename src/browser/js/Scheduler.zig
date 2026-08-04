@@ -41,6 +41,7 @@ allocator: std.mem.Allocator,
 // scheduler's generation. Code can snapshot this version and then compare it
 // later to see if we're still in the same task.
 generation: u64,
+stopped: bool,
 low_priority: Queue,
 high_priority: Queue,
 
@@ -49,6 +50,7 @@ pub fn init(allocator: std.mem.Allocator) Scheduler {
         ._sequence = 0,
         .allocator = allocator,
         .generation = 0,
+        .stopped = false,
         .low_priority = Queue.initContext({}),
         .high_priority = Queue.initContext({}),
     };
@@ -66,6 +68,17 @@ pub fn reset(self: *Scheduler) void {
     self.high_priority.clearRetainingCapacity();
 }
 
+// Permanently stop this scheduler. Unlike reset(), tasks added after shutdown
+// are finalized immediately and a currently-running repeating task is not
+// requeued after its callback returns.
+pub fn shutdown(self: *Scheduler) void {
+    if (self.stopped) {
+        return;
+    }
+    self.stopped = true;
+    self.reset();
+}
+
 const AddOpts = struct {
     name: []const u8 = "",
     front: bool = false, // run before any timed tasks, multi-fronts are FIFO amongst themselves
@@ -73,6 +86,13 @@ const AddOpts = struct {
     finalizer: ?Finalizer = null,
 };
 pub fn add(self: *Scheduler, ctx: *anyopaque, cb: Callback, run_in_ms: u32, opts: AddOpts) !void {
+    if (self.stopped) {
+        if (opts.finalizer) |finalize| {
+            finalize(ctx);
+        }
+        return;
+    }
+
     if (comptime IS_DEBUG) {
         log.debug(.scheduler, "scheduler.add", .{ .name = opts.name, .run_in_ms = run_in_ms, .low_priority = opts.low_priority });
     }
@@ -89,7 +109,25 @@ pub fn add(self: *Scheduler, ctx: *anyopaque, cb: Callback, run_in_ms: u32, opts
     });
 }
 
+pub fn remove(self: *Scheduler, ctx: *anyopaque) bool {
+    for ([_]*Queue{ &self.high_priority, &self.low_priority }) |queue| {
+        for (queue.items, 0..) |task, i| {
+            if (task.ctx != ctx) continue;
+
+            const removed = queue.popIndex(i);
+            if (removed.finalizer) |finalize| {
+                finalize(removed.ctx);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 pub fn run(self: *Scheduler) !void {
+    if (self.stopped) {
+        return;
+    }
     try self.runQueue(&self.low_priority);
     try self.runQueue(&self.high_priority);
 }
@@ -136,6 +174,13 @@ fn runQueue(self: *Scheduler, queue: *Queue) !void {
         };
 
         if (repeat_in_ms) |ms| {
+            if (self.stopped) {
+                if (task.finalizer) |finalize| {
+                    finalize(task.ctx);
+                }
+                return;
+            }
+
             // Task cannot be repeated immediately, and they should know that
             if (comptime IS_DEBUG) {
                 std.debug.assert(ms != 0);
@@ -177,3 +222,37 @@ const Task = struct {
 
 const Callback = *const fn (ctx: *anyopaque) anyerror!?u32;
 const Finalizer = *const fn (ctx: *anyopaque) void;
+
+test "Scheduler: remove queued timer tasks" {
+    const Context = struct {
+        finalized: bool = false,
+
+        fn run(_: *anyopaque) !?u32 {
+            return null;
+        }
+
+        fn finalize(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.finalized = true;
+        }
+    };
+
+    var scheduler = Scheduler.init(std.testing.allocator);
+    defer scheduler.low_priority.deinit(std.testing.allocator);
+    defer scheduler.high_priority.deinit(std.testing.allocator);
+
+    var contexts: [2048]Context = @splat(.{});
+    for (&contexts, 0..) |*ctx, i| {
+        try scheduler.add(ctx, Context.run, std.math.maxInt(u32), .{
+            .low_priority = i % 2 == 0,
+            .finalizer = Context.finalize,
+        });
+    }
+    try std.testing.expectEqual(contexts.len, scheduler.low_priority.count() + scheduler.high_priority.count());
+
+    for (&contexts) |*ctx| {
+        try std.testing.expect(scheduler.remove(ctx));
+        try std.testing.expect(ctx.finalized);
+    }
+    try std.testing.expectEqual(0, scheduler.low_priority.count() + scheduler.high_priority.count());
+}

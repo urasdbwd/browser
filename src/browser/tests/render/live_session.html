@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Live session fixture</title>
+</head>
+<body>
+  <input id="text" value="old">
+  <input id="password" type="password" value="default-secret">
+  <p id="mutation">before</p>
+  <button id="reorder-first">first</button>
+  <button id="reorder-second">second</button>
+  <button id="event-button"><span id="event-child">event child</span></button>
+  <output id="event-result"></output>
+  <div id="shadow-host"></div>
+  <output id="shadow-result">before</output>
+  <div id="slot-host"><input id="slot-input" slot="field" value="slot-old"></div>
+  <div id="late-shadow-host"><button id="late-shadow-light">light</button></div>
+  <div id="manual-host">
+    <button id="manual-first">manual first</button>
+    <button id="manual-second">manual second</button>
+  </div>
+  <div
+    id="marker-spoof"
+    data-lp-t-0123456789abcdef="65535"
+    data-lp-k-0123456789abcdef="deadbeefdeadbeef"
+  ></div>
+  <button id="pointer-target">pointer</button>
+  <output id="pointer-result"></output>
+  <output id="key-result"></output>
+  <div id="scroll-box" style="height:40px;overflow:auto">
+    <div id="scroll-tall" style="height:400px">tall</div>
+  </div>
+  <div id="editor" contenteditable>editable</div>
+  <input id="indeterminate" type="checkbox">
+  <select id="selected-none"><option selected>one</option></select>
+  <a id="slow" href="/src/browser/tests/render/live_session.html?delay_ms=100">slow</a>
+  <script>
+    const shadow = document.querySelector("#shadow-host").attachShadow({ mode: "closed" });
+    shadow.innerHTML = '<button id="shadow-button">shadow</button>';
+    shadow.querySelector("#shadow-button").addEventListener("click", () => {
+      document.querySelector("#shadow-result").textContent = "clicked";
+    });
+    const slot = document.querySelector("#slot-host").attachShadow({ mode: "closed" });
+    slot.innerHTML = '<slot name="field"></slot>';
+    const manual = document.querySelector("#manual-host").attachShadow({
+      mode: "closed",
+      slotAssignment: "manual",
+    });
+    manual.innerHTML = '<slot id="manual-slot"></slot>';
+    window.manualSlot = manual.querySelector("#manual-slot");
+    window.manualSlot.assign(document.querySelector("#manual-first"));
+    window.detachedManualSlot = document.createElement("slot");
+    document.querySelector("#indeterminate").indeterminate = true;
+    document.querySelector("#selected-none").selectedIndex = -1;
+    const eventResult = document.querySelector("#event-result");
+    const eventChild = document.querySelector("#event-child");
+    for (const type of ["mousedown", "mouseup", "click"]) {
+      eventChild.addEventListener(type, (event) => {
+        const part = [
+          type,
+          event.target.id,
+          event.clientX,
+          event.clientY,
+          event.pageX,
+          event.pageY,
+          event.buttons,
+          event.detail,
+          event.altKey,
+          event.ctrlKey,
+          event.metaKey,
+          event.shiftKey,
+        ].join(":");
+        eventResult.textContent += `${eventResult.textContent ? "|" : ""}${part}`;
+      });
+    }
+    const pointerResult = document.querySelector("#pointer-result");
+    const pointerTarget = document.querySelector("#pointer-target");
+    for (const type of ["mousemove", "mouseover", "mouseout", "contextmenu", "dblclick", "wheel"]) {
+      pointerTarget.addEventListener(type, (event) => {
+        const part = [
+          type,
+          event.target.id,
+          event.clientX,
+          event.clientY,
+          event.buttons,
+          event.detail,
+          event.deltaX ?? 0,
+          event.deltaY ?? 0,
+          event.altKey,
+          event.ctrlKey,
+          event.metaKey,
+          event.shiftKey,
+        ].join(":");
+        pointerResult.textContent += `${pointerResult.textContent ? "|" : ""}${part}`;
+      });
+    }
+    const keyResult = document.querySelector("#key-result");
+    for (const type of ["keydown", "keyup"]) {
+      document.addEventListener(type, (event) => {
+        const part = [
+          type,
+          event.key,
+          event.code,
+          event.location,
+          event.repeat,
+          event.altKey,
+          event.ctrlKey,
+          event.metaKey,
+          event.shiftKey,
+        ].join(":");
+        keyResult.textContent += `${keyResult.textContent ? "|" : ""}${part}`;
+      });
+    }
+  </script>
+</body>
+</html>

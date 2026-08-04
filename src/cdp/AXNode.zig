@@ -342,7 +342,7 @@ pub const Writer = struct {
         const frame = self.frame;
         const dom_node = axnode.dom;
 
-        switch (dom_node._type) {
+        switch (dom_node.typed()) {
             .document => |document| {
                 const uri = document.getURL(frame);
                 try self.writeAXProperty(.{ .name = .url, .value = .{ .string = uri } }, w);
@@ -758,7 +758,7 @@ pub const AXRole = enum(u8) {
     // zig fmt: on
 
     fn fromNode(node: *DOMNode) !AXRole {
-        return switch (node._type) {
+        return switch (node.typed()) {
             .document => return .RootWebArea, // Chrome specific.
             .cdata => |cd| {
                 if (cd.is(DOMNode.CData.Text) == null) {
@@ -979,7 +979,7 @@ fn writeName(
 
     const node = axnode.dom;
 
-    return switch (node._type) {
+    return switch (node.typed()) {
         .document => |doc| switch (doc._type) {
             .html => |doc_html| {
                 try w.write(try doc_html.getTitle(frame));
@@ -1106,7 +1106,7 @@ fn writeName(
 fn writeAccessibleNameFallback(node: *DOMNode, writer: *std.Io.Writer, frame: *Frame) !void {
     var it = node.childrenIterator();
     while (it.next()) |child| {
-        switch (child._type) {
+        switch (child.typed()) {
             .cdata => |cd| switch (cd._type) {
                 .text => {
                     const content = std.mem.trim(u8, cd._data.str(), &std.ascii.whitespace);

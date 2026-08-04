@@ -21,6 +21,7 @@ const lp = @import("lightpanda");
 const id = @import("../id.zig");
 const CDP = @import("../CDP.zig");
 const Session = @import("../../browser/Session.zig");
+const js = @import("../../browser/js/js.zig");
 const Notification = @import("../../Notification.zig");
 
 const log = lp.log;
@@ -290,6 +291,24 @@ test "cdp.browser: grant/set/reset permissions reach navigator.permissions" {
     });
     try ctx.expectSentResult(null, .{ .id = 41, .session_id = null });
     try testing.expectEqual(.denied, browser.permissions.get("geolocation").?);
+
+    // An unsupported name remains invalid even if a CDP client configured it.
+    try browser.setPermission("not-a-real-permission", .granted);
+    {
+        const frame = bc.mainFrame() orelse unreachable;
+        var ls: js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+
+        _ = try ls.local.exec(
+            "globalThis.__invalidPermissionRejected = false;" ++
+                "navigator.permissions.query({name:'not-a-real-permission'})" ++
+                ".catch(e => { globalThis.__invalidPermissionRejected = e instanceof TypeError; });",
+            null,
+        );
+        ls.local.runMicrotasks();
+        try testing.expect((try ls.local.exec("globalThis.__invalidPermissionRejected", null)).isTrue());
+    }
 
     // resetPermissions: clears everything; query falls back to "prompt".
     try ctx.processMessage(.{

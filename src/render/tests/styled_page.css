@@ -1,0 +1,82 @@
+:root {
+  color: #eaf2ff;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  background:
+    radial-gradient(circle at 20% 10%, rgb(88 101 242 / 35%), transparent 38%),
+    linear-gradient(145deg, #07101f, #111d35);
+}
+
+.card {
+  width: min(620px, 100%);
+  padding: 48px;
+  border: 1px solid rgb(255 255 255 / 14%);
+  border-radius: 28px;
+  background-color: rgb(12 24 45 / 88%);
+  background-image:
+    linear-gradient(130deg, rgb(143 180 255 / 8%), transparent 45%),
+    url("styled_badge.svg");
+  background-position: center, right 28px top 28px;
+  background-repeat: no-repeat;
+  background-size: auto, 28px 28px;
+  box-shadow: 0 32px 90px rgb(0 0 0 / 45%);
+}
+
+.card img {
+  width: 64px;
+  height: 64px;
+}
+
+.eyebrow {
+  margin: 24px 0 8px;
+  color: #8fb4ff;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+h1 {
+  margin: 0;
+  font-size: clamp(36px, 7vw, 64px);
+  line-height: 0.98;
+}
+
+.copy {
+  max-width: 48ch;
+  margin: 24px 0 32px;
+  color: #b9c8e5;
+  font-size: 18px;
+  line-height: 1.6;
+}
+
+button {
+  padding: 12px 18px;
+  border: 0;
+  border-radius: 999px;
+  color: #07101f;
+  background: var(--runtime-accent, #8fb4ff);
+  font: inherit;
+  font-weight: 750;
+}
+
+.runtime-ready button {
+  box-shadow: 0 0 0 4px rgb(143 180 255 / 18%);
+}
+
+.runtime-active .card {
+  border-color: var(--runtime-accent);
+}

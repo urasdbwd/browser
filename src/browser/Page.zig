@@ -33,6 +33,52 @@ const SharedWorkerGlobalScope = @import("webapi/SharedWorkerGlobalScope.zig");
 const Allocator = std.mem.Allocator;
 const IS_DEBUG = builtin.mode == .Debug;
 
+const MutableFormValues = struct {
+    values: std.AutoHashMapUnmanaged(usize, []const u8) = .empty,
+
+    fn get(self: *const MutableFormValues, control: *const anyopaque) ?[]const u8 {
+        return self.values.get(@intFromPtr(control));
+    }
+
+    fn put(self: *MutableFormValues, allocator: Allocator, control: *const anyopaque, value: []const u8) ![]const u8 {
+        if (self.get(control)) |current| {
+            if (std.mem.eql(u8, current, value)) return current;
+        }
+
+        const owned = try allocator.dupe(u8, value);
+        return self.adopt(allocator, control, owned);
+    }
+
+    // Takes ownership of value, including on error.
+    fn adopt(self: *MutableFormValues, allocator: Allocator, control: *const anyopaque, value: []u8) ![]const u8 {
+        errdefer allocator.free(value);
+
+        const key = @intFromPtr(control);
+        if (self.values.get(key)) |current| {
+            if (std.mem.eql(u8, current, value)) {
+                allocator.free(value);
+                return current;
+            }
+        }
+
+        const gop = try self.values.getOrPut(allocator, key);
+        if (gop.found_existing) {
+            allocator.free(gop.value_ptr.*);
+        }
+        gop.value_ptr.* = value;
+        return value;
+    }
+
+    fn deinit(self: *MutableFormValues, allocator: Allocator) void {
+        var it = self.values.valueIterator();
+        while (it.next()) |value| {
+            allocator.free(value.*);
+        }
+        self.values.deinit(allocator);
+        self.* = .{};
+    }
+};
+
 // A Page is the container for a root Frame and all of its descendants
 // (nested iframes). It owns the resources that share the lifetime of the root
 // document: the DOM factory, the per-page arena, the JS identity map, shared
@@ -44,6 +90,10 @@ const IS_DEBUG = builtin.mode == .Debug;
 const Page = @This();
 
 session: *Session,
+
+// Stable identity for this Page allocation. Page pointers come from a pool and
+// may be reused after navigation; this value never is within a Browser.
+incarnation: u64,
 
 // DOM version used to invalidate cached state of "live" collections. Ideally
 // this would be on the Frame (and that's where it used to be). But getting the
@@ -57,6 +107,11 @@ session: *Session,
 // putting this on the Page, and having an DOM mutation in Frame 1 invalidate
 // a cached lookup on Frame 2. We picked the latter.
 dom_version: usize = 0,
+
+// Version of state serialized by render live snapshots. DOM changes advance
+// this together with dom_version; form-control IDL state advances it directly
+// because value/checked/selected changes do not mutate attributes.
+snapshot_version: usize = 0,
 
 // Monotonic creation counter for BroadcastChannels in this Page. A postMessage
 // captures the current value so delivery targets only channels that existed
@@ -74,6 +129,11 @@ factory: Factory,
 // objects allocate out of this.
 _frame_arena: *lp.Arena,
 frame_arena: Allocator,
+
+// Runtime form values are mutable and may be replaced many times while a Page
+// stays alive. Keep only the latest bytes outside the Page arena so old values
+// can be reclaimed without adding ownership fields to every DOM node.
+mutable_form_values: MutableFormValues = .{},
 
 // Origin map for same-origin context sharing. Entries live for the Page's
 // lifetime.
@@ -121,9 +181,8 @@ frame: Frame,
 // to the original page like this.
 popups: std.ArrayList(*Frame) = .empty,
 
-// Popup Frames that have been closed. The window can still be referenced / used
-// from JS, so we defer shutting them down until page tear down (which isn't
-// ideal from a memory point of view).
+// Discarded popup and iframe Frames. Their Window can still be referenced from
+// JS, so they are quiesced immediately but deinitialized only at Page teardown.
 closed_frames: std.ArrayList(*Frame) = .empty,
 
 // SharedWorkerGlobalScopes created by this Page's frames (also registered in
@@ -155,6 +214,7 @@ pub fn init(self: *Page, session: *Session, frame_id: u32) !void {
 
     self.* = .{
         .session = session,
+        .incarnation = try session.browser.nextPageIncarnation(),
         .frame = undefined,
         ._frame_arena = frame_arena,
         .frame_arena = frame_arena.allocator(),
@@ -230,7 +290,21 @@ pub fn deinit(self: *Page) void {
         self.origins = .empty;
     }
 
+    self.mutable_form_values.deinit(session.browser.app.allocator);
     self._frame_arena.release();
+}
+
+pub fn getMutableFormValue(self: *const Page, control: *const anyopaque) ?[]const u8 {
+    return self.mutable_form_values.get(control);
+}
+
+pub fn putMutableFormValue(self: *Page, control: *const anyopaque, value: []const u8) ![]const u8 {
+    return self.mutable_form_values.put(self.session.browser.app.allocator, control, value);
+}
+
+// Takes ownership of value, including on error.
+pub fn adoptMutableFormValue(self: *Page, control: *const anyopaque, value: []u8) ![]const u8 {
+    return self.mutable_form_values.adopt(self.session.browser.app.allocator, control, value);
 }
 
 pub fn recordJsError(self: *Page, err: anyerror) void {
@@ -415,4 +489,57 @@ test "Page: js_error_count" {
     defer page.close();
 
     try testing.expectEqual(2, page.frame().?._page.js_error_count);
+}
+
+test "Page: mutable form values replace owned storage" {
+    var tracked = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = tracked.allocator();
+
+    {
+        var values: MutableFormValues = .{};
+        defer values.deinit(allocator);
+
+        var control: u8 = 0;
+        var first: [4096]u8 = undefined;
+        var second: [4096]u8 = undefined;
+        @memset(&first, 'a');
+        @memset(&second, 'b');
+
+        const initial = try values.put(allocator, &control, &first);
+        const retained_bytes = tracked.allocated_bytes - tracked.freed_bytes;
+
+        const allocations = tracked.allocations;
+        try testing.expectEqual(
+            @intFromPtr(initial.ptr),
+            @intFromPtr((try values.put(allocator, &control, &first)).ptr),
+        );
+        try testing.expectEqual(allocations, tracked.allocations);
+
+        for (0..10_000) |i| {
+            const value: []const u8 = if (i % 2 == 0) &second else &first;
+            _ = try values.put(allocator, &control, value);
+            try testing.expectEqual(retained_bytes, tracked.allocated_bytes - tracked.freed_bytes);
+        }
+        try testing.expectEqual(1, values.values.count());
+
+        const current = values.get(&control).?;
+        tracked.fail_index = tracked.alloc_index;
+        try testing.expectError(error.OutOfMemory, values.put(allocator, &control, "replacement"));
+        try testing.expectEqual(@intFromPtr(current.ptr), @intFromPtr(values.get(&control).?.ptr));
+        try std.testing.expectEqualStrings(first[0..], values.get(&control).?);
+        tracked.fail_index = std.math.maxInt(usize);
+
+        const live_before_adopt = tracked.allocated_bytes - tracked.freed_bytes;
+        var empty: MutableFormValues = .{};
+        defer empty.deinit(allocator);
+        var other_control: u8 = 0;
+        const candidate = try allocator.dupe(u8, &second);
+        tracked.fail_index = tracked.alloc_index;
+        try testing.expectError(error.OutOfMemory, empty.adopt(allocator, &other_control, candidate));
+        tracked.fail_index = std.math.maxInt(usize);
+        try testing.expectEqual(null, empty.get(&other_control));
+        try testing.expectEqual(live_before_adopt, tracked.allocated_bytes - tracked.freed_bytes);
+    }
+
+    try testing.expectEqual(tracked.allocated_bytes, tracked.freed_bytes);
 }

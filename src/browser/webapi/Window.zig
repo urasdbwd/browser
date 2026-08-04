@@ -126,6 +126,11 @@ _opener: ?*Window = null,
 // transfers aborted, scheduler reset, and unreachable for events / name lookup.
 _closed: bool = false,
 
+// True after an iframe's child browsing context is discarded. The Window
+// remains page-owned for cached WindowProxy safety, but no longer has browsing
+// context relationships or runnable tasks.
+_detached: bool = false,
+
 // Popup name (owned by page.arena)
 _name: []const u8 = "",
 
@@ -179,7 +184,10 @@ pub fn setName(self: *Window, name: []const u8, frame: *Frame) !void {
     self._name = try frame.arena.dupe(u8, name);
 }
 
-pub fn getTop(self: *Window, frame: *Frame) Access {
+pub fn getTop(self: *Window, frame: *Frame) ?Access {
+    if (self._detached) {
+        return null;
+    }
     var p = self._frame;
     while (p.parent) |parent| {
         p = parent;
@@ -187,7 +195,10 @@ pub fn getTop(self: *Window, frame: *Frame) Access {
     return Access.init(frame.window, p.window);
 }
 
-pub fn getParent(self: *Window, frame: *Frame) Access {
+pub fn getParent(self: *Window, frame: *Frame) ?Access {
+    if (self._detached) {
+        return null;
+    }
     if (self._frame.parent) |p| {
         return Access.init(frame.window, p.window);
     }
@@ -883,6 +894,9 @@ pub fn structuredClone(_: *const Window, value: js.Value) !js.Value {
 }
 
 pub fn getFrame(self: *Window, idx: usize) !?*Window {
+    if (self._detached) {
+        return null;
+    }
     const frame = self._frame;
     const frames = frame.child_frames.items;
     if (idx >= frames.len) {
@@ -906,6 +920,9 @@ pub fn getFrame(self: *Window, idx: usize) !?*Window {
 }
 
 pub fn getFramesLength(self: *const Window) u32 {
+    if (self._detached) {
+        return 0;
+    }
     return @intCast(self._frame.child_frames.items.len);
 }
 
@@ -927,14 +944,16 @@ pub fn getInnerHeight(_: *const Window, frame: *Frame) u32 {
     return frame._page.getViewport().height;
 }
 
-// outer* includes browser chrome; non-zero is the headless tell scanners check.
-// Match inner for width; add a modest chrome height for realism.
+// A maximized window is exactly as wide as the space available to it, so
+// outerWidth == innerWidth == availWidth, which is what real Chrome reports.
 pub fn getOuterWidth(self: *const Window, frame: *Frame) u32 {
     return self.getInnerWidth(frame);
 }
 
-pub fn getOuterHeight(self: *const Window, frame: *Frame) u32 {
-    return self.getInnerHeight(frame) + 85;
+// outerHeight == innerHeight is impossible in a real browser: the tab strip and
+// omnibox always sit between them. See Viewport for the full chain.
+pub fn getOuterHeight(_: *const Window, frame: *Frame) u32 {
+    return frame._page.getViewport().outerHeight();
 }
 
 pub fn getChrome(self: *Window) *Chrome {
@@ -1334,11 +1353,11 @@ const CrossOriginWindow = struct {
         return self.window.postMessage(message, target_origin, transfer, frame);
     }
 
-    pub fn getTop(self: *CrossOriginWindow, frame: *Frame) Access {
+    pub fn getTop(self: *CrossOriginWindow, frame: *Frame) ?Access {
         return self.window.getParent(frame);
     }
 
-    pub fn getParent(self: *CrossOriginWindow, frame: *Frame) Access {
+    pub fn getParent(self: *CrossOriginWindow, frame: *Frame) ?Access {
         return self.window.getParent(frame);
     }
 

@@ -205,7 +205,7 @@ pub fn invokerTarget(invoker: *Node, explicit: ?*Element, frame: *Frame) ?*Eleme
 }
 
 pub fn runInvokerActivation(invoker: *HtmlElement, explicit: ?*Element, frame: *Frame) !void {
-    switch (invoker._type) {
+    switch (invoker.typed()) {
         .button => {},
         .input => |input| switch (input._input_type) {
             .button, .submit, .reset, .image => {},

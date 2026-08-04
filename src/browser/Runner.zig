@@ -459,6 +459,10 @@ fn firstConditionError(conditions: []const WaitCondition) !void {
 
 /// Poll Turnstile widgets: wait for passive (always-pass) tokens first, then
 /// click managed interactive controls. Soft-fail if no token by timeout.
+///
+/// Blocking — for the one-shot `fetch`/`render` paths that must hold the token
+/// before dumping. Long-lived paths (CDP, MCP, agent) use `Turnstile.AutoSolve`
+/// instead, which never parks the event loop.
 pub fn solveTurnstile(self: *Runner, timeout_ms: u32) !void {
     const session = self.session;
     const timer: std.Io.Timestamp = .now(lp.io, .boot);
@@ -632,4 +636,31 @@ test "Runner: lazy iframe does not delay the load event" {
     try runner.waitForFrame(page.frame_id, 3000, .{ .until = .done });
     try testing.expectEqual(true, lazy_child._load_state == .complete);
     try testing.expectEqual(true, lazy_child._parent_notified);
+}
+
+test "Runner: solveTurnstile finds widget and detects token" {
+    const page = try testing.pageTest("turnstile/widget.html", .{});
+    defer page.close();
+
+    try testing.expectEqual(true, Turnstile.hasWidget(page.session));
+    try testing.expectEqual(false, Turnstile.hasToken(page.session));
+
+    var runner = page.session.runner(.{});
+    try runner.solveTurnstile(3000);
+
+    try testing.expectEqual(true, Turnstile.hasToken(page.session));
+}
+
+test "Runner: solveTurnstile returns promptly with no widget" {
+    const page = try testing.pageTest("runner/runner1.html", .{});
+    defer page.close();
+
+    var runner = page.session.runner(.{});
+    const started: std.Io.Timestamp = .now(lp.io, .boot);
+    // A 30s budget must not be spent on a page that has no challenge.
+    try runner.solveTurnstile(30_000);
+    const elapsed = started.untilNow(lp.io, .boot).toMilliseconds();
+
+    try testing.expectEqual(false, Turnstile.hasWidget(page.session));
+    try testing.expectEqual(true, elapsed < 2_000);
 }

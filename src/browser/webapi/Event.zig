@@ -320,7 +320,7 @@ pub fn composedPath(self: *Event, exec: *Execution) ![]const *EventTarget {
     const target = self._dispatch_target orelse self._target orelse return &.{};
 
     // Only nodes have a propagation path
-    const target_node = switch (target._type) {
+    const target_node = switch (target.typed()) {
         .node => |n| n,
         else => return &.{},
     };
@@ -349,8 +349,9 @@ pub fn composedPath(self: *Event, exec: *Execution) ![]const *EventTarget {
 
         // Check if this node is a shadow root
         if (n._type == .document_fragment) {
-            if (n._type.document_fragment._type == .shadow_root) {
-                const shadow = n._type.document_fragment._type.shadow_root;
+            const fragment = n.typed().document_fragment;
+            if (fragment._type == .shadow_root) {
+                const shadow = fragment._type.shadow_root;
 
                 if (!self._composed and n == target_root) {
                     stopped_at_shadow_boundary = true;
@@ -389,7 +390,7 @@ pub fn composedPath(self: *Event, exec: *Execution) ![]const *EventTarget {
     // at a shadow boundary...
     if (stopped_at_shadow_boundary == false) {
         // ... AND when the tree's root is a document
-        const root_is_document = path_len > 0 and switch (path_buffer[path_len - 1]._type) {
+        const root_is_document = path_len > 0 and switch (path_buffer[path_len - 1].typed()) {
             .node => |n| n._type == .document,
             else => false,
         };

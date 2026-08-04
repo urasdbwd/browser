@@ -19,16 +19,59 @@
 const std = @import("std");
 const Frame = @import("Frame.zig");
 const Node = @import("webapi/Node.zig");
+const Element = @import("webapi/Element.zig");
 const Slot = @import("webapi/element/html/Slot.zig");
 const IFrame = @import("webapi/element/html/IFrame.zig");
+const Link = @import("webapi/element/html/Link.zig");
+
+const Input = Element.Html.Input;
+const Option = Element.Html.Option;
+const Select = Element.Html.Select;
+const TextArea = Element.Html.TextArea;
 
 const IS_DEBUG = @import("builtin").mode == .Debug;
+pub const MAX_LIVE_TARGETS = std.math.maxInt(u16);
+const LIVE_INDETERMINATE_ATTR = "data-lightpanda-live-indeterminate";
+const LIVE_SELECTED_NONE_ATTR = "data-lightpanda-live-selected-none";
+const LIVE_FRAME_ATTR = "data-lightpanda-live-frame";
+const LIVE_TARGET_ATTR_PREFIX = "data-lp-t-";
+const LIVE_TARGET_KEY_ATTR_PREFIX = "data-lp-k-";
+// CSP3 has no generic anchor-navigation directive. Render clients must also
+// sandbox the snapshot frame and cancel captured link navigation.
+const RENDER_CSP_META =
+    "<meta http-equiv=\"Content-Security-Policy\" content=\"" ++
+    "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; " ++
+    "img-src data: blob:; media-src data: blob:; font-src data: blob:; " ++
+    "connect-src 'none'; frame-src 'self' about:; child-src 'self' about:; " ++
+    "worker-src 'none'; " ++
+    "object-src 'none'; form-action 'none'\">";
+const RENDER_CSP_DIRECT_RESOURCES_META =
+    "<meta http-equiv=\"Content-Security-Policy\" content=\"" ++
+    "default-src 'none'; script-src 'none'; " ++
+    "style-src 'unsafe-inline' data: blob: http: https:; " ++
+    "img-src data: blob: http: https:; media-src data: blob: http: https:; " ++
+    "font-src data: blob: http: https:; " ++
+    "connect-src 'none'; frame-src 'self' about:; child-src 'self' about:; " ++
+    "worker-src 'none'; " ++
+    "object-src 'none'; form-action 'none'\">";
+const RENDER_REFERRER_META = "<meta name=\"referrer\" content=\"no-referrer\">";
 
 pub const Opts = struct {
     with_base: bool = false,
     with_frames: bool = false,
     strip: Opts.Strip = .{},
     shadow: Opts.Shadow = .rendered,
+    /// Reflect mutable form-control properties into a transport snapshot.
+    /// Password values are always omitted.
+    live_form_state: bool = false,
+    /// Inject a restrictive policy for inert client-side render snapshots.
+    /// This also strips source CSP and refresh meta elements.
+    with_render_csp: bool = false,
+    /// Let an explicitly opted-in client fetch visual resources directly.
+    direct_render_resources: bool = false,
+    /// Assign opaque, snapshot-local IDs to the exact elements emitted by the
+    /// rendered shadow/slot traversal.
+    live_targets: ?LiveTargets = null,
 
     pub const Strip = packed struct(u5) {
         js: bool = false,
@@ -50,8 +93,18 @@ pub const Opts = struct {
     };
 };
 
+pub const LiveTargets = struct {
+    allocator: std.mem.Allocator,
+    elements: *std.ArrayList(*Element),
+    version: *const [16]u8,
+    key_secret: u64,
+    page_incarnation: u64,
+};
+
 pub fn root(doc: *Node.Document, opts: Opts, writer: *std.Io.Writer, frame: *Frame) !void {
+    var missing_head = false;
     if (doc.is(Node.Document.HTMLDocument)) |html_doc| {
+        missing_head = html_doc.getHead() == null;
         blk: {
             // Ideally we just render the doctype which is part of the document
             if (doc.asNode().firstChild()) |first| {
@@ -63,20 +116,26 @@ pub fn root(doc: *Node.Document, opts: Opts, writer: *std.Io.Writer, frame: *Fra
             // well force it.
             try writer.writeAll("<!DOCTYPE html>");
         }
-
-        _ = html_doc;
     }
 
-    var state: RootState = .{ .inject_base = opts.with_base };
+    var state: RootState = .{
+        .inject_base = opts.with_base,
+        .inject_render_csp = opts.with_render_csp,
+        .direct_render_resources = opts.direct_render_resources,
+        .synthesize_head = missing_head and (opts.with_base or opts.with_render_csp),
+    };
     return _deep(doc.asNode(), opts, false, writer, frame, &state);
 }
 
 pub fn deep(node: *Node, opts: Opts, writer: *std.Io.Writer, frame: *Frame) error{WriteFailed}!void {
-    return _deep(node, opts, false, writer, frame, null);
+    return _deep(node, opts, false, writer, frame, null) catch error.WriteFailed;
 }
 
 const RootState = struct {
     inject_base: bool,
+    inject_render_csp: bool,
+    direct_render_resources: bool,
+    synthesize_head: bool,
 };
 
 fn _deep(
@@ -86,8 +145,8 @@ fn _deep(
     writer: *std.Io.Writer,
     frame: *Frame,
     root_state: ?*RootState,
-) error{WriteFailed}!void {
-    switch (node._type) {
+) error{ WriteFailed, OutOfMemory }!void {
+    switch (node.typed()) {
         .cdata => |cd| {
             if (node.is(Node.CData.Comment)) |_| {
                 try writer.writeAll("<!--");
@@ -112,6 +171,17 @@ fn _deep(
                 return;
             }
 
+            if (opts.with_render_csp) {
+                if (el.is(Link)) |link| {
+                    if (link._sheet) |sheet| {
+                        try writer.writeAll("<style>");
+                        try sheet.writeCssRules(writer, frame);
+                        try writer.writeAll("</style>");
+                        return;
+                    }
+                }
+            }
+
             // When opts.shadow == .rendered, we normally skip any element with
             // a slot attribute. Only the "active" element will get rendered into
             // the <slot name="X">. However, the `deep` function is itself used
@@ -124,13 +194,23 @@ fn _deep(
                 }
             }
 
-            try el.format(writer);
+            if (opts.live_form_state or
+                opts.live_targets != null or
+                (opts.with_frames and opts.with_render_csp and el.is(IFrame) != null))
+            {
+                try writeSnapshotStartTag(el, opts, writer, frame);
+            } else {
+                try el.format(writer);
+            }
             if (root_state) |state| {
-                if (state.inject_base and std.mem.eql(u8, el.getTagNameDump(), "head")) {
-                    try writer.writeAll("<base href=\"");
-                    try writeEscapedAttributeValue(frame.base(), writer);
-                    try writer.writeAll("\">");
-                    state.inject_base = false;
+                const tag_name = el.getTagNameDump();
+                if (state.synthesize_head and std.mem.eql(u8, tag_name, "html")) {
+                    try writer.writeAll("<head>");
+                    try writeRootHead(state, writer, frame);
+                    try writer.writeAll("</head>");
+                    state.synthesize_head = false;
+                } else if (std.mem.eql(u8, tag_name, "head")) {
+                    try writeRootHead(state, writer, frame);
                 }
             }
 
@@ -156,7 +236,7 @@ fn _deep(
                 }
             }
 
-            if (opts.with_frames and el.is(IFrame) != null) {
+            if (opts.with_frames and !opts.with_render_csp and el.is(IFrame) != null) {
                 const iframe = el.as(IFrame);
                 if (iframe.getContentDocument()) |doc| {
                     // A frame's document should always ahave a frame, but
@@ -166,12 +246,42 @@ fn _deep(
                     }
                     if (doc._frame) |f| {
                         try writer.writeByte('\n');
-                        root(doc, opts, writer, f) catch return error.WriteFailed;
+                        try root(doc, opts, writer, f);
                         try writer.writeByte('\n');
                     }
                 }
             } else {
-                try _children(node, opts, writer, frame, root_state);
+                if (opts.with_render_csp) {
+                    if (el.is(Element.Html.Style)) |style| {
+                        if (style._sheet) |sheet| {
+                            try sheet.writeCssRules(writer, frame);
+                        } else {
+                            try _children(node, opts, writer, frame, root_state);
+                        }
+                    } else if (opts.live_form_state) {
+                        if (el.is(TextArea)) |textarea| {
+                            const value = textarea.getValue();
+                            // HTML parsing ignores one leading LF in a textarea.
+                            if (std.mem.startsWith(u8, value, "\n")) try writer.writeByte('\n');
+                            try writeEscapedText(value, writer);
+                        } else {
+                            try _children(node, opts, writer, frame, root_state);
+                        }
+                    } else {
+                        try _children(node, opts, writer, frame, root_state);
+                    }
+                } else if (opts.live_form_state) {
+                    if (el.is(TextArea)) |textarea| {
+                        const value = textarea.getValue();
+                        // HTML parsing ignores one leading LF in a textarea.
+                        if (std.mem.startsWith(u8, value, "\n")) try writer.writeByte('\n');
+                        try writeEscapedText(value, writer);
+                    } else {
+                        try _children(node, opts, writer, frame, root_state);
+                    }
+                } else {
+                    try _children(node, opts, writer, frame, root_state);
+                }
             }
 
             if (!isVoidElement(el)) {
@@ -277,7 +387,7 @@ fn dumpSlotContent(slot: *Slot, opts: Opts, writer: *std.Io.Writer, frame: *Fram
 }
 
 fn isVoidElement(el: *const Node.Element) bool {
-    return switch (el._type) {
+    return switch (el.typed()) {
         .html => |html| switch (html._type) {
             .base, .br, .hr, .img, .input, .link, .meta => true,
             else => false,
@@ -286,13 +396,180 @@ fn isVoidElement(el: *const Node.Element) bool {
     };
 }
 
+fn writeSnapshotStartTag(
+    el: *Element,
+    opts: Opts,
+    writer: *std.Io.Writer,
+    frame: *Frame,
+) !void {
+    const input = el.is(Input);
+    const option = el.is(Option);
+    const select = el.is(Select);
+    const iframe = el.is(IFrame);
+    const transport_frame = opts.with_frames and opts.with_render_csp and iframe != null;
+    const child_frame: ?*Frame = if (transport_frame) child: {
+        const doc = iframe.?.getContentDocument() orelse break :child null;
+        const owner = doc._frame orelse break :child null;
+        if (owner._page != frame._page) break :child null;
+        break :child owner;
+    } else null;
+    const input_type = if (input) |value| value.getType() else "";
+    const checkable = std.mem.eql(u8, input_type, "checkbox") or
+        std.mem.eql(u8, input_type, "radio");
+    const password = std.mem.eql(u8, input_type, "password");
+    const file = std.mem.eql(u8, input_type, "file");
+    const target_id: ?u16 = if (opts.live_targets) |targets| target: {
+        if (targets.elements.items.len >= MAX_LIVE_TARGETS) return error.WriteFailed;
+        try targets.elements.append(targets.allocator, el);
+        break :target @intCast(targets.elements.items.len);
+    } else null;
+
+    try writer.writeByte('<');
+    try writer.writeAll(el.getTagNameDump());
+    for (el._attributes.entries()) |*attr| {
+        const name = attr.name();
+        if (opts.live_form_state) {
+            if (std.mem.eql(u8, name, LIVE_INDETERMINATE_ATTR) or
+                std.mem.eql(u8, name, LIVE_SELECTED_NONE_ATTR)) continue;
+            if (input != null and std.mem.eql(u8, name, "checked") and checkable) continue;
+            if (input != null and std.mem.eql(u8, name, "value")) continue;
+            if (option != null and std.mem.eql(u8, name, "selected")) continue;
+        }
+        if (opts.live_targets != null and isLiveTargetAttribute(name)) continue;
+        if (transport_frame and
+            (std.ascii.eqlIgnoreCase(name, "src") or
+                std.ascii.eqlIgnoreCase(name, "srcdoc") or
+                std.ascii.eqlIgnoreCase(name, "sandbox") or
+                std.ascii.eqlIgnoreCase(name, LIVE_FRAME_ATTR)))
+        {
+            continue;
+        }
+        try writer.print(" {f}", .{attr});
+    }
+
+    if (opts.live_form_state) {
+        if (input) |value| {
+            if (checkable) {
+                if (value.getChecked()) try writer.writeAll(" checked");
+            }
+            if (!password and !file) {
+                try writer.writeAll(" value=\"");
+                try writeEscapedAttributeValue(value.getValue(), writer);
+                try writer.writeByte('"');
+            }
+            if (value.getIndeterminate()) {
+                try writer.writeAll(" " ++ LIVE_INDETERMINATE_ATTR);
+            }
+        }
+        if (option) |value| {
+            if (value.getSelected()) try writer.writeAll(" selected");
+        }
+        if (select) |value| {
+            if (value.getSelectedIndex() == -1) {
+                try writer.writeAll(" " ++ LIVE_SELECTED_NONE_ATTR);
+            }
+        }
+    }
+    if (transport_frame) {
+        try writer.writeAll(" sandbox=\"allow-same-origin\"");
+    }
+    if (target_id) |id| {
+        const targets = opts.live_targets.?;
+        const key = liveTargetKey(el, targets.key_secret, targets.page_incarnation);
+        const key_hex = hexU64(key);
+        try writer.writeByte(' ');
+        try writer.writeAll(LIVE_TARGET_ATTR_PREFIX);
+        try writer.writeAll(targets.version);
+        try writer.print("=\"{d}\"", .{id});
+        try writer.writeByte(' ');
+        try writer.writeAll(LIVE_TARGET_KEY_ATTR_PREFIX);
+        try writer.writeAll(targets.version);
+        try writer.writeAll("=\"");
+        try writer.writeAll(&key_hex);
+        try writer.writeByte('"');
+    }
+    if (child_frame) |child| {
+        try writer.writeByte(' ');
+        try writer.writeAll(LIVE_FRAME_ATTR);
+        try writer.writeAll(" srcdoc=\"");
+        var escaped: EscapedAttributeWriter = .init(writer);
+        try root(child.document, opts, &escaped.writer, child);
+        try writer.writeByte('"');
+    }
+    try writer.writeByte('>');
+}
+
+const EscapedAttributeWriter = struct {
+    out: *std.Io.Writer,
+    writer: std.Io.Writer = .{ .buffer = &.{}, .vtable = &vtable },
+
+    fn init(out: *std.Io.Writer) EscapedAttributeWriter {
+        return .{ .out = out };
+    }
+
+    const vtable: std.Io.Writer.VTable = .{ .drain = drain };
+
+    fn drain(
+        writer: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        const self: *EscapedAttributeWriter = @alignCast(@fieldParentPtr("writer", writer));
+        var written: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            try self.write(bytes);
+            written += bytes.len;
+        }
+        const repeated = data[data.len - 1];
+        for (0..splat) |_| {
+            try self.write(repeated);
+            written += repeated.len;
+        }
+        return written;
+    }
+
+    fn write(self: *EscapedAttributeWriter, bytes: []const u8) std.Io.Writer.Error!void {
+        writeEscapedAttributeValue(bytes, self.out) catch return error.WriteFailed;
+    }
+};
+
+fn isLiveTargetAttribute(name: []const u8) bool {
+    const prefix_len = if (std.ascii.startsWithIgnoreCase(name, LIVE_TARGET_ATTR_PREFIX))
+        LIVE_TARGET_ATTR_PREFIX.len
+    else if (std.ascii.startsWithIgnoreCase(name, LIVE_TARGET_KEY_ATTR_PREFIX))
+        LIVE_TARGET_KEY_ATTR_PREFIX.len
+    else
+        return false;
+    if (name.len != prefix_len + 16) return false;
+    for (name[prefix_len..]) |byte| {
+        if (!std.ascii.isDigit(byte) and
+            !(byte >= 'a' and byte <= 'f') and
+            !(byte >= 'A' and byte <= 'F'))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn liveTargetKey(el: *Element, secret: u64, page_incarnation: u64) u64 {
+    const input = [2]u64{ @intFromPtr(el), page_incarnation };
+    return std.hash.Wyhash.hash(secret, std.mem.asBytes(&input));
+}
+
+fn hexU64(value: u64) [16]u8 {
+    const big_endian = std.mem.nativeToBig(u64, value);
+    return std.fmt.bytesToHex(std.mem.asBytes(&big_endian), .lower);
+}
+
 fn shouldStripElement(el: *Node.Element, opts: Opts, frame: *Frame) bool {
     // Fast path: with no strip flags set (every innerHTML/outerHTML call)
-    if (@as(u5, @bitCast(opts.strip)) == 0) {
+    if (@as(u5, @bitCast(opts.strip)) == 0 and !opts.with_render_csp) {
         return false;
     }
 
     const tag_name = el.getTagNameDump();
+    if (opts.with_render_csp and std.ascii.eqlIgnoreCase(tag_name, "frame")) return true;
 
     if (opts.strip.js) {
         if (std.mem.eql(u8, tag_name, "script")) return true;
@@ -313,9 +590,16 @@ fn shouldStripElement(el: *Node.Element, opts: Opts, frame: *Frame) bool {
         }
     }
 
-    if (opts.strip.meta and std.mem.eql(u8, tag_name, "meta")) {
+    if ((opts.strip.meta or opts.with_render_csp) and std.mem.eql(u8, tag_name, "meta")) {
         if (el.getAttributeSafe(comptime .wrap("http-equiv"))) |raw| {
             if (isUnsafeHttpEquiv(raw)) return true;
+        }
+        if (opts.with_render_csp) {
+            if (el.getAttributeSafe(comptime .wrap("name"))) |raw| {
+                if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, raw, &std.ascii.whitespace), "referrer")) {
+                    return true;
+                }
+            }
         }
     }
 
@@ -344,6 +628,23 @@ fn shouldStripElement(el: *Node.Element, opts: Opts, frame: *Frame) bool {
     }
 
     return false;
+}
+
+fn writeRootHead(state: *RootState, writer: *std.Io.Writer, frame: *Frame) !void {
+    if (state.inject_render_csp) {
+        try writer.writeAll(if (state.direct_render_resources)
+            RENDER_CSP_DIRECT_RESOURCES_META
+        else
+            RENDER_CSP_META);
+        try writer.writeAll(RENDER_REFERRER_META);
+        state.inject_render_csp = false;
+    }
+    if (state.inject_base) {
+        try writer.writeAll("<base href=\"");
+        try writeEscapedAttributeValue(frame.base(), writer);
+        try writer.writeAll("\">");
+        state.inject_base = false;
+    }
 }
 
 fn hasAsciiToken(value: []const u8, wanted: []const u8) bool {
@@ -491,6 +792,266 @@ test "dump: render handoff strips navigation and CSP meta policies" {
     try testing.expect(isUnsafeHttpEquiv("CONTENT-SECURITY-POLICY"));
     try testing.expect(isUnsafeHttpEquiv("content-security-policy-report-only"));
     try testing.expect(!isUnsafeHttpEquiv("content-type"));
+}
+
+test "dump: live target attribute grammar is narrow" {
+    try testing.expect(isLiveTargetAttribute("data-lp-t-0123456789abcdef"));
+    try testing.expect(isLiveTargetAttribute("data-lp-k-0123456789abcdef"));
+    try testing.expect(isLiveTargetAttribute("DATA-LP-T-0123456789ABCDEF"));
+    try testing.expect(!isLiveTargetAttribute("data-lp-t-0123456789abcde"));
+    try testing.expect(!isLiveTargetAttribute("data-lp-t-0123456789abcdeg"));
+    try testing.expect(!isLiveTargetAttribute("data-lp-target-0123456789abcdef"));
+}
+
+test "dump: render CSP precedes base and replaces source policies" {
+    var page = try testing.pageTest("dump_render_policy.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    var aw: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    try root(frame.document, .{
+        .with_base = true,
+        .with_render_csp = true,
+    }, &aw.writer, frame);
+    const html = aw.written();
+
+    const head_pos = std.mem.indexOf(u8, html, "<head>").?;
+    const csp_pos = std.mem.indexOf(u8, html, RENDER_CSP_META).?;
+    const referrer_pos = std.mem.indexOf(u8, html, RENDER_REFERRER_META).?;
+    const base_pos = std.mem.indexOf(u8, html, "<base href=").?;
+    try testing.expectEqual(head_pos + "<head>".len, csp_pos);
+    try testing.expectEqual(csp_pos + RENDER_CSP_META.len, referrer_pos);
+    try testing.expectEqual(referrer_pos + RENDER_REFERRER_META.len, base_pos);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, html, "http-equiv=\"Content-Security-Policy\""));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, html, "name=\"referrer\""));
+    try testing.expect(std.mem.indexOf(u8, html, "default-src *") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "999999;url=") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "unsafe-url") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "http-equiv=\"content-type\"") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "base-uri") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "navigate-to") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "style-src 'unsafe-inline' data: blob: http: https:") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "connect-src 'none'") != null);
+}
+
+test "dump: render synthesizes a protected head when the source head is removed" {
+    var page = try testing.pageTest("dump_render_policy.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    frame.document.is(Node.Document.HTMLDocument).?.getHead().?.remove(frame);
+
+    var aw: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    try root(frame.document, .{
+        .with_base = true,
+        .with_render_csp = true,
+    }, &aw.writer, frame);
+    const html = aw.written();
+
+    try testing.expect(std.mem.indexOf(u8, html, "<html><head>") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(
+        u8,
+        html,
+        "http-equiv=\"Content-Security-Policy\"",
+    ));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, html, "<base href="));
+    const head_end = std.mem.indexOf(u8, html, "</head>").? + "</head>".len;
+    const body_start = std.mem.indexOfPos(u8, html, head_end, "<body").?;
+    try testing.expectEqual(@as(usize, 0), std.mem.trim(
+        u8,
+        html[head_end..body_start],
+        " \t\r\n",
+    ).len);
+}
+
+test "dump: direct render resources are explicit and script-free" {
+    var page = try testing.pageTest("dump_render_policy.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    var aw: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    try root(frame.document, .{
+        .with_base = true,
+        .with_render_csp = true,
+        .direct_render_resources = true,
+        .strip = .{ .js = true },
+    }, &aw.writer, frame);
+    const html = aw.written();
+
+    try testing.expect(std.mem.indexOf(
+        u8,
+        html,
+        "style-src 'unsafe-inline' data: blob: http: https:",
+    ) != null);
+    try testing.expect(std.mem.indexOf(u8, html, "img-src data: blob: http: https:") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "connect-src 'none'") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "<script") == null);
+}
+
+test "dump: render frames use nested script-free srcdoc snapshots" {
+    var page = try testing.pageTest("render/live_session_frame.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    var aw: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    try root(frame.document, .{
+        .with_base = true,
+        .with_frames = true,
+        .with_render_csp = true,
+        .strip = .{ .js = true, .meta = true },
+    }, &aw.writer, frame);
+    const html = aw.written();
+
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, html, LIVE_FRAME_ATTR));
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, html, " srcdoc=\""));
+    try testing.expect(std.mem.indexOf(u8, html, LIVE_FRAME_ATTR ++ "=\"spoof\"") == null);
+    try testing.expect(std.mem.indexOf(u8, html, " src=\"live_session_frame_child.html\"") == null);
+    try testing.expect(std.mem.indexOf(u8, html, " src=\"live_session_frame_grandchild.html\"") == null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        html,
+        " srcdoc=\"&lt;p id='srcdoc-content'&gt;srcdoc child&lt;/p&gt;\"",
+    ) == null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        html,
+        "&lt;base href=&quot;http://127.0.0.1:9582/src/browser/tests/render/live_session_frame_child.html&quot;&gt;",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        html,
+        "&amp;lt;base href=&amp;quot;http://127.0.0.1:9582/src/browser/tests/render/live_session_frame_grandchild.html&amp;quot;&amp;gt;",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        html,
+        "&lt;link rel=&quot;stylesheet&quot; href=&quot;live_session_frame.css&quot;&gt;",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        html,
+        "&amp;lt;link rel=&amp;quot;stylesheet&amp;quot; href=&amp;quot;live_session_frame.css&amp;quot;&amp;gt;",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        html,
+        "&lt;meta name=&quot;referrer&quot; content=&quot;no-referrer&quot;&gt;",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        html,
+        "&amp;lt;meta name=&amp;quot;referrer&amp;quot; content=&amp;quot;no-referrer&amp;quot;&amp;gt;",
+    ) != null);
+    try testing.expect(std.mem.indexOf(u8, html, "unsafe-url") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "content=&quot;origin&quot;") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "<script") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "&lt;script") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "&amp;lt;script") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "frame-src 'self'") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "frame-src http:") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "frame-src https:") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "sandbox=\"allow-scripts\"") == null);
+    try testing.expect(std.mem.count(
+        u8,
+        html,
+        "sandbox=\"allow-same-origin\"",
+    ) >= 2);
+}
+
+test "dump: render snapshot serializes initialized style CSSOM" {
+    var page = try testing.pageTest("render/cssom_style_snapshot.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    var aw: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    try root(frame.document, .{
+        .with_render_csp = true,
+        .strip = .{ .js = true },
+    }, &aw.writer, frame);
+    const html = aw.written();
+
+    try testing.expect(std.mem.indexOf(u8, html, ".deleted") == null);
+    try testing.expect(std.mem.indexOf(u8, html, ".stale") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "@media screen { .media { display: block; } }") != null);
+    try testing.expect(std.mem.indexOf(u8, html, ".kept { color: green; }") != null);
+    try testing.expect(std.mem.indexOf(u8, html, ".replacement::before { content: \"\\3C /STYLE>\"; }") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "@keyframes spin { from { opacity: 0; } to { opacity: 1; } }") != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        html,
+        "<style id=\"raw\" type=\"text/plain\">\n    .raw{content:\"original\";}\n  </style>",
+    ) != null);
+}
+
+test "dump: render snapshot inlines mutated linked CSSOM" {
+    testing.test_session.load_external_stylesheets = true;
+    defer testing.test_session.load_external_stylesheets = false;
+
+    var page = try testing.pageTest("css/external_stylesheet.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    const sheets = try frame.document.getStyleSheets(frame);
+    const sheet = sheets.item(0).?;
+    const rules = try sheet.getCssRules(frame);
+    const style_rule = switch (rules._rules.items[0]._type) {
+        .style => |style| style,
+        else => unreachable,
+    };
+    const style = try style_rule.getStyle(frame);
+    try style.setNamed("display", "block", frame);
+    _ = try sheet.insertRule(".linked-added { color: green; }", null, frame);
+
+    var aw: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    try root(frame.document, .{
+        .with_render_csp = true,
+        .strip = .{ .js = true },
+    }, &aw.writer, frame);
+    const html = aw.written();
+
+    try testing.expect(std.mem.indexOf(u8, html, "<link id=\"ext\"") == null);
+    try testing.expect(std.mem.indexOf(u8, html, ".ext-hide { display: block; }") != null);
+    try testing.expect(std.mem.indexOf(u8, html, ".linked-added { color: green; }") != null);
+
+    sheet.setDisabled(true, frame);
+    var disabled: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    try root(frame.document, .{
+        .with_render_csp = true,
+        .strip = .{ .js = true },
+    }, &disabled.writer, frame);
+    try testing.expect(std.mem.indexOf(u8, disabled.written(), ".linked-added") == null);
+}
+
+test "dump: live form state reflects properties without passwords" {
+    var page = try testing.pageTest("dump_live_form.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    var aw: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    try root(frame.document, .{
+        .strip = .{ .js = true },
+        .live_form_state = true,
+    }, &aw.writer, frame);
+    const html = aw.written();
+
+    try testing.expect(std.mem.indexOf(u8, html, "id=\"text\" value=\"A&amp;B&quot;\"") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "default-secret") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "runtime-secret") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "spoof-file-value") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "<input id=\"file\" type=\"file\">") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "id=\"check\" type=\"checkbox\" checked") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "id=\"check\" type=\"checkbox\" value=\"runtime-check\"") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "id=\"radio\" type=\"radio\" checked value=\"runtime-radio\"") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "id=\"indeterminate\" type=\"checkbox\" value=\"on\" " ++ LIVE_INDETERMINATE_ATTR) != null);
+    try testing.expect(std.mem.indexOf(u8, html, "id=\"not-indeterminate\" type=\"checkbox\" value=\"on\" " ++ LIVE_INDETERMINATE_ATTR) == null);
+    try testing.expect(std.mem.indexOf(u8, html, "<option value=\"a\">A</option>") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "<option value=\"b\" selected>B</option>") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "<select id=\"none\" " ++ LIVE_SELECTED_NONE_ATTR) != null);
+    try testing.expect(std.mem.indexOf(u8, html, "<select id=\"selected-spoof\" " ++ LIVE_SELECTED_NONE_ATTR) == null);
+    try testing.expect(std.mem.indexOf(u8, html, "<option value=\"same\" selected>First</option>") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "<option value=\"same\">Second</option>") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "<textarea id=\"notes\">&lt;new&gt;</textarea>") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "<textarea id=\"leading\">\n\nlead</textarea>") != null);
 }
 
 test "dump: strip.css removes style and stylesheet links" {

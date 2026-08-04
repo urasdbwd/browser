@@ -530,7 +530,7 @@ fn errorLocal(comptime T: type, local: *const Local, info: anytype) Local {
     const instance = TaggedOpaque.fromJS(*T, info.getThis()) catch return local.*;
     const node = protoNode(T, instance);
 
-    const doc: *Document = node.ownerDocument(frame) orelse switch (node._type) {
+    const doc: *Document = node.ownerDocument(frame) orelse switch (node.typed()) {
         .document => |d| d,
         else => return local.*,
     };

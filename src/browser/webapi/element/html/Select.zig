@@ -110,7 +110,7 @@ pub fn effectiveOption(self: *const Select) ?*Option {
         }
         if (first_option == null) first_option = option;
     }
-    return first_option;
+    return if (self._selected_index_set) null else first_option;
 }
 
 pub fn getValue(self: *Select, frame: *Frame) []const u8 {
@@ -123,10 +123,23 @@ pub fn getValue(self: *Select, frame: *Frame) []const u8 {
 pub fn setValue(self: *Select, value: []const u8, frame: *Frame) !void {
     // Find option with matching value and select it
     // Note: This updates the current state (_selected), not the default state (attribute)
-    // Setting value always deselects all others, even for multiple selects
+    // Setting value selects only the first match and deselects all others.
+    const old_index = self.getSelectedIndex();
+    self._selected_index_set = true;
+    var changed = false;
+    var matched = false;
     var it = OptionIterator.init(self);
     while (it.next()) |option| {
-        option._selected = std.mem.eql(u8, option.getValue(frame), value);
+        const selected = !matched and std.mem.eql(u8, option.getValue(frame), value);
+        matched = matched or selected;
+        changed = changed or option._selected != selected;
+        option._selected = selected;
+    }
+    const new_index = self.getSelectedIndex();
+    if (changed) {
+        frame.snapshotChanged();
+    } else if (old_index != new_index) {
+        frame.snapshotChanged();
     }
 }
 
@@ -149,23 +162,32 @@ pub fn getSelectedIndex(self: *Select) i32 {
     return if (has_options) 0 else -1;
 }
 
-pub fn setSelectedIndex(self: *Select, index: i32) !void {
+pub fn setSelectedIndex(self: *Select, index: i32, frame: *Frame) !void {
+    const old_index = self.getSelectedIndex();
+
     // Mark that selectedIndex has been explicitly set
     self._selected_index_set = true;
 
     // Select option at given index
     // Note: This updates the current state (_selected), not the default state (attribute)
-    const is_multiple = self.getMultiple();
+    var changed = false;
     var current_index: i32 = 0;
     var it = OptionIterator.init(self);
     while (it.next()) |option| {
         if (current_index == index) {
+            changed = changed or !option._selected;
             option._selected = true;
-        } else if (!is_multiple) {
-            // Only deselect others if not multiple
+        } else {
+            changed = changed or option._selected;
             option._selected = false;
         }
         current_index += 1;
+    }
+    const new_index = self.getSelectedIndex();
+    if (changed) {
+        frame.snapshotChanged();
+    } else if (old_index != new_index) {
+        frame.snapshotChanged();
     }
 }
 
@@ -434,4 +456,22 @@ test "WebApi: HTML.Select" {
     try testing.htmlRunner("element/html/select.html", .{});
     try testing.htmlRunner("element/html/select-optgroup.html", .{});
     try testing.htmlRunner("element/html/select-validity.html", .{});
+}
+
+test "HTML.Select missing value preserves explicit no-selection state" {
+    var page = try testing.pageTest("dump_live_form.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    const select = frame.document.getElementById("selected-spoof", frame).?.is(Select).?;
+    try testing.expectEqual(@as(i32, 0), select.getSelectedIndex());
+    const snapshot_version = frame._page.snapshot_version;
+
+    try select.setValue("missing", frame);
+    try testing.expectEqual(@as(i32, -1), select.getSelectedIndex());
+    try std.testing.expectEqualStrings("", select.getValue(frame));
+    try testing.expectEqual(snapshot_version + 1, frame._page.snapshot_version);
+
+    try select.setValue("missing", frame);
+    try testing.expectEqual(snapshot_version + 1, frame._page.snapshot_version);
 }

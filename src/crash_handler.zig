@@ -54,7 +54,11 @@ pub noinline fn crash(
                     writer.writeByte('\n') catch abort();
                 }
 
-                std.debug.writeCurrentStackTrace(.{ .first_address = begin_addr }, .{ .writer = writer, .mode = .no_color }) catch abort();
+                // Release binaries are stripped (see the Makefile's post-link
+                // `strip -x`), so there is no debug info to walk. A missing
+                // stack trace must not abort us before report() below runs, or
+                // stripped builds silently lose every crash report.
+                std.debug.writeCurrentStackTrace(.{ .first_address = begin_addr }, .{ .writer = writer, .mode = .no_color }) catch {};
             }
 
             report(reason, begin_addr, args) catch {};

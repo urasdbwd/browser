@@ -54,7 +54,13 @@ _slab: SlabAllocator,
 pub fn init(arena: Allocator) Factory {
     return .{
         ._arena = arena,
-        ._slab = SlabAllocator.init(arena, 128),
+        // Slot cap per chunk. The slab's free-slot bitset is realloc'd on every
+        // chunk (std bit_set resizes to an exact fit) and the old buffer is
+        // dead weight in the arena, so total waste is O(slots^2 / (16 * cap)).
+        // At 128 that was 4.5 MB of dead bitset per 96k-node size class; 8192
+        // makes it negligible in exchange for a bounded per-size-class tail of
+        // unused slots, whose pages are never touched and so never resident.
+        ._slab = SlabAllocator.init(arena, 8192),
     };
 }
 
@@ -70,7 +76,7 @@ pub fn eventTargetWithAllocator(_: *const Factory, allocator: Allocator, child: 
 
     const event_ptr = chain.get(0);
     event_ptr.* = .{
-        ._type = unionInit(EventTarget.Type, chain.get(1)),
+        ._type = typeInit(EventTarget, chain.get(1)),
     };
     chain.setLeaf(1, child);
 
@@ -99,7 +105,7 @@ pub fn uiEvent(_: *const Factory, arena: *lp.Arena, typ: String, child: anytype)
     // Special case: Event has a _type_string field, so we need manual setup
     const event_ptr = chain.get(0);
     event_ptr.* = try eventInit(arena, typ, chain.get(1));
-    chain.setMiddle(1, UIEvent.Type);
+    chain.setMiddle(1);
     chain.setLeaf(2, child);
 
     return chain.get(2);
@@ -113,7 +119,7 @@ pub fn mouseEvent(_: *const Factory, arena: *lp.Arena, typ: String, mouse: Mouse
     // Special case: Event has a _type_string field, so we need manual setup
     const event_ptr = chain.get(0);
     event_ptr.* = try eventInit(arena, typ, chain.get(1));
-    chain.setMiddle(1, UIEvent.Type);
+    chain.setMiddle(1);
 
     // Set MouseEvent with all its fields
     const mouse_ptr = chain.get(2);
@@ -180,31 +186,20 @@ fn PrototypeChain(comptime types: []const type) type {
             ptr.* = value;
         }
 
-        fn setRoot(self: *const Self, comptime T: type) void {
+        fn setRoot(self: *const Self) void {
             const ptr = self.get(0);
-            ptr.* = .{ ._type = unionInit(T, self.get(1)) };
+            ptr.* = .{ ._type = typeInit(types[0], self.get(1)) };
         }
 
-        fn setMiddle(self: *const Self, comptime index: usize, comptime T: type) void {
+        fn setMiddle(self: *const Self, comptime index: usize) void {
             assert(index >= 1);
             assert(index < types.len);
 
             const ptr = self.get(index);
             ptr.* = if (comptime @hasField(types[index], "_proto"))
-                .{ ._proto = undefined, ._type = unionInit(T, self.get(index + 1)) }
+                .{ ._proto = undefined, ._type = typeInit(types[index], self.get(index + 1)) }
             else
-                .{ ._type = unionInit(T, self.get(index + 1)) };
-            setProto(ptr, self.get(index - 1));
-        }
-
-        fn setMiddleWithValue(self: *const Self, comptime index: usize, comptime T: type, value: anytype) void {
-            assert(index >= 1);
-
-            const ptr = self.get(index);
-            ptr.* = if (comptime @hasField(types[index], "_proto"))
-                .{ ._proto = undefined, ._type = unionInit(T, value) }
-            else
-                .{ ._type = unionInit(T, value) };
+                .{ ._type = typeInit(types[index], self.get(index + 1)) };
             setProto(ptr, self.get(index - 1));
         }
 
@@ -223,12 +218,10 @@ fn AutoPrototypeChain(comptime types: []const type) type {
         fn create(allocator: std.mem.Allocator, leaf_value: anytype) !*@TypeOf(leaf_value) {
             const chain = try PrototypeChain(types).allocate(allocator);
 
-            const RootType = types[0];
-            chain.setRoot(RootType.Type);
+            chain.setRoot();
 
             inline for (1..types.len - 1) |i| {
-                const MiddleType = types[i];
-                chain.setMiddle(i, MiddleType.Type);
+                chain.setMiddle(i);
             }
 
             chain.setLeaf(types.len - 1, leaf_value);
@@ -329,8 +322,8 @@ pub fn cdataNode(self: *Factory, cd: Node.CData, leaf: anytype) !*Node.CData {
     comptime assert(types[0] == EventTarget and types[1] == Node and types[2] == Node.CData);
 
     const chain = try PrototypeChain(types).allocate(self._slab.allocator());
-    chain.setRoot(EventTarget.Type);
-    chain.setMiddle(1, Node.Type);
+    chain.setRoot();
+    chain.setMiddle(1);
 
     const cd_ptr = chain.get(2);
     cd_ptr.* = cd;
@@ -482,7 +475,7 @@ pub fn svgElement(self: *Factory, tag_name: []const u8, child: anytype) !*@TypeO
     const types = comptime svgPrototypeTypes(@TypeOf(child));
     const chain = try PrototypeChain(types).allocate(self._slab.allocator());
 
-    chain.setRoot(EventTarget.Type);
+    chain.setRoot();
     inline for (1..types.len - 1) |i| {
         const T = types[i];
         if (T == Element.Svg) {
@@ -493,7 +486,7 @@ pub fn svgElement(self: *Factory, tag_name: []const u8, child: anytype) !*@TypeO
             };
             setProto(svg_ptr, chain.get(i - 1));
         } else {
-            chain.setMiddle(i, T.Type);
+            chain.setMiddle(i);
         }
     }
     chain.setLeaf(types.len - 1, child);
@@ -592,6 +585,46 @@ pub fn create(self: *Factory, value: anytype) !*@TypeOf(value) {
     const ptr = try self.createT(@TypeOf(value));
     ptr.* = value;
     return ptr;
+}
+
+// The chain is contiguous, so a member's successor always sits at a fixed
+// offset from it. Types whose `_type` is a bare tag (rather than a tagged
+// union) use this to resolve the payload instead of storing a pointer.
+pub fn childOf(value: anytype, comptime T: type) *T {
+    const S = reflect.Struct(@TypeOf(value));
+    comptime assert(reflect.Proto(T).? == S);
+
+    const child: *T = @ptrFromInt(@intFromPtr(value) + comptime protoOffset(T));
+    if (comptime IS_DEBUG) {
+        // protoOf does its own canary check, so this asserts both directions
+        assert(@intFromPtr(protoOf(child)) == @intFromPtr(value));
+    }
+    return child;
+}
+
+// Rebuilds the tagged-union view of a bare `_type` tag. See `childOf`.
+pub fn typedOf(value: anytype) reflect.Struct(@TypeOf(value)).Typed {
+    const Typed = reflect.Struct(@TypeOf(value)).Typed;
+    switch (value._type) {
+        inline else => |tag| {
+            const name = @tagName(tag);
+            const F = @FieldType(Typed, name);
+            if (comptime F == void) {
+                return @unionInit(Typed, name, {});
+            }
+            return @unionInit(Typed, name, childOf(@constCast(value), reflect.Struct(F)));
+        },
+    }
+}
+
+// The `_type` value for a chain member pointing at `value`. Handles both the
+// tagged-union and the bare-tag (see `typedOf`) representation.
+fn typeInit(comptime S: type, value: anytype) @FieldType(S, "_type") {
+    const F = @FieldType(S, "_type");
+    if (comptime @typeInfo(F) == .@"enum") {
+        return @field(F, unionFieldName(S.Typed, @TypeOf(value)));
+    }
+    return unionInit(F, value);
 }
 
 fn unionInit(comptime T: type, value: anytype) T {

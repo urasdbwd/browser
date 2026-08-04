@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+
+<script id=iframe_remove_retires_context type=module>
+{
+  const state = await testing.async();
+  window.__removedFrameTicks = 0;
+
+  const iframe = document.createElement('iframe');
+  document.body.appendChild(iframe);
+  const cachedWindow = iframe.contentWindow;
+  iframe.contentDocument.write(
+    '<script>setInterval(() => parent.__removedFrameTicks++, 1);<\/script>',
+  );
+  iframe.contentDocument.close();
+
+  setTimeout(() => {
+    const before = window.__removedFrameTicks;
+    iframe.remove();
+    const settled = window.__removedFrameTicks;
+
+    setTimeout(() => {
+      const wrapper = document.createElement('div');
+      const nested = document.createElement('iframe');
+      wrapper.appendChild(nested);
+      document.body.appendChild(wrapper);
+      wrapper.remove();
+
+      const shadowHost = document.createElement('div');
+      const shadowIframe = document.createElement('iframe');
+      shadowHost.attachShadow({mode: 'open'}).appendChild(shadowIframe);
+      document.body.appendChild(shadowHost);
+      shadowHost.remove();
+
+      const selfRemoving = document.createElement('iframe');
+      document.body.appendChild(selfRemoving);
+      const selfRemovingDocument = selfRemoving.contentDocument;
+      selfRemovingDocument.write(
+        '<script>frameElement.remove();<\/script>',
+      );
+      selfRemovingDocument.close();
+
+      const reinserted = document.createElement('iframe');
+      document.body.appendChild(reinserted);
+      const firstWindow = reinserted.contentWindow;
+      reinserted.remove();
+      document.body.appendChild(reinserted);
+      const reinsertedHasFreshWindow =
+        firstWindow !== reinserted.contentWindow;
+      reinserted.remove();
+
+      state.resolve({
+        before,
+        settled,
+        after: window.__removedFrameTicks,
+        contentWindow: iframe.contentWindow,
+        contentDocument: iframe.contentDocument,
+        cachedTop: cachedWindow.top,
+        cachedParent: cachedWindow.parent,
+        cachedFrameElement: cachedWindow.frameElement,
+        nestedContentWindow: nested.contentWindow,
+        shadowContentWindow: shadowIframe.contentWindow,
+        selfRemovedWindow: selfRemoving.contentWindow,
+        reinsertedHasFreshWindow,
+      });
+    }, 20);
+  }, 15);
+
+  await state.done((value) => {
+    testing.expectTrue(value.before > 0);
+    testing.expectEqual(value.settled, value.after);
+    testing.expectEqual(null, value.contentWindow);
+    testing.expectEqual(null, value.contentDocument);
+    testing.expectEqual(null, value.cachedTop);
+    testing.expectEqual(null, value.cachedParent);
+    testing.expectEqual(null, value.cachedFrameElement);
+    testing.expectEqual(null, value.nestedContentWindow);
+    testing.expectEqual(null, value.shadowContentWindow);
+    testing.expectEqual(null, value.selfRemovedWindow);
+    testing.expectTrue(value.reinsertedHasFreshWindow);
+  });
+}
+</script>
+
+<script id=iframe_self_remove_stops_current_interval type=module>
+{
+  const state = await testing.async();
+  window.__selfRemovingFrameTicks = 0;
+
+  const iframe = document.createElement('iframe');
+  document.body.appendChild(iframe);
+  iframe.contentDocument.write(
+    '<script>setInterval(() => { parent.__selfRemovingFrameTicks++; frameElement.remove(); }, 1);<\/script>',
+  );
+  iframe.contentDocument.close();
+
+  setTimeout(() => {
+    state.resolve({
+      contentWindow: iframe.contentWindow,
+      ticks: window.__selfRemovingFrameTicks,
+    });
+  }, 20);
+
+  await state.done((value) => {
+    testing.expectEqual(null, value.contentWindow);
+    testing.expectEqual(1, value.ticks);
+  });
+}
+</script>
+
+<script id=connected_iframe_src_attribute_navigates type=module>
+{
+  const state = await testing.async();
+  const iframe = document.createElement('iframe');
+  const nextLoad = () => new Promise((resolve) => {
+    iframe.onload = resolve;
+  });
+
+  let loaded = nextLoad();
+  document.body.appendChild(iframe);
+  await loaded;
+
+  loaded = nextLoad();
+  iframe.setAttribute('src', 'support/page.html');
+  await loaded;
+  const text = iframe.contentDocument.body.textContent.trim();
+
+  loaded = nextLoad();
+  iframe.removeAttribute('src');
+  await loaded;
+  state.resolve({
+    text,
+    src: iframe.getAttribute('src'),
+    href: iframe.contentWindow.location.href,
+  });
+
+  await state.done((value) => {
+    testing.expectEqual('a-page', value.text);
+    testing.expectEqual(null, value.src);
+    testing.expectEqual('about:blank', value.href);
+  });
+}
+</script>
+
+<script id=iframe_navigation_retires_descendant_contexts type=module>
+{
+  const state = await testing.async();
+  const outer = document.createElement('iframe');
+  const nextOuterLoad = () => new Promise((resolve) => {
+    outer.onload = resolve;
+  });
+
+  let loaded = nextOuterLoad();
+  document.body.appendChild(outer);
+  await loaded;
+
+  const nested = outer.contentDocument.createElement('iframe');
+  outer.contentDocument.body.appendChild(nested);
+
+  window.__nestedFrameTicks = 0;
+  const cachedNestedWindow = nested.contentWindow;
+  nested.contentDocument.write(
+    '<script>setInterval(() => top.__nestedFrameTicks++, 1);<\/script>',
+  );
+  nested.contentDocument.close();
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  const started = window.__nestedFrameTicks > 0;
+
+  loaded = nextOuterLoad();
+  outer.src = 'support/page.html';
+  await loaded;
+  const settled = window.__nestedFrameTicks;
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  state.resolve({
+    started,
+    settled,
+    after: window.__nestedFrameTicks,
+    top: cachedNestedWindow.top,
+    parent: cachedNestedWindow.parent,
+    frameElement: cachedNestedWindow.frameElement,
+  });
+
+  await state.done((value) => {
+    testing.expectTrue(value.started);
+    testing.expectEqual(value.settled, value.after);
+    testing.expectEqual(null, value.top);
+    testing.expectEqual(null, value.parent);
+    testing.expectEqual(null, value.frameElement);
+  });
+}
+</script>

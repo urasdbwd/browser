@@ -18,7 +18,12 @@ const ResponseBuffer = @This();
 out: std.Io.Writer.Allocating,
 writer: std.Io.Writer = .{ .buffer = &.{}, .vtable = &vtable },
 limit: usize,
-failed: bool = false,
+failure: ?Failure = null,
+
+pub const Failure = enum {
+    limit,
+    out_of_memory,
+};
 
 const vtable: std.Io.Writer.VTable = .{
     .drain = drain,
@@ -45,36 +50,43 @@ pub fn reset(self: *ResponseBuffer, retained_bytes: usize) void {
         self.out.deinit();
         self.out = .init(allocator);
     }
-    self.failed = false;
+    self.failure = null;
     self.writer.end = 0;
 }
 
 fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
     const self: *ResponseBuffer = @alignCast(@fieldParentPtr("writer", writer));
-    if (self.failed) return error.WriteFailed;
+    if (self.failure != null) return error.WriteFailed;
 
     var additional: usize = 0;
     for (data[0 .. data.len - 1]) |bytes| {
-        additional = std.math.add(usize, additional, bytes.len) catch return self.fail();
+        additional = std.math.add(usize, additional, bytes.len) catch
+            return self.fail(.limit);
     }
-    const splat_bytes = std.math.mul(usize, data[data.len - 1].len, splat) catch return self.fail();
-    additional = std.math.add(usize, additional, splat_bytes) catch return self.fail();
+    const splat_bytes = std.math.mul(usize, data[data.len - 1].len, splat) catch
+        return self.fail(.limit);
+    additional = std.math.add(usize, additional, splat_bytes) catch
+        return self.fail(.limit);
 
     const current = self.out.writer.end;
-    if (additional > self.limit or current > self.limit - additional) return self.fail();
+    if (additional > self.limit or current > self.limit - additional) {
+        return self.fail(.limit);
+    }
     const needed = current + additional;
     if (self.out.writer.buffer.len < needed) {
         const capacity = @min(std.ArrayList(u8).growCapacity(needed), self.limit);
-        self.out.ensureTotalCapacityPrecise(capacity) catch return self.fail();
+        self.out.ensureTotalCapacityPrecise(capacity) catch
+            return self.fail(.out_of_memory);
     }
 
-    return self.out.writer.writeSplat(data, splat) catch return self.fail();
+    return self.out.writer.writeSplat(data, splat) catch
+        return self.fail(.out_of_memory);
 }
 
 fn flush(_: *std.Io.Writer) std.Io.Writer.Error!void {}
 
-fn fail(self: *ResponseBuffer) error{WriteFailed} {
-    self.failed = true;
+fn fail(self: *ResponseBuffer, failure: Failure) error{WriteFailed} {
+    self.failure = failure;
     return error.WriteFailed;
 }
 
@@ -84,15 +96,26 @@ test "ResponseBuffer: limit failure is transactional" {
 
     try out.writer.writeAll("1234567890");
     try std.testing.expectError(error.WriteFailed, out.writer.writeAll("1234567"));
-    try std.testing.expect(out.failed);
+    try std.testing.expectEqual(Failure.limit, out.failure.?);
     try std.testing.expectEqualStrings("1234567890", out.buffered());
     try std.testing.expect(out.out.writer.buffer.len <= 16);
 
     out.reset(16);
-    try std.testing.expect(!out.failed);
+    try std.testing.expectEqual(null, out.failure);
     try std.testing.expectEqualStrings("", out.buffered());
     try out.writer.writeAll("ok");
     try std.testing.expectEqualStrings("ok", out.buffered());
+}
+
+test "ResponseBuffer: allocation failure is distinct from the size limit" {
+    var tracked = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    tracked.fail_index = tracked.alloc_index;
+    var out: ResponseBuffer = .init(tracked.allocator(), 16);
+    defer out.deinit();
+
+    try std.testing.expectError(error.WriteFailed, out.writer.writeAll("x"));
+    try std.testing.expectEqual(Failure.out_of_memory, out.failure.?);
+    try std.testing.expectEqualStrings("", out.buffered());
 }
 
 test "ResponseBuffer: reset releases oversized retained capacity" {

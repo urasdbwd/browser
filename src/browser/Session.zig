@@ -171,7 +171,7 @@ pub fn init(self: *Session, browser: *Browser, notification: *Notification) !voi
         EventTarget{ ._type = undefined },
         Navigation{ ._proto = undefined },
     });
-    navigation._proto._type = .{ .navigation = navigation };
+    navigation._proto._type = .navigation;
 
     self.* = .{
         .arena = arena,
@@ -591,6 +591,9 @@ fn processPageQueuedNavigation(self: *Session, page: *Page) !void {
 
     // First pass: process async navigations (non-about:blank)
     for (navigations.items) |frame| {
+        if (frame._retired) {
+            continue;
+        }
         const qn = frame._queued_navigation orelse {
             // Was previously an assert; downgraded so prod can recover, but
             // kept at warn so the invariant violation isn't silently lost.
@@ -618,6 +621,9 @@ fn processPageQueuedNavigation(self: *Session, page: *Page) !void {
     // rest of the queue (the `defer clearRetainingCapacity` would wipe
     // siblings whose _queued_navigation stays set).
     for (about_blank_queue.items) |frame| {
+        if (frame._retired) {
+            continue;
+        }
         const qn = frame._queued_navigation orelse {
             // Was previously an assert; downgraded so prod can recover, but
             // kept at warn so the invariant violation isn't silently lost.
@@ -636,6 +642,10 @@ fn processPageQueuedNavigation(self: *Session, page: *Page) !void {
     var i: usize = 0;
     while (i < new_navigations.items.len) {
         const frame = new_navigations.items[i];
+        if (frame._retired) {
+            _ = page.queued_navigation.swapRemove(i);
+            continue;
+        }
         if (frame._queued_navigation) |qn| {
             if (qn.is_about_blank) {
                 log.warn(.frame, "recursive about blank", .{});
@@ -650,6 +660,10 @@ fn processPageQueuedNavigation(self: *Session, page: *Page) !void {
 fn processFrameNavigation(self: *Session, frame: *Frame, qn: *QueuedNavigation) !void {
     frame._queued_navigation = null;
     defer qn.arena.release();
+
+    if (frame._retired) {
+        return;
+    }
 
     // A popup whose window was close()'d is parked in page.closed_frames and
     // torn down at Page.deinit. It must never be navigated. This navigation
@@ -694,6 +708,7 @@ fn _processFrameNavigation(self: *Session, frame: *Frame, qn: *QueuedNavigation)
     const frame_id = frame._frame_id;
     const reuse_window = frame.window;
     const page = frame._page;
+    frame.retireDescendantFrames();
     frame.js.detachGlobal();
     frame.deinit();
     frame.* = undefined;
@@ -814,6 +829,17 @@ fn replaceRootImmediate(self: *Session, frame_id: u32, url: [:0]const u8, opts: 
         log.err(.browser, "synthetic navigation error", .{ .err = err, .url = url });
         return err;
     };
+}
+
+/// Start a root navigation, reusing a not-yet-loaded frame when possible.
+/// Callers should use this instead of reaching into a page's JavaScript
+/// Navigation object, which may already have been detached during a commit.
+pub fn navigateRoot(self: *Session, frame_id: u32, url: [:0]const u8, opts: Frame.NavigateOpts) !void {
+    const frame = &(self.livePage(frame_id) orelse return error.FrameNotLoaded).frame;
+    if (frame._load_state == .waiting) {
+        return frame.navigate(url, opts);
+    }
+    return self.initiateRootNavigation(frame_id, url, opts);
 }
 
 // Real HTTP root navigation: allocate a pending Page, leave the active Page

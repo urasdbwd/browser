@@ -66,6 +66,14 @@ pub fn build(b: *Build) !void {
     opts.addOption(bool, "wpt_extensions", wpt_extensions);
     opts.addOption(bool, "low_resource_default", low_resource_default);
 
+    // Release binaries ship ~17MB of local symbols that nothing reads, but
+    // -fstrip segfaults the Zig 0.16 compiler on the snapshot_creator, so the
+    // Makefile runs `strip -x` post-link instead. ReleaseSafe keeps its
+    // symbols either way so panic stack traces stay useful.
+    // ponytail: drop the Makefile step and set .strip here once the compiler
+    // crash is fixed upstream.
+    const strip = false;
+
     const enable_tsan = b.option(bool, "tsan", "Enable Thread Sanitizer") orelse false;
     const enable_asan = b.option(bool, "asan", "Enable Address Sanitizer") orelse false;
     const enable_csan = b.option(std.zig.SanitizeC, "csan", "Enable C Sanitizers");
@@ -77,6 +85,7 @@ pub fn build(b: *Build) !void {
             .optimize = optimize,
             .link_libc = true,
             .link_libcpp = true,
+            .strip = strip,
             .sanitize_c = enable_csan,
             .sanitize_thread = enable_tsan,
         });
@@ -128,6 +137,7 @@ pub fn build(b: *Build) !void {
                 .root_source_file = b.path("src/main.zig"),
                 .target = target,
                 .optimize = optimize,
+                .strip = strip,
                 .sanitize_c = enable_csan,
                 .sanitize_thread = enable_tsan,
                 .imports = &.{

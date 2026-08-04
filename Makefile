@@ -81,7 +81,7 @@ help:
 
 # $(ZIG) commands
 # ------------
-.PHONY: build build-pi build-v8-snapshot build-dev download-v8 run run-release test bench data end2end clean
+.PHONY: build build-pi build-v8-snapshot build-dev download-v8 run run-release test test-client bench data end2end clean
 
 ## Download the prebuilt V8 archive (skips the 10+ min source build)
 download-v8:
@@ -103,7 +103,8 @@ build-v8-snapshot:
 build: build-v8-snapshot
 	@printf "\033[36mBuilding (release fast)...\033[0m\n"
 	@$(ZIG) build $(ZIGFLAGS) -Doptimize=ReleaseFast -Dsnapshot_path=../../snapshot.bin || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
-	@printf "\033[33mBuild OK\033[0m\n"
+	@strip -x zig-out/bin/lightpanda
+	@printf "\033[33mBuild OK: %s bytes\033[0m\n" "$$(wc -c < zig-out/bin/lightpanda | tr -d ' ')"
 
 ## Build a low-RAM binary for Raspberry Pi (native aarch64/arm Linux)
 build-pi: download-v8
@@ -129,8 +130,14 @@ run-debug: build-dev
 	@printf "\033[36mRunning...\033[0m\n"
 	@./zig-out/bin/lightpanda || (printf "\033[33mRun ERROR\033[0m\n"; exit 1;)
 
-test:
+test: test-client
 	TEST_FILTER="${F}" $(ZIG) build $(ZIGFLAGS) test -freference-trace
+
+## Run the render client's JS tests (node --test); skipped when node is absent
+test-client:
+	@command -v node >/dev/null 2>&1 \
+		&& node --test src/render/client.test.mjs \
+		|| printf "\033[33mnode not found: skipping src/render/client.test.mjs\033[0m\n"
 
 ## Run demo/runner end to end tests
 end2end:

@@ -83,7 +83,9 @@ pub const Namespace = enum(u8) {
             .svg => "http://www.w3.org/2000/svg",
             .mathml => "http://www.w3.org/1998/Math/MathML",
             .xml => "http://www.w3.org/XML/1998/namespace",
-            .unknown => "http://lightpanda.io/unsupported/namespace",
+            // The original namespace string isn't retained; report a neutral
+            // placeholder rather than a branded URI that identifies the engine.
+            .unknown => "about:invalid",
             .null => null,
         };
     }
@@ -116,14 +118,25 @@ _attributes: Attribute.List = .{},
 // work to resolve the proto).
 _proto_canary: if (IS_DEBUG) *Node else void = undefined,
 
-pub const Type = union(enum) {
+pub const Type = enum(u8) {
+    html,
+    svg,
+};
+
+// `_type` only stores the tag: the payload is the next member of the
+// (contiguous) factory chain, resolved by Factory.typedOf.
+pub const Typed = union(Type) {
     html: *Html,
     svg: *Svg,
 };
 
+pub fn typed(self: *const Element) Typed {
+    return Factory.typedOf(self);
+}
+
 pub fn is(self: *Element, comptime T: type) ?*T {
     const type_name = @typeName(T);
-    switch (self._type) {
+    switch (self.typed()) {
         .html => |el| {
             if (T == Html) {
                 return el;
@@ -178,13 +191,13 @@ pub fn isEqualNode(self: *Element, other: *Element) bool {
 }
 
 pub fn getTagNameLower(self: *const Element) []const u8 {
-    switch (self._type) {
-        .html => |he| switch (he._type) {
+    switch (self.typed()) {
+        .html => |he| switch (he.typed()) {
             .custom => |ce| {
                 @branchHint(.unlikely);
                 return ce._tag_name.str();
             },
-            else => return switch (he._type) {
+            else => return switch (he.typed()) {
                 .anchor => "a",
                 .area => "area",
                 .base => "base",
@@ -264,8 +277,8 @@ pub fn getTagNameLower(self: *const Element) []const u8 {
 }
 
 pub fn getTagNameSpec(self: *const Element, buf: []u8) []const u8 {
-    return switch (self._type) {
-        .html => |he| switch (he._type) {
+    return switch (self.typed()) {
+        .html => |he| switch (he.typed()) {
             .anchor => "A",
             .area => "AREA",
             .base => "BASE",
@@ -347,7 +360,7 @@ pub fn getTagNameSpec(self: *const Element, buf: []u8) []const u8 {
 }
 
 pub fn getTagNameDump(self: *const Element) []const u8 {
-    switch (self._type) {
+    switch (self.typed()) {
         .html => return self.getTagNameLower(),
         .svg => |svg| return svg._tag_name.str(),
     }
@@ -814,6 +827,7 @@ pub fn attachShadow(self: *Element, opts: ShadowRoot.AttachOptions, frame: *Fram
 
     const shadow_root = try ShadowRoot.init(self, opts, frame);
     try frame._element_shadow_roots.put(frame.arena, self, shadow_root);
+    frame.domChanged();
     return shadow_root;
 }
 
@@ -1916,8 +1930,8 @@ fn upperTagName(tag_name: *String, buf: []u8) []const u8 {
 }
 
 pub fn getTag(self: *const Element) Tag {
-    return switch (self._type) {
-        .html => |he| switch (he._type) {
+    return switch (self.typed()) {
+        .html => |he| switch (he.typed()) {
             .anchor => .anchor,
             .area => .area,
             .base => .base,
@@ -2354,13 +2368,13 @@ pub const Build = struct {
     // Calls `func_name` with `args` on the most specific type where it is
     // implement. This could be on the Element itself.
     pub fn call(self: *const Element, comptime func_name: []const u8, args: anytype) !bool {
-        inline for (@typeInfo(Element.Type).@"union".fields) |f| {
+        inline for (@typeInfo(Element.Typed).@"union".fields) |f| {
             if (@field(Element.Type, f.name) == self._type) {
                 // The inner type implements this function. Call it and we're done.
                 const S = reflect.Struct(f.type);
                 if (@hasDecl(S, "Build")) {
                     if (@hasDecl(S.Build, "call")) {
-                        const sub = @field(self._type, f.name);
+                        const sub = Factory.childOf(@constCast(self), S);
                         return S.Build.call(sub, func_name, args);
                     }
 

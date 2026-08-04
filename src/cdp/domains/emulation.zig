@@ -158,13 +158,8 @@ pub fn setUserAgentOverride(cmd: *CDP.Command) !void {
     Config.validateUserAgent(ua) catch |err| switch (err) {
         error.NonPrintable => return cmd.sendError(-32602, "User agent contains non-printable characters", .{}),
         error.Reserved => {
-            // Stealth mode intentionally uses a Chrome Mozilla/* UA. Allow it
-            // when the process was started with --stealth; otherwise keep the
-            // historical no-impersonation policy (ignore + success).
-            if (!cmd.cdp.browser.app.config.stealth()) {
-                log.warn(.not_implemented, "Emulation.setUserAgentOverride", .{ .param = "userAgent", .value = ua, .info = "User agent must not contain Mozilla (use --stealth)" });
-                return cmd.sendResult(null, .{});
-            }
+            log.warn(.not_implemented, "Emulation.setUserAgentOverride", .{ .param = "userAgent", .value = ua, .info = "User agent must not contain Mozilla" });
+            return cmd.sendResult(null, .{});
         },
     };
 

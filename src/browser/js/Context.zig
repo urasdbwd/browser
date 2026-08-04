@@ -85,6 +85,10 @@ microtask_queue: *v8.MicrotaskQueue,
 // from this, and we can free it when the context is done.
 handle: v8.Global,
 
+// Captured before page code runs so FrozenArray accessors do not trust a
+// replaceable global Object.freeze property.
+object_freeze: v8.Global,
+
 cpu_profiler: ?*v8.CpuProfiler = null,
 
 heap_profiler: ?*v8.HeapProfiler = null,
@@ -148,6 +152,11 @@ script_manager: *ScriptManagerBase,
 // Our macrotasks
 scheduler: Scheduler,
 
+// False once the owning browsing context has been discarded. The Context is
+// kept alive until its Page is torn down so cached WindowProxy references do
+// not point through freed native state, but it must no longer run tasks.
+active: bool = true,
+
 // Execution context for worker-compatible APIs. This provides a common
 // interface that works in both Page and Worker contexts.
 execution: Execution,
@@ -210,6 +219,7 @@ pub fn deinit(self: *Context) void {
     // Unlink any IndexedDB gate participants first: the session-scoped engine
     // must never wake a waiter into this scheduler once it's torn down.
     self.page.session.idb.detachContext(self);
+    self.deactivate();
 
     var hs: js.HandleScope = undefined;
     const entered = self.enter(&hs);
@@ -229,12 +239,32 @@ pub fn deinit(self: *Context) void {
     // have a dangling pointer to our freed Context struct.
     v8.v8__Context__SetAlignedPointerInEmbedderData(entered.handle, 1, null);
 
+    v8.v8__Global__Reset(&self.object_freeze);
     v8.v8__Global__Reset(&self.handle);
     env.isolate.notifyContextDisposed();
     // There can be other tasks associated with this context that we need to
     // purge while the context is still alive.
     _ = env.pumpMessageLoop();
     v8.v8__MicrotaskQueue__DELETE(self.microtask_queue);
+}
+
+pub fn deactivate(self: *Context) void {
+    if (self.active == false) {
+        return;
+    }
+    self.active = false;
+
+    const active_contexts = &self.env.active_contexts;
+    for (active_contexts.items, 0..) |ctx, i| {
+        if (ctx == self) {
+            _ = active_contexts.orderedRemove(i);
+            break;
+        }
+    } else if (comptime IS_DEBUG) {
+        @panic("Tried to deactivate unknown context");
+    }
+
+    self.scheduler.shutdown();
 }
 
 // The global (e.g. Window) can be reused across contexts. If you do:

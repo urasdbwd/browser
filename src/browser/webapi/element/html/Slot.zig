@@ -126,13 +126,27 @@ pub fn assign(self: *Slot, values: []const js.Value, frame: *Frame) !void {
         entry.* = node;
     }
 
+    var affected_roots: std.ArrayList(*Node) = .empty;
+    try appendManualRoot(&affected_roots, self, frame);
+    for (nodes) |node| {
+        const other = frame._manual_slot_assignments.get(node) orelse continue;
+        if (other != self) try appendManualRoot(&affected_roots, other, frame);
+    }
+
+    // Nothing below this point may fail: assign() moves nodes between slots, so
+    // an allocation error after the first removal would split the lookup map
+    // from the per-slot ordered sets.
+    try self._manually_assigned.ensureTotalCapacity(frame.arena, nodes.len);
+    const additional = std.math.cast(u32, nodes.len) orelse return error.OutOfMemory;
+    try frame._manual_slot_assignments.ensureUnusedCapacity(frame.arena, additional);
+
     for (self._manually_assigned.items) |node| {
         _ = frame._manual_slot_assignments.remove(node);
     }
     self._manually_assigned.clearRetainingCapacity();
 
     for (nodes) |node| {
-        const gop = try frame._manual_slot_assignments.getOrPut(frame.arena, node);
+        const gop = frame._manual_slot_assignments.getOrPutAssumeCapacity(node);
         if (gop.found_existing) {
             const other = gop.value_ptr.*;
             if (other == self) {
@@ -148,12 +162,27 @@ pub fn assign(self: *Slot, values: []const js.Value, frame: *Frame) !void {
             }
         }
         gop.value_ptr.* = self;
-        try self._manually_assigned.append(frame.arena, node);
+        self._manually_assigned.appendAssumeCapacity(node);
     }
 
-    const root = self.asNode().getRootNode(.{});
-    if (root.is(ShadowRoot) != null) {
+    var connected_changed = false;
+    for (affected_roots.items) |root| {
         slotting.assignSlottablesForTree(root, frame);
+        connected_changed = connected_changed or root.isConnected();
+    }
+    if (connected_changed) frame.domChanged();
+}
+
+fn appendManualRoot(
+    roots: *std.ArrayList(*Node),
+    slot: *Slot,
+    frame: *Frame,
+) !void {
+    const root = slot.asNode().getRootNode(.{});
+    const shadow_root = root.is(ShadowRoot) orelse return;
+    if (shadow_root._slot_assignment != .manual) return;
+    if (std.mem.indexOfScalar(*Node, roots.items, root) == null) {
+        try roots.append(frame.call_arena, root);
     }
 }
 

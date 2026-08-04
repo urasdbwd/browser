@@ -45,12 +45,60 @@ pub fn asCSSStyleDeclaration(self: *CSSStyleProperties) *CSSStyleDeclaration {
     return self._proto;
 }
 
+fn ruleCssText(self: *CSSStyleProperties, frame: *Frame) !?[]const u8 {
+    if (self._proto._element != null or self._proto._is_computed) return null;
+    return try self._proto.getCssText(frame);
+}
+
+fn ruleStyleChanged(self: *CSSStyleProperties, before: ?[]const u8, frame: *Frame) !void {
+    const previous = before orelse return;
+    const current = try self._proto.getCssText(frame);
+    if (std.mem.eql(u8, previous, current)) return;
+    frame._style_manager.sheetModified();
+    frame.snapshotChanged();
+}
+
 pub fn setNamed(self: *CSSStyleProperties, name: []const u8, value: []const u8, frame: *Frame) !void {
     if (method_names.has(name)) {
         return error.NotHandled;
     }
+    const before = try self.ruleCssText(frame);
     const dash_case = camelCaseToDashCase(name, &frame.buf);
     try self._proto.setProperty(dash_case, value, null, frame);
+    try self.ruleStyleChanged(before, frame);
+}
+
+pub fn getCssText(self: *const CSSStyleProperties, frame: *Frame) ![]const u8 {
+    return self._proto.getCssText(frame);
+}
+
+pub fn setCssText(self: *CSSStyleProperties, text: []const u8, frame: *Frame) !void {
+    const before = try self.ruleCssText(frame);
+    try self._proto.setCssText(text, frame);
+    try self.ruleStyleChanged(before, frame);
+}
+
+pub fn setProperty(self: *CSSStyleProperties, property_name: []const u8, value: []const u8, priority: ?[]const u8, frame: *Frame) !void {
+    const before = try self.ruleCssText(frame);
+    try self._proto.setProperty(property_name, value, priority, frame);
+    try self.ruleStyleChanged(before, frame);
+}
+
+pub fn removeProperty(self: *CSSStyleProperties, property_name: []const u8, frame: *Frame) ![]const u8 {
+    const before = try self.ruleCssText(frame);
+    const removed = try self._proto.removeProperty(property_name, frame);
+    try self.ruleStyleChanged(before, frame);
+    return removed;
+}
+
+pub fn getFloat(self: *const CSSStyleProperties, frame: *Frame) []const u8 {
+    return self._proto.getFloat(frame);
+}
+
+pub fn setFloat(self: *CSSStyleProperties, value: ?[]const u8, frame: *Frame) !void {
+    const before = try self.ruleCssText(frame);
+    try self._proto.setFloat(value, frame);
+    try self.ruleStyleChanged(before, frame);
 }
 
 pub fn getNamed(self: *CSSStyleProperties, name: []const u8, frame: *Frame) ![]const u8 {
@@ -263,7 +311,6 @@ fn isKnownCSSProperty(dash_case: []const u8) bool {
         .{ "transition-timing-function", {} },
         .{ "transition-delay", {} },
         .{ "animation", {} },
-        .{ "animation-name", {} },
         .{ "animation-duration", {} },
         .{ "animation-timing-function", {} },
         .{ "animation-delay", {} },
@@ -406,4 +453,8 @@ pub const JsApi = struct {
     };
 
     pub const @"[]" = bridge.namedIndexed(CSSStyleProperties.getNamed, CSSStyleProperties.setNamed, null, null, null, .{});
+    pub const cssText = bridge.accessor(CSSStyleProperties.getCssText, CSSStyleProperties.setCssText, .{});
+    pub const setProperty = bridge.function(CSSStyleProperties.setProperty, .{});
+    pub const removeProperty = bridge.function(CSSStyleProperties.removeProperty, .{});
+    pub const cssFloat = bridge.accessor(CSSStyleProperties.getFloat, CSSStyleProperties.setFloat, .{});
 };

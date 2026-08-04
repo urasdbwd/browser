@@ -172,14 +172,20 @@ pub fn getMetaKey(self: *const MouseEvent) bool {
     return self._meta_key;
 }
 
-pub fn getPageX(self: *const MouseEvent) f64 {
-    // this should be clientX + window.scrollX
-    return self._client_x;
+pub fn getMovement(_: *const MouseEvent) f64 {
+    // Live/render clicks do not currently stream pointer history, so there is
+    // no previous coordinate from which to derive a delta.
+    return 0;
 }
 
-pub fn getPageY(self: *const MouseEvent) f64 {
-    // this should be clientY + window.scrollY
-    return self._client_y;
+pub fn getPageX(self: *const MouseEvent, frame: *Frame) f64 {
+    if (!self._proto._proto._is_trusted) return self._client_x;
+    return self._client_x + @as(f64, @floatFromInt(frame.window.getScrollX()));
+}
+
+pub fn getPageY(self: *const MouseEvent, frame: *Frame) f64 {
+    if (!self._proto._proto._is_trusted) return self._client_y;
+    return self._client_y + @as(f64, @floatFromInt(frame.window.getScrollY()));
 }
 
 pub fn getRelatedTarget(self: *const MouseEvent) ?*EventTarget {
@@ -274,7 +280,10 @@ pub const JsApi = struct {
     pub const clientX = bridge.accessor(getClientX, null, .{});
     pub const clientY = bridge.accessor(getClientY, null, .{});
     pub const ctrlKey = bridge.accessor(getCtrlKey, null, .{});
+    pub const fromElement = bridge.accessor(getRelatedTarget, null, .{});
     pub const metaKey = bridge.accessor(getMetaKey, null, .{});
+    pub const movementX = bridge.accessor(getMovement, null, .{});
+    pub const movementY = bridge.accessor(getMovement, null, .{});
     pub const offsetX = bridge.property(0.0, .{ .template = false });
     pub const offsetY = bridge.property(0.0, .{ .template = false });
     pub const pageX = bridge.accessor(getPageX, null, .{});
@@ -283,6 +292,7 @@ pub const JsApi = struct {
     pub const screenX = bridge.accessor(getScreenX, null, .{});
     pub const screenY = bridge.accessor(getScreenY, null, .{});
     pub const shiftKey = bridge.accessor(getShiftKey, null, .{});
+    pub const toElement = bridge.accessor(getRelatedTarget, null, .{});
     pub const layerX = bridge.accessor(getLayerX, null, .{});
     pub const layerY = bridge.accessor(getLayerY, null, .{});
     pub const x = bridge.accessor(getClientX, null, .{});

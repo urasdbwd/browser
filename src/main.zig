@@ -179,11 +179,6 @@ fn run(allocator: Allocator, main_arena: Allocator, proc_args: std.process.Args)
                     .with_frames = opts.with_frames,
                 },
                 .json = opts.json,
-                .solve_captchas = switch (opts.solve_captchas) {
-                    .on => true,
-                    .off => false,
-                    .auto => opts.stealth,
-                },
             };
 
             var writer = std.Io.File.stdout().writerStreaming(lp.io, &.{});

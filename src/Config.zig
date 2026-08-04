@@ -217,17 +217,17 @@ const CommonOptions = .{
     .{ .name = "web_bot_auth_keyid", .type = ?[]const u8 },
     .{ .name = "web_bot_auth_domain", .type = ?[]const u8 },
     .{ .name = "user_agent", .type = ?[]const u8 },
-    // Chrome-aligned fingerprint for challenge widgets (Turnstile managed mode,
-    // etc.). Sets a Chrome UA, Sec-Ch-Ua brands, and navigator.userAgentData.
-    // Auto-generates a random fingerprint seed (CloakBrowser-style) unless
-    // --fingerprint is set. Enables interactive Turnstile click-solve by default.
+    // Chrome-aligned identity for challenge widgets (Turnstile, bot scanners):
+    // Chrome UA, Sec-Ch-Ua brands, navigator.userAgentData, plus a random
+    // fingerprint seed unless --fingerprint pins one. Off by default — without
+    // it Lightpanda identifies honestly as Lightpanda.
     .{ .name = "stealth", .type = bool },
-    // Deterministic fingerprint seed (CloakBrowser --fingerprint=N). Same seed
-    // → same GPU/screen/hw/canvas/audio identity. Alone activates the fingerprint
-    // profile; pair with --stealth for Chrome UA + captcha auto-interact.
+    // Deterministic fingerprint seed. Same seed → same GPU/screen/hw identity.
+    // Alone activates the fingerprint profile; pair with --stealth for the
+    // Chrome UA too.
     .{ .name = "fingerprint", .type = ?u64 },
-    // Platform reported to JS: windows|macos|linux. Default with --stealth: windows
-    // (common CloakBrowser wrapper default on non-Mac hosts).
+    // Platform reported to JS: windows|macos|linux. Defaults to the host OS on
+    // macOS, windows elsewhere.
     .{ .name = "fingerprint_platform", .type = ?[]const u8 },
     // Click managed Turnstile checkboxes and wait for a token after load.
     // auto (default) = on when --stealth; on/off force either way.
@@ -463,8 +463,8 @@ mode: Mode,
 command: RunMode,
 exec_name: []const u8,
 http_headers: HttpHeaders,
-/// CloakBrowser-style fingerprint profile (seed → GPU/screen/hw). Always set;
-/// stock profile when stealth is off and no seed given.
+/// Seed-derived device identity (GPU/screen/cores/memory). Always set; the
+/// stock profile when neither --stealth nor --fingerprint is given.
 fingerprint_profile: Fingerprint.Profile = .stock,
 
 fn modeNeedsHttp(mode: Mode) bool {
@@ -486,29 +486,26 @@ pub fn init(allocator: Allocator, exec_name: []const u8, mode: Mode) !Config {
         .fingerprint_profile = .stock,
     };
     if (modeNeedsHttp(mode)) {
-        config.http_headers = try HttpHeaders.init(allocator, &config);
+        // Resolved first: the stealth User-Agent's OS token derives from it.
         config.fingerprint_profile = resolveFingerprintProfile(&config);
+        config.http_headers = try HttpHeaders.init(allocator, &config);
     }
     return config;
 }
 
-/// Build profile from --stealth / --fingerprint / --fingerprint-platform.
+/// Build the profile from --stealth / --fingerprint / --fingerprint-platform.
 fn resolveFingerprintProfile(config: *const Config) Fingerprint.Profile {
-    const has_seed = config.fingerprintSeed() != null;
-    const is_stealth = config.stealth() or has_seed;
-    if (!is_stealth) return .stock;
+    const seed = config.fingerprintSeed();
+    if (seed == null and !config.stealth()) return .stock;
 
     const platform: Fingerprint.Platform = blk: {
         if (config.fingerprintPlatform()) |s| {
             break :blk Fingerprint.Platform.fromString(s) orelse .windows;
         }
-        // CloakBrowser wrapper default on non-Mac: spoof Windows.
         break :blk if (builtin.os.tag == .macos) .macos else .windows;
     };
 
-    if (config.fingerprintSeed()) |seed| {
-        return Fingerprint.Profile.fromSeed(seed, platform);
-    }
+    if (seed) |s| return Fingerprint.Profile.fromSeed(s, platform);
     return Fingerprint.Profile.random(platform);
 }
 
@@ -560,14 +557,14 @@ pub fn obeyRobots(self: *const Config) bool {
 
 pub fn disableSubframes(self: *const Config) bool {
     return switch (self.mode) {
-        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.disable_subframes or self.resourceProfile() == .pi,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.disable_subframes,
         else => unreachable,
     };
 }
 
 pub fn disableWorkers(self: *const Config) bool {
     return switch (self.mode) {
-        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.disable_workers or self.resourceProfile() == .pi,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.disable_workers,
         else => unreachable,
     };
 }
@@ -575,7 +572,11 @@ pub fn disableWorkers(self: *const Config) bool {
 pub fn watchdogMs(self: *const Config) ?u32 {
     return switch (self.mode) {
         inline .serve, .fetch, .render, .mcp, .agent => |opts| {
-            const default_ms: u32 = if (self.resourceProfile() == .pi) 10_000 else 30_000;
+            var default_ms: u32 = if (self.resourceProfile() == .pi) 10_000 else 30_000;
+            // A managed Turnstile solve runs for tens of seconds; the `pi`
+            // profile's 10s default would kill it mid-flight. Raise the floor
+            // rather than disarming — an explicit --watchdog-ms still wins.
+            if (self.solveCaptchas()) default_ms = @max(default_ms, 30_000);
             const ms = opts.watchdog_ms orelse default_ms;
             return if (ms == 0) null else ms;
         },
@@ -594,6 +595,41 @@ pub fn v8Flags(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
         inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.v8_flags_unsafe,
         else => unreachable,
+    };
+}
+
+// Memory-oriented V8 flags applied before --v8-flags-unsafe (so a user flag
+// with the same name still wins). Measured on a 1.4 MB DOM + JS page load
+// (peak RSS, median of 7):
+//   --optimize-for-size            68.4 -> 66.4 MB, CPU unchanged
+//   --no-concurrent-recompilation  66.3 -> 61.6 MB, CPU +0.01s
+// Deliberately NOT here: --jitless / --lite-mode. They save a further ~7 MB but
+// take CPU from 0.15s to 0.35s on the same load, which loses more than it wins
+// when the point of the pi profile is many concurrent sessions on few cores.
+// `--v8-flags-unsafe --jitless` opts into that trade explicitly.
+// --single-threaded-gc was measured too: no RSS or CPU effect once
+// v8ThreadPoolSize() is already 1 on this profile, so it isn't set.
+//
+// The GC-sizing knobs were swept in isolation (median of 7 peak RSS) over a
+// 30-byte page (22.11 MiB floor), a 4 MB JS-free DOM (48.38 MiB) and a 24k-
+// element DOM-mutating JS page (41.78 MiB). Every one of them landed inside
+// the +-0.05 MiB run-to-run noise on all three, so none is set:
+//   --max-semi-space-size / --min-semi-space-size (1 and 2 MB)
+//   --initial-heap-size=1, --initial-old-space-size=1
+//   --no-memory-reducer, --no-parallel-scavenge
+//   --no-concurrent-marking, --no-concurrent-sweeping
+//   --no-turbofan, --predictable, --single-threaded
+//   --no-write-protect-code-memory
+// --no-maglev is actively worse (41.78 -> 46.44 MiB on the JS page).
+// Lowering --v8-max-heap-mb from 64 to 16 also moves nothing: what V8 still
+// holds after --optimize-for-size is snapshot + isolate + code, not young/old
+// space capacity, and ConfigureDefaultsFromHeapSize only caps the latter.
+pub const pi_v8_flags = "--optimize-for-size --no-concurrent-recompilation";
+
+pub fn v8ProfileFlags(self: *const Config) ?[]const u8 {
+    return switch (self.mode) {
+        inline .serve, .fetch, .render, .mcp, .agent => if (self.resourceProfile() == .pi) pi_v8_flags else null,
+        else => null,
     };
 }
 
@@ -747,16 +783,21 @@ pub fn userAgentSuffix(self: *const Config) ?[]const u8 {
     };
 }
 
-pub fn userAgent(self: *const Config) ?[]const u8 {
-    return switch (self.mode) {
-        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.user_agent,
-        else => null,
-    };
-}
-
 pub fn stealth(self: *const Config) bool {
     return switch (self.mode) {
         inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.stealth,
+        else => false,
+    };
+}
+
+/// Auto-click managed Turnstile and wait for tokens. Defaults to on with --stealth.
+pub fn solveCaptchas(self: *const Config) bool {
+    return switch (self.mode) {
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| switch (opts.solve_captchas) {
+            .on => true,
+            .off => false,
+            .auto => opts.stealth,
+        },
         else => false,
     };
 }
@@ -775,15 +816,10 @@ pub fn fingerprintPlatform(self: *const Config) ?[]const u8 {
     };
 }
 
-/// Auto-click managed Turnstile and wait for tokens. Defaults to on with --stealth.
-pub fn solveCaptchas(self: *const Config) bool {
+pub fn userAgent(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .render, .mcp, .agent => |opts| switch (opts.solve_captchas) {
-            .on => true,
-            .off => false,
-            .auto => opts.stealth,
-        },
-        else => false,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.user_agent,
+        else => null,
     };
 }
 
@@ -1061,54 +1097,60 @@ pub const WaitUntil = enum {
 /// Pre-formatted HTTP headers for reuse across Http and Client.
 /// Must be initialized with an allocator that outlives all HTTP connections.
 pub const HttpHeaders = struct {
-    const user_agent_base: [:0]const u8 = "Lightpanda/1.0";
-
-    /// Chrome-aligned UA used when `--stealth` is set (challenge widgets
-    /// fingerprint this string against Sec-Ch-Ua / userAgentData).
-    pub const stealth_user_agent: [:0]const u8 = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-    pub const stealth_chrome_version: [:0]const u8 = "131";
-    pub const stealth_ua_full_version: [:0]const u8 = "131.0.6778.86";
+    pub const product_version: [:0]const u8 = "1.0";
+    const user_agent_base: [:0]const u8 = "Lightpanda/" ++ product_version;
 
     pub const Brand = struct {
         brand: [:0]const u8,
         version: [:0]const u8,
     };
 
-    /// Default product brands (non-stealth).
-    pub const brands_default = [_]Brand{
+    pub const brands = [_]Brand{
         .{ .brand = "Lightpanda", .version = "1" },
     };
+    pub const full_brands = [_]Brand{
+        .{ .brand = "Lightpanda", .version = product_version },
+    };
 
-    /// Chrome GREASE + Chromium + Google Chrome brands (stealth).
+    pub const stealth_chrome_version: [:0]const u8 = "131";
+    pub const stealth_ua_full_version: [:0]const u8 = "131.0.6778.86";
+
+    /// Chrome GREASE + Chromium + Google Chrome brands, used with --stealth.
     pub const brands_stealth = [_]Brand{
         .{ .brand = "Not/A)Brand", .version = "8" },
         .{ .brand = "Chromium", .version = stealth_chrome_version },
         .{ .brand = "Google Chrome", .version = stealth_chrome_version },
     };
 
-    /// Source of truth alias for non-stealth compile-time consumers.
-    pub const brands = brands_default;
+    /// Chrome-aligned UA for --stealth. The OS token has to agree with the
+    /// resolved fingerprint platform: a Windows UA next to a "MacIntel"
+    /// navigator.platform is a louder tell than no stealth at all.
+    pub fn stealthUserAgent(platform: Fingerprint.Platform) [:0]const u8 {
+        const prefix = "Mozilla/5.0 (";
+        // Chrome's reduced UA pins the last three version components to zero;
+        // the real build number only travels over UA-CH.
+        const suffix = ") AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" ++
+            stealth_chrome_version ++ ".0.0.0 Safari/537.36";
+        return switch (platform) {
+            .windows => prefix ++ "Windows NT 10.0; Win64; x64" ++ suffix,
+            .macos => prefix ++ "Macintosh; Intel Mac OS X 10_15_7" ++ suffix,
+            .linux => prefix ++ "X11; Linux x86_64" ++ suffix,
+        };
+    }
 
-    pub const sec_ch_ua_default: [:0]const u8 = blk: {
-        var out: [:0]const u8 = "Sec-Ch-Ua:";
-        for (brands_default, 0..) |b, i| {
-            const sep = if (i == 0) " " else ", ";
-            out = out ++ sep ++ "\"" ++ b.brand ++ "\";v=\"" ++ b.version ++ "\"";
+    fn secChUa(comptime brand_list: []const Brand) [:0]const u8 {
+        comptime {
+            var out: [:0]const u8 = "Sec-Ch-Ua:";
+            for (brand_list, 0..) |b, i| {
+                const sep = if (i == 0) " " else ", ";
+                out = out ++ sep ++ "\"" ++ b.brand ++ "\";v=\"" ++ b.version ++ "\"";
+            }
+            return out;
         }
-        break :blk out;
-    };
+    }
 
-    pub const sec_ch_ua_stealth: [:0]const u8 = blk: {
-        var out: [:0]const u8 = "Sec-Ch-Ua:";
-        for (brands_stealth, 0..) |b, i| {
-            const sep = if (i == 0) " " else ", ";
-            out = out ++ sep ++ "\"" ++ b.brand ++ "\";v=\"" ++ b.version ++ "\"";
-        }
-        break :blk out;
-    };
-
-    // Back-compat name: non-stealth Sec-Ch-Ua.
-    pub const sec_ch_ua: [:0]const u8 = sec_ch_ua_default;
+    pub const sec_ch_ua: [:0]const u8 = secChUa(&brands);
+    pub const sec_ch_ua_stealth: [:0]const u8 = secChUa(&brands_stealth);
 
     // Some bot-protection frontends (e.g. Akamai on canada.ca) RST the HTTP/2
     // stream when a client sends Accept-Encoding without Accept-Language,
@@ -1125,28 +1167,29 @@ pub const HttpHeaders = struct {
     sec_ch_ua_header: [:0]const u8,
     /// Brand list for navigator.userAgentData (same source as Sec-Ch-Ua).
     brand_list: []const Brand,
+    /// True when --stealth presents this process as Chrome.
     stealth: bool = false,
+    /// False when user_agent is a comptime literal rather than an allocation.
+    user_agent_owned: bool = false,
 
     proxy_bearer_header: ?[:0]const u8,
 
     pub fn init(allocator: Allocator, config: *const Config) !HttpHeaders {
         const is_stealth = config.stealth();
+        const owned = config.userAgent() != null or (!is_stealth and config.userAgentSuffix() != null);
 
         const user_agent: [:0]const u8 = if (config.userAgent()) |ua|
             try allocator.dupeZ(u8, ua)
         else if (is_stealth)
-            stealth_user_agent
+            stealthUserAgent(config.fingerprint_profile.platform)
         else if (config.userAgentSuffix()) |suffix|
             try std.fmt.allocPrintSentinel(allocator, "{s} {s}", .{ user_agent_base, suffix }, 0)
         else
             user_agent_base;
-        errdefer if (config.userAgent() != null or (!is_stealth and config.userAgentSuffix() != null)) allocator.free(user_agent);
+        errdefer if (owned) allocator.free(user_agent);
 
         const user_agent_header = try std.fmt.allocPrintSentinel(allocator, "User-Agent: {s}", .{user_agent}, 0);
         errdefer allocator.free(user_agent_header);
-
-        const brand_list: []const Brand = if (is_stealth) &brands_stealth else &brands_default;
-        const sec_ch_ua_header: [:0]const u8 = if (is_stealth) sec_ch_ua_stealth else sec_ch_ua_default;
 
         const proxy_bearer_header: ?[:0]const u8 = if (config.proxyBearerToken()) |token|
             try std.fmt.allocPrintSentinel(allocator, "Proxy-Authorization: Bearer {s}", .{token}, 0)
@@ -1156,9 +1199,10 @@ pub const HttpHeaders = struct {
         return .{
             .user_agent = user_agent,
             .user_agent_header = user_agent_header,
-            .sec_ch_ua_header = sec_ch_ua_header,
-            .brand_list = brand_list,
+            .sec_ch_ua_header = if (is_stealth) sec_ch_ua_stealth else sec_ch_ua,
+            .brand_list = if (is_stealth) &brands_stealth else &brands,
             .stealth = is_stealth,
+            .user_agent_owned = owned,
             .proxy_bearer_header = proxy_bearer_header,
         };
     }
@@ -1168,7 +1212,7 @@ pub const HttpHeaders = struct {
             allocator.free(hdr);
         }
         allocator.free(self.user_agent_header);
-        if (self.user_agent.ptr != user_agent_base.ptr and self.user_agent.ptr != stealth_user_agent.ptr) {
+        if (self.user_agent_owned) {
             allocator.free(self.user_agent);
         }
     }
@@ -1316,8 +1360,8 @@ test "Config: pi resource profile bounds expensive defaults" {
     defer config.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(ResourceProfile.pi, config.resourceProfile());
-    try std.testing.expect(config.disableSubframes());
-    try std.testing.expect(config.disableWorkers());
+    try std.testing.expect(!config.disableSubframes());
+    try std.testing.expect(!config.disableWorkers());
     try std.testing.expectEqual(@as(?u32, 10_000), config.watchdogMs());
     try std.testing.expectEqual(@as(?u32, 64), config.v8MaxHeapMb());
     try std.testing.expectEqual(@as(u8, 1), config.v8ThreadPoolSize());
@@ -1334,6 +1378,22 @@ test "Config: pi resource profile bounds expensive defaults" {
     try std.testing.expectEqual(@as(u32, 256 * 1024), config.cdpMaxMessageSize());
     try std.testing.expectEqual(@as(?usize, 8 * 1024 * 1024), config.cdpMaxCapturedResponseSize());
     try std.testing.expectEqual(@as(?usize, 256), config.cdpMaxCapturedResponses());
+    try std.testing.expectEqualStrings(pi_v8_flags, config.v8ProfileFlags().?);
+}
+
+test "Config: only the pi profile sets V8 memory flags" {
+    var standard = try Config.init(std.testing.allocator, "test", .{ .serve = .{} });
+    defer standard.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?[]const u8, null), standard.v8ProfileFlags());
+
+    // The profile flags are prepended to --v8-flags-unsafe, never replaced by it.
+    var pi = try Config.init(std.testing.allocator, "test", .{ .serve = .{
+        .resource_profile = .pi,
+        .v8_flags_unsafe = "--jitless",
+    } });
+    defer pi.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(pi_v8_flags, pi.v8ProfileFlags().?);
+    try std.testing.expectEqualStrings("--jitless", pi.v8Flags().?);
 }
 
 test "Config: explicit limits override pi profile defaults" {
@@ -1345,6 +1405,8 @@ test "Config: explicit limits override pi profile defaults" {
         .ws_max_concurrent = 1,
         .v8_max_heap_mb = 96,
         .v8_thread_pool_size = 2,
+        .disable_subframes = true,
+        .disable_workers = true,
         .cdp_max_connections = 4,
         .cdp_max_pending_connections = 8,
         .cdp_max_message_size = 512 * 1024,
@@ -1359,6 +1421,8 @@ test "Config: explicit limits override pi profile defaults" {
     try std.testing.expectEqual(@as(u8, 1), config.wsMaxConcurrent());
     try std.testing.expectEqual(@as(?u32, 96), config.v8MaxHeapMb());
     try std.testing.expectEqual(@as(u8, 2), config.v8ThreadPoolSize());
+    try std.testing.expect(config.disableSubframes());
+    try std.testing.expect(config.disableWorkers());
     try std.testing.expectEqual(@as(u16, 4), config.maxConnections());
     try std.testing.expectEqual(@as(u31, 8), config.maxPendingConnections());
     try std.testing.expectEqual(@as(u32, 512 * 1024), config.cdpMaxMessageSize());

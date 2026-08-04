@@ -103,6 +103,18 @@ pub fn newArray(self: *const Local, len: u32) js.Array {
     };
 }
 
+pub fn freeze(self: *const Local, value: anytype) !js.Value {
+    const handle: *const v8.Function = @ptrCast(v8.v8__Global__Get(
+        &self.ctx.object_freeze,
+        self.isolate.handle,
+    ));
+    const freeze_intrinsic = js.Function{
+        .local = self,
+        .handle = handle,
+    };
+    return freeze_intrinsic.call(js.Value, .{value});
+}
+
 /// Creates a new typed array. Memory is owned by JS context.
 /// https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Typed_arrays
 pub fn createTypedArray(self: *const Local, comptime array_type: js.ArrayType, size: usize) js.ArrayBufferRef(array_type) {
@@ -1269,6 +1281,20 @@ pub fn resolveValue(value: anytype) Resolved {
     if (comptime @typeInfo(@TypeOf(value._type)) == .@"enum" and @hasDecl(T, "Subtype")) {
         switch (value._type) {
             inline else => |tag| return resolveValue(value.subtype(T.Subtype(tag))),
+        }
+    }
+
+    // Same idea, but for the types (EventTarget, Node, Element, Html) whose
+    // bare tag is projected back into a union of chain-member pointers.
+    if (comptime @typeInfo(@TypeOf(value._type)) == .@"enum" and @hasDecl(T, "Typed")) {
+        switch (value.typed()) {
+            inline else => |child| {
+                // e.g. a plain EventTarget, which has no more specific member
+                if (comptime @TypeOf(child) == void) {
+                    return resolveT(T, value);
+                }
+                return resolveValue(child);
+            },
         }
     }
 

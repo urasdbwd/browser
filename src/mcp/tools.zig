@@ -1360,9 +1360,75 @@ test "MCP - press Enter on form input triggers submit (lowercase alias)" {
     try router.handleMessage(server, aa, press_msg);
     out.clearRetainingCapacity();
 
-    const evaluate_msg = try aa.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"evaluate\",\"arguments\":{\"script\":\"window.submitted === true && window.submittedValue === 'hello'\"}}}");
-    try router.handleMessage(server, aa, evaluate_msg);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "true") != null);
+    const frame = server.active_session.session.currentFrame().?;
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    const result = try ls.local.compileAndRun(
+        \\window.submitted === true &&
+        \\window.submittedValue === 'hello' &&
+        \\enterResults.default.clicks === 1 &&
+        \\enterResults.default.submits === 1 &&
+        \\enterResults.default.clickTrusted === true &&
+        \\enterResults.default.submitter === 'default-submit' &&
+        \\JSON.stringify(enterResults.default.order) === '["keydown","click","submit","keyup"]'
+    , null);
+    try testing.expect(result.isTrue());
+}
+
+test "MCP - press Enter follows form default actions exactly once" {
+    const aa = testing.arena_allocator;
+    var out: std.Io.Writer.Allocating = .init(aa);
+    const server = try testLoadPage("http://localhost:9582/src/browser/tests/mcp_press_form.html", &out.writer);
+    defer server.deinit();
+
+    const selectors = [_][]const u8{
+        "#prevented",
+        "#notes",
+        "#checkbox",
+        "#radio",
+        "#file",
+        "#reset",
+        "#hidden",
+        "#submit-input",
+        "#submit-button",
+        "#single",
+        "#two-a",
+    };
+    for (selectors, 1..) |selector, id| {
+        try testPressEnter(server, aa, id, selector);
+        out.clearRetainingCapacity();
+    }
+
+    const frame = server.active_session.session.currentFrame().?;
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    const result = try ls.local.compileAndRun(
+        \\(() => {
+        \\  const r = window.enterResults;
+        \\  return r.prevented.clicks === 0 &&
+        \\    r.prevented.submits === 0 &&
+        \\    JSON.stringify(r.prevented.order) === '["keydown","keyup"]' &&
+        \\    document.getElementById('notes').value === 'line\n' &&
+        \\    r.textarea.submits === 0 &&
+        \\    r.nontext.clicks === 0 &&
+        \\    r.nontext.submits === 0 &&
+        \\    document.getElementById('checkbox').checked === false &&
+        \\    document.getElementById('radio').checked === false &&
+        \\    r.activation.inputClicks === 1 &&
+        \\    r.activation.buttonClicks === 1 &&
+        \\    r.activation.submits === 2 &&
+        \\    JSON.stringify(r.activation.trusted) === '[true,true]' &&
+        \\    JSON.stringify(r.activation.submitters) === '["submit-input","submit-button"]' &&
+        \\    r.single.submits === 1 &&
+        \\    r.single.submitterIsNull === true &&
+        \\    r.two.submits === 0;
+        \\})()
+    , null);
+    try testing.expect(result.isTrue());
 }
 
 test "MCP - getCookies: defaults to current page, url filter, all flag" {
@@ -1482,6 +1548,18 @@ test "MCP - sessions: new, list, attach isolation, close" {
     );
     try testing.expect(std.mem.indexOf(u8, out.written(), "closed session a") != null);
     try testing.expect(!server.sessions.contains("a"));
+}
+
+fn testPressEnter(server: *Server, allocator: std.mem.Allocator, id: usize, selector: []const u8) !void {
+    const id_string = try std.fmt.allocPrint(allocator, "{d}", .{id});
+    const msg = try std.mem.concat(allocator, u8, &.{
+        "{\"jsonrpc\":\"2.0\",\"id\":",
+        id_string,
+        ",\"method\":\"tools/call\",\"params\":{\"name\":\"press\",\"arguments\":{\"selector\":\"",
+        selector,
+        "\",\"key\":\"Enter\"}}}",
+    });
+    try router.handleMessage(server, allocator, msg);
 }
 
 fn testLoadPage(url: [:0]const u8, writer: *std.Io.Writer) !*Server {

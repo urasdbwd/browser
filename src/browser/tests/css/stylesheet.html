@@ -36,6 +36,19 @@
 }
 </script>
 
+<script id="CSSStyleProperties_animation_feature_detection">
+{
+    const style = document.createElement('div').style;
+
+    // Lightpanda does not run CSS animations or dispatch animationend. Reporting
+    // animationName as supported makes applications wait forever for that event.
+    testing.expectEqual(undefined, style.animationName);
+
+    style.animationName = 'fade';
+    testing.expectEqual('fade', style.animationName);
+}
+</script>
+
 <script id="CSSStyleDeclaration_setCssText_multiple">
 {
     const div = document.createElement('div');

@@ -32,8 +32,19 @@ use types::*;
 use encoding_rs::Encoding;
 use html5ever::driver::parse_fragment_for_element;
 use html5ever::interface::tree_builder::QuirksMode;
-use html5ever::tendril::{StrTendril, TendrilSink};
+use html5ever::tendril::{ByteTendril, StrTendril, TendrilSink};
 use html5ever::{ns, parse_document, LocalName, ParseOpts, Parser, QualName};
+
+/// How much of a buffered document is handed to the tokenizer at a time.
+///
+/// `TendrilSink::one()` copies the *entire* input into a refcounted tendril
+/// that stays alive for the whole parse — a second full copy of every document
+/// byte, live at exactly the moment the DOM is at its largest. Feeding in
+/// chunks bounds that copy to this constant instead. html5ever's tokenizer is
+/// already incremental (`html5ever_streaming_parser_feed` below drives it the
+/// same way) and `Utf8LossyDecoder` buffers partial sequences across chunk
+/// boundaries, so splitting anywhere is safe.
+const PARSE_CHUNK: usize = 64 * 1024;
 
 #[no_mangle]
 pub extern "C" fn html5ever_parse_document(
@@ -62,7 +73,7 @@ pub extern "C" fn html5ever_parse_document(
         return ();
     }
 
-    let arena = typed_arena::Arena::new();
+    let arena = sink::ElementDataArena::new();
 
     let sink = sink::Sink {
         ctx: ctx,
@@ -90,7 +101,7 @@ pub extern "C" fn html5ever_parse_document(
     let bytes = unsafe { std::slice::from_raw_parts(html, len) };
     parse_document(sink, Default::default())
         .from_utf8()
-        .one(bytes);
+        .from_iter(bytes.chunks(PARSE_CHUNK).map(ByteTendril::from_slice));
 }
 
 /// Parse an HTML document with encoding conversion.
@@ -136,7 +147,7 @@ pub extern "C" fn html5ever_parse_document_with_encoding(
     let encoding = Encoding::for_label(charset_bytes).unwrap_or(encoding_rs::UTF_8);
     let (decoded, _, _) = encoding.decode(input);
 
-    let arena = typed_arena::Arena::new();
+    let arena = sink::ElementDataArena::new();
 
     let sink = sink::Sink {
         ctx: ctx,
@@ -161,8 +172,18 @@ pub extern "C" fn html5ever_parse_document_with_encoding(
         allow_declarative_shadow: allow_declarative_shadow,
     };
 
-    // Parse directly from decoded string
-    parse_document(sink, Default::default()).one(StrTendril::from(decoded.as_ref()));
+    // Parse directly from the decoded string. Chunked (see PARSE_CHUNK): the
+    // old `one(StrTendril::from(..))` copied all of `decoded` a second time.
+    // `decoded` is already valid UTF-8, so the from_utf8 decoder is a
+    // pass-through that only exists to stitch chunk boundaries back together.
+    parse_document(sink, Default::default())
+        .from_utf8()
+        .from_iter(
+            decoded
+                .as_bytes()
+                .chunks(PARSE_CHUNK)
+                .map(ByteTendril::from_slice),
+        );
 }
 
 // === Encoding API for TextDecoder ===
@@ -489,7 +510,7 @@ pub extern "C" fn html5ever_parse_fragment(
         return ();
     }
 
-    let arena = typed_arena::Arena::new();
+    let arena = sink::ElementDataArena::new();
 
     let sink = sink::Sink {
         ctx: ctx,
@@ -541,15 +562,12 @@ pub extern "C" fn html5ever_parse_fragment(
     };
 
     let context_qname = QualName::new(None, ns!(html), context_local);
-    let context_data = arena.alloc(sink::ElementData {
-        qname: context_qname.clone(),
-        mathml_annotation_xml_integration_point: false,
-    });
+    let context_data = arena.intern(context_qname.clone(), false);
     let mut context_attrs = CAttributeIterator { vec: vec![], pos: 0 };
     let context_elem = unsafe {
         (create_context_element_callback)(
             ctx,
-            context_data as *mut _ as *mut c_void,
+            context_data as *mut c_void,
             CQualName::create(&context_qname),
             &mut context_attrs as *mut _ as *mut c_void,
         )
@@ -619,7 +637,7 @@ pub extern "C" fn html5ever_get_memory_usage() -> Memory {
 // The Parser type from html5ever implements TendrilSink and supports streaming
 pub struct StreamingParser {
     #[allow(dead_code)]
-    arena: Box<typed_arena::Arena<sink::ElementData>>,
+    arena: Box<sink::ElementDataArena>,
     parser: Box<dyn std::any::Any>,
 }
 
@@ -644,13 +662,12 @@ pub extern "C" fn html5ever_streaming_parser_create(
     attach_declarative_shadow_callback: AttachDeclarativeShadowCallback,
     allow_declarative_shadow: bool,
 ) -> *mut c_void {
-    let arena = Box::new(typed_arena::Arena::new());
+    let arena = Box::new(sink::ElementDataArena::new());
 
     // SAFETY: We're creating a self-referential structure here.
     // The arena is stored in the StreamingParser and lives as long as the parser.
     // The sink contains a reference to the arena that's valid for the parser's lifetime.
-    let arena_ref: &'static typed_arena::Arena<sink::ElementData> =
-        unsafe { std::mem::transmute(arena.as_ref()) };
+    let arena_ref: &'static sink::ElementDataArena = unsafe { std::mem::transmute(arena.as_ref()) };
 
     let sink = sink::Sink {
         ctx: ctx,
@@ -781,7 +798,7 @@ pub extern "C" fn xml5ever_parse_document(
         return ();
     }
 
-    let arena = typed_arena::Arena::new();
+    let arena = sink::ElementDataArena::new();
 
     let sink = sink::Sink {
         ctx: ctx,

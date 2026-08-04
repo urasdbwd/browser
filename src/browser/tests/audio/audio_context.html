@@ -43,7 +43,7 @@
 {
   const state = await testing.async();
 
-  async function fingerprint() {
+  async function renderedSampleSum() {
     const ctx = new OfflineAudioContext(1, 44100, 44100);
     const osc = ctx.createOscillator();
     osc.type = "triangle";
@@ -59,8 +59,8 @@
     return sum;
   }
 
-  const a = await fingerprint();
-  const b = await fingerprint();
+  const a = await renderedSampleSum();
+  const b = await renderedSampleSum();
   state.resolve();
   await state.done(() => {
     testing.expectEqual(true, a > 0);

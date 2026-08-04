@@ -45,8 +45,10 @@ pub fn getUserAgent(_: *const Navigator, exec: *const Execution) []const u8 {
     return exec.session.browser.http_client.getUserAgent();
 }
 
-pub fn getLanguages(_: *const Navigator) [2][]const u8 {
-    return .{ "en-US", "en" };
+pub fn getLanguages(_: *const Navigator, exec: *const Execution) !js.Value {
+    const local = exec.js.local.?;
+    const languages = try local.zigValueToJs([2][]const u8{ "en-US", "en" }, .{});
+    return local.freeze(languages);
 }
 
 pub fn getDoNotTrack(_: *const Navigator) ?[]const u8 {
@@ -61,8 +63,26 @@ pub fn getAppCodeName(_: *const Navigator) []const u8 {
     return "Mozilla";
 }
 
-pub fn getAppVersion(_: *const Navigator) []const u8 {
-    return "1.0";
+pub fn getAppVersion(self: *const Navigator, exec: *const Execution) ![]const u8 {
+    const user_agent = getUserAgent(self, exec);
+    const lightpanda_prefix = "Lightpanda/";
+    if (std.mem.startsWith(u8, user_agent, lightpanda_prefix)) {
+        const version = user_agent[lightpanda_prefix.len..];
+        const end = std.mem.indexOfScalar(u8, version, ' ') orelse version.len;
+        return version[0..end];
+    }
+
+    const prefix = "Mozilla/";
+    if (!std.mem.startsWith(u8, user_agent, "Mozilla/5.0 (")) {
+        return "";
+    }
+
+    const trail = user_agent[prefix.len..];
+    if (std.mem.startsWith(u8, trail, "5.0 (Windows")) {
+        return "5.0 (Windows)";
+    }
+    const separator = std.mem.indexOfScalar(u8, trail, ';') orelse return trail;
+    return std.mem.concat(exec.js.local.?.call_arena, u8, &.{ trail[0..separator], ")" });
 }
 
 pub fn getLanguage(_: *const Navigator) []const u8 {
@@ -78,7 +98,11 @@ pub fn getCookieEnabled(_: *const Navigator) bool {
 }
 
 pub fn getHardwareConcurrency(_: *const Navigator, exec: *const Execution) u32 {
-    return exec.session.browser.app.config.fingerprint_profile.hardware_concurrency;
+    const config = exec.session.browser.app.config;
+    if (config.fingerprint_profile.seed != 0) {
+        return config.fingerprint_profile.hardware_concurrency;
+    }
+    return @intCast(std.Thread.getCpuCount() catch 1);
 }
 
 pub fn getDeviceMemory(_: *const Navigator, exec: *const Execution) f64 {
@@ -89,14 +113,19 @@ pub fn getMaxTouchPoints(_: *const Navigator) u32 {
     return 0;
 }
 
-pub fn getVendor(_: *const Navigator) []const u8 {
-    return "";
+pub fn getVendor(_: *const Navigator, exec: *const Execution) []const u8 {
+    // Chrome reports "Google Inc."; an empty vendor next to a Chrome UA is a
+    // headless tell, so it tracks the stealth identity.
+    return if (exec.session.browser.app.config.http_headers.stealth) "Google Inc." else "";
 }
 
 pub fn getProduct(_: *const Navigator) []const u8 {
     return "Gecko";
 }
 
+// Chrome only sets this when a WebDriver client is attached. Lightpanda is not
+// driven by WebDriver, and reporting true is the single loudest automation
+// signal a page can read.
 pub fn getWebdriver(_: *const Navigator) bool {
     return false;
 }
@@ -112,8 +141,7 @@ pub fn getGlobalPrivacyControl(_: *const Navigator) bool {
 
 pub fn getPlatform(_: *const Navigator, exec: *const Execution) []const u8 {
     const fp = exec.session.browser.app.config.fingerprint_profile;
-    // When a seed/stealth profile is active (seed != stock zero), use its platform.
-    if (fp.seed != 0 or exec.session.browser.app.config.stealth()) {
+    if (fp.seed != 0) {
         return fp.navigatorPlatform();
     }
     return switch (builtin.os.tag) {
@@ -245,19 +273,19 @@ pub const JsApi = struct {
     pub const appVersion = bridge.accessor(Navigator.getAppVersion, null, .{});
     pub const platform = bridge.accessor(Navigator.getPlatform, null, .{});
     pub const language = bridge.accessor(Navigator.getLanguage, null, .{});
-    pub const languages = bridge.accessor(Navigator.getLanguages, null, .{});
+    pub const languages = bridge.accessor(Navigator.getLanguages, null, .{ .cache = .{ .private = "navigator_array" } });
     pub const onLine = bridge.accessor(Navigator.getOnLine, null, .{});
     pub const cookieEnabled = bridge.accessor(Navigator.getCookieEnabled, null, .{});
     pub const hardwareConcurrency = bridge.accessor(Navigator.getHardwareConcurrency, null, .{});
     pub const deviceMemory = bridge.accessor(Navigator.getDeviceMemory, null, .{});
     pub const maxTouchPoints = bridge.accessor(Navigator.getMaxTouchPoints, null, .{});
-    pub const vendor = bridge.accessor(Navigator.getVendor, null, .{});
+    pub const vendor = bridge.accessor(Navigator.getVendor, null, .{ .exposed = .window });
     pub const product = bridge.accessor(Navigator.getProduct, null, .{});
     pub const webdriver = bridge.accessor(Navigator.getWebdriver, null, .{});
     pub const doNotTrack = bridge.accessor(Navigator.getDoNotTrack, null, .{});
     pub const globalPrivacyControl = bridge.accessor(Navigator.getGlobalPrivacyControl, null, .{});
 
-    pub const javaEnabled = bridge.function(Navigator.javaEnabled, .{});
+    pub const javaEnabled = bridge.function(Navigator.javaEnabled, .{ .exposed = .window });
     pub const sendBeacon = bridge.function(Navigator.sendBeacon, .{ .exposed = .window, .noop = true });
     pub const permissions = bridge.accessor(Navigator.getPermissions, null, .{});
     pub const storage = bridge.accessor(Navigator.getStorage, null, .{});
@@ -274,7 +302,4 @@ pub const JsApi = struct {
 const testing = @import("../../testing.zig");
 test "WebApi: Navigator" {
     try testing.htmlRunner("navigator", .{});
-}
-test "WebApi: StealthSurface" {
-    try testing.htmlRunner("stealth/stealth_surface.html", .{});
 }

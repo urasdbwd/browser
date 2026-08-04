@@ -199,3 +199,69 @@ fn frameHasWidget(frame: *Frame) bool {
     }
     return false;
 }
+
+/// Non-blocking counterpart of `Runner.solveTurnstile`, for the CDP / MCP /
+/// agent paths where the event loop must keep serving commands. A
+/// self-rescheduling scheduler task instead of a wait loop: each run does one
+/// cheap check and hands control straight back.
+pub const AutoSolve = struct {
+    frame: *Frame,
+    budget_ms: u32,
+    clicks: u32 = 0,
+    idle_polls: u32 = 0,
+
+    // Give a widget this long to show up before concluding it's a normal page.
+    const idle_poll_ms: u32 = 500;
+    const max_idle_polls: u32 = 4;
+    const click_interval_ms: u32 = 1_500;
+    const max_clicks: u32 = 12;
+    pub const default_timeout_ms: u32 = 30_000;
+
+    /// Arm the solver for a freshly loaded main frame. No-op unless
+    /// `--solve-captchas` (or `--stealth`) is on.
+    pub fn start(frame: *Frame) void {
+        if (frame._session.browser.app.config.solveCaptchas() == false) return;
+        arm(frame, default_timeout_ms);
+    }
+
+    /// Arm regardless of config — an explicit request (`LP.solveCaptchas`).
+    /// Returns immediately; the solve runs on the scheduler.
+    pub fn arm(frame: *Frame, timeout_ms: u32) void {
+        if (frame.parent != null) return;
+
+        const self = frame.arena.create(AutoSolve) catch return;
+        self.* = .{ .frame = frame, .budget_ms = timeout_ms };
+        frame.js.scheduler.add(self, run, idle_poll_ms, .{ .name = "turnstile.autosolve" }) catch {};
+    }
+
+    fn run(ctx: *anyopaque) !?u32 {
+        const self: *AutoSolve = @ptrCast(@alignCast(ctx));
+        const frame = self.frame;
+
+        if (frameHasToken(frame)) {
+            log.info(.browser, "turnstile token ready", .{ .clicks = self.clicks });
+            return null;
+        }
+
+        if (frameHasWidget(frame) == false) {
+            // Ordinary page: stop quickly, don't keep polling forever.
+            self.idle_polls += 1;
+            if (self.idle_polls >= max_idle_polls) return null;
+            return self.spend(idle_poll_ms);
+        }
+
+        if (self.clicks >= max_clicks) return null;
+        // First clicks stay inside challenge iframes; later ones also tap the
+        // host widget (same escalation as Runner.solveTurnstile).
+        walkFrame(frame, self.clicks >= 3);
+        self.clicks += 1;
+        return self.spend(click_interval_ms);
+    }
+
+    // Charge the next sleep against the timeout budget; null stops the task.
+    fn spend(self: *AutoSolve, ms: u32) ?u32 {
+        if (self.budget_ms <= ms) return null;
+        self.budget_ms -= ms;
+        return ms;
+    }
+};

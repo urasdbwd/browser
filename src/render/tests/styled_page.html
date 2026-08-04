@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Lightpanda client-rendered page</title>
+  <link rel="stylesheet" href="styled_page.css">
+  <style>
+    .inline-style {
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <img src="styled_badge.svg" alt="Lightpanda">
+    <p class="eyebrow inline-style">Streamed by Lightpanda</p>
+    <h1>Rendered on this client</h1>
+    <p class="copy">
+      Lightpanda runs the page. Your browser handles its CSS, images, layout,
+      paint and compositing.
+    </p>
+    <button type="button">Interactive</button>
+  </main>
+  <script>
+    const root = document.documentElement;
+    root.classList.add("runtime-ready");
+    document.querySelector("button").addEventListener("click", () => {
+      const active = root.classList.toggle("runtime-active");
+      root.style.setProperty("--runtime-accent", active ? "#86efac" : "#8fb4ff");
+    });
+  </script>
+</body>
+</html>

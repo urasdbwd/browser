@@ -1500,8 +1500,8 @@ fn processOneMessage(self: *Client, msg: http.Handles.MultiMessage, transfer: *T
         }
     }
 
-    // Transfer is done (success or error). Materialize the response into the
-    // transfer's arena, release the conn, and buffer the events — user
+    // Transfer is done (success or error). Materialize the response into
+    // transfer-owned state, release the conn, and buffer the events — user
     // callbacks run later, from dispatch(), never from here.
 
     // When the server closes the TLS onnection without a close_notify alert,
@@ -2130,6 +2130,7 @@ pub const Transfer = struct {
         // Any concurrent CDP lookup by id will now see this transfer as gone.
         _ = self.client.transfers.remove(self.id);
 
+        self.res.deinit(self.client.allocator);
         self.req.deinit();
         if (self.owner) |o| {
             o.removeTransfer(self);
@@ -2325,8 +2326,8 @@ pub const Transfer = struct {
         self.client.dispatch_count += 1;
     }
 
-    // Buffer the standard success event sequence. `body` is either owned by
-    // transfer.arena OR, through some other mechanism, outlives the transfer.
+    // Buffer the standard success event sequence. `body` is owned by the
+    // transfer or, through some other mechanism, outlives it.
     fn bufferEvents(self: *Transfer, body: []const u8) !void {
         // Single delivery point for every successful response — network,
         // cache, and synthetic, on both the sync and async paths. Redirect
@@ -2417,8 +2418,8 @@ pub const Transfer = struct {
         try self.bufferEvents(owned_body);
     }
 
-    // Copy everything the response needs out of the conn and into the
-    // transfer arena. After this, delivery never touches libcurl state —
+    // Copy everything the response needs out of the conn and into
+    // transfer-owned memory. After this, delivery never touches libcurl state —
     // the conn can be released and reused before the consumer sees a byte.
     fn materializeResponse(self: *Transfer, conn: *http.Connection) !void {
         if (self.res.stream.started) {
@@ -2679,6 +2680,10 @@ pub const Transfer = struct {
         self.abortParked(error.AbortAuthChallenge);
     }
 
+    fn appendResponseData(self: *Transfer, chunk: []const u8) !void {
+        try self.res.buffer.appendSlice(self.client.allocator, chunk);
+    }
+
     fn dataCallback(buffer: [*]const u8, chunk_count: usize, chunk_len: usize, data: *anyopaque) callconv(.c) usize {
         // libcurl should only ever emit 1 chunk at a time
         if (comptime IS_DEBUG) {
@@ -2712,7 +2717,7 @@ pub const Transfer = struct {
                     res.callback_error = error.ResponseTooLarge;
                     return http.writefunc_error;
                 }
-                res.buffer.ensureTotalCapacity(transfer.arena.allocator(), cl) catch {};
+                res.buffer.ensureTotalCapacity(transfer.client.allocator, cl) catch {};
             }
         }
 
@@ -2746,7 +2751,7 @@ pub const Transfer = struct {
             return http.writefunc_error;
         }
 
-        res.buffer.appendSlice(transfer.arena.allocator(), chunk) catch |err| {
+        transfer.appendResponseData(chunk) catch |err| {
             res.callback_error = err;
             return http.writefunc_error;
         };
@@ -2769,7 +2774,7 @@ pub const Transfer = struct {
             res.stream.started = true;
         }
         // append the data to whatever data we already have (but haven't delivered)
-        try res.buffer.appendSlice(self.arena.allocator(), chunk);
+        try self.appendResponseData(chunk);
         if (res.stream.data_queued == false) {
             res.stream.data_queued = true;
             try self._events.append(self.arena.allocator(), .stream_data);
@@ -2978,8 +2983,8 @@ const Response = struct {
     skip_body: bool = false,
     first_data_received: bool = false,
 
-    // Response body. Filled by dataCallback, consumed in processMessages.
-    // See Stream.spare to see how this works in streaming mode
+    // Response body. Filled by dataCallback from the client's reclaiming
+    // allocator and consumed in processMessages. See Stream.spare for streaming.
     buffer: std.ArrayList(u8) = .empty,
 
     // Error captured in dataCallback to be reported in processMessages.
@@ -2987,6 +2992,11 @@ const Response = struct {
 
     // State for streaming. Unused in non-streaming
     stream: Stream = .{},
+
+    fn deinit(self: *Response, allocator: Allocator) void {
+        self.buffer.deinit(allocator);
+        self.stream.spare.deinit(allocator);
+    }
 
     const Stream = struct {
         // Whether we've queued the start/header events or not
@@ -3002,7 +3012,7 @@ const Response = struct {
     };
 };
 
-// A single buffered response event. The payload of `data` has transfer-arena
+// A single buffered response event. The payload of `data` has transfer
 // lifetime. `done`, and `err` are terminal — nothing follows them.
 const Event = union(enum) {
     start,
@@ -3071,6 +3081,38 @@ const Synthetic = struct {
 };
 
 const testing = @import("../testing.zig");
+
+test "HttpClient: chunked large response releases buffer capacities" {
+    var gpa: std.heap.DebugAllocator(.{ .enable_memory_limit = true }) = .{};
+    defer testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    // Reclaiming growth stays below 6 MiB; arena growth retains about 7.1 MiB.
+    gpa.requested_memory_limit = 6 * 1024 * 1024;
+    const allocator = gpa.allocator();
+
+    var client: Client = undefined;
+    client.allocator = allocator;
+
+    var transfer: Transfer = undefined;
+    transfer.client = &client;
+    transfer.res = .{};
+    defer transfer.res.deinit(allocator);
+
+    const chunk = [_]u8{'x'} ** 4096;
+    for (0..512) |_| {
+        try transfer.appendResponseData(&chunk);
+    }
+
+    try testing.expectEqual(transfer.res.buffer.capacity, gpa.total_requested_bytes);
+
+    // Streaming delivery swaps the active body into spare; teardown owns both.
+    std.mem.swap(std.ArrayList(u8), &transfer.res.buffer, &transfer.res.stream.spare);
+    transfer.res.stream.spare.clearRetainingCapacity();
+    try testing.expectEqual(transfer.res.stream.spare.capacity, gpa.total_requested_bytes);
+
+    transfer.res.deinit(allocator);
+    transfer.res = .{};
+    try testing.expectEqual(0, gpa.total_requested_bytes);
+}
 
 test "HttpClient: isFetchInterceptionMethod matches the four Fetch methods" {
     try testing.expect(isFetchInterceptionMethod("Fetch.continueRequest"));

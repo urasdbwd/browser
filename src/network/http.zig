@@ -114,22 +114,28 @@ pub const Headers = struct {
     headers: ?*libcurl.CurlSList,
 
     pub fn init(user_agent: [:0]const u8, sec_ch_ua: [:0]const u8) !Headers {
-        const header_list = libcurl.curl_slist_append(null, user_agent);
+        // Header *order* is fingerprinted as much as header presence. Chrome
+        // sends Sec-CH-UA ahead of User-Agent and trails with Accept-Language,
+        // so the list is built in Chrome's order rather than a convenient one.
+        // libcurl still places its own generated headers (Host, Accept,
+        // Accept-Encoding) itself; only the relative order of these is ours.
+
+        // Always add the product's Sec-CH-UA header.
+        const header_list = libcurl.curl_slist_append(null, sec_ch_ua);
         if (header_list == null) {
             return error.OutOfMemory;
         }
         // libcurl leaves the list intact when curl_slist_append fails, so we own it.
         errdefer libcurl.curl_slist_free_all(header_list);
 
-        // Always add sec-CH-UA header (stealth uses Chrome brands).
-        const with_sec_ch_ua = libcurl.curl_slist_append(header_list, sec_ch_ua);
-        if (with_sec_ch_ua == null) {
+        const with_user_agent = libcurl.curl_slist_append(header_list, user_agent);
+        if (with_user_agent == null) {
             return error.OutOfMemory;
         }
 
         // Always add Accept-Language. Omitting it triggers bot-protection on
         // some CDNs (Akamai) when Accept-Encoding is present.
-        const updated_headers = libcurl.curl_slist_append(with_sec_ch_ua, Config.HttpHeaders.accept_language);
+        const updated_headers = libcurl.curl_slist_append(with_user_agent, Config.HttpHeaders.accept_language);
         if (updated_headers == null) {
             return error.OutOfMemory;
         }
@@ -350,10 +356,264 @@ fn opensocketCallback(
     return fd;
 }
 
+fn proxyOptionValue(
+    proxy: ?[:0]const u8,
+    ip_filter_active: bool,
+) error{ProxyBypassesIpFilter}![*:0]const u8 {
+    if (proxy) |value| {
+        if (value.len == 0) return value.ptr;
+
+        // A proxy hides the destination address from opensocketCallback, so
+        // its destination filter cannot be enforced.
+        if (ip_filter_active) return error.ProxyBypassesIpFilter;
+        return value.ptr;
+    }
+
+    // libcurl treats null as "use proxy environment variables"; an empty
+    // string explicitly disables all proxies.
+    return "";
+}
+
+// ── Chrome TLS fingerprint ───────────────────────────────────────────────────
+//
+// Cloudflare (and bot management generally) fingerprints the ClientHello —
+// JA3/JA4 — before a single byte of page JavaScript runs, so every JS-level
+// stealth measure downstream is moot if libcurl's stock hello goes out first.
+// curl here is linked against BoringSSL, the same TLS stack Chrome uses, so the
+// hello can be reshaped through the CURLOPT_SSL_CTX_FUNCTION hook rather than
+// by patching a foreign TLS stack. curl invokes that hook *after* applying its
+// own TLS defaults, so whatever is set here wins.
+//
+// These externs would normally live in src/sys/libcrypto.zig alongside the
+// other BoringSSL declarations; they are local because only this file uses
+// them.
+const boring = struct {
+    const CRYPTO_BUFFER = opaque {};
+
+    const TLS1_2_VERSION: u16 = 0x0303;
+    const TLS1_3_VERSION: u16 = 0x0304;
+
+    const SSL_GROUP_SECP256R1: u16 = 23;
+    const SSL_GROUP_SECP384R1: u16 = 24;
+    const SSL_GROUP_X25519: u16 = 29;
+    const SSL_GROUP_X25519_MLKEM768: u16 = 0x11ec;
+
+    const TLSEXT_cert_compression_brotli: u16 = 2;
+
+    const SSL_METHOD = opaque {};
+
+    const DecompressFn = *const fn (
+        ssl: *anyopaque,
+        out: **CRYPTO_BUFFER,
+        uncompressed_len: usize,
+        in: [*]const u8,
+        in_len: usize,
+    ) callconv(.c) c_int;
+
+    extern fn TLS_method() *const SSL_METHOD;
+    extern fn SSL_CTX_new(method: *const SSL_METHOD) ?*crypto.SSL_CTX;
+    extern fn SSL_CTX_free(ctx: *crypto.SSL_CTX) void;
+    extern fn SSL_CTX_set_cipher_list(ctx: *crypto.SSL_CTX, str: [*:0]const u8) c_int;
+    extern fn SSL_CTX_set1_group_ids(ctx: *crypto.SSL_CTX, group_ids: [*]const u16, num: usize) c_int;
+    extern fn SSL_CTX_set_verify_algorithm_prefs(ctx: *crypto.SSL_CTX, prefs: [*]const u16, num: usize) c_int;
+    extern fn SSL_CTX_set_grease_enabled(ctx: *crypto.SSL_CTX, enabled: c_int) void;
+    extern fn SSL_CTX_set_permute_extensions(ctx: *crypto.SSL_CTX, enabled: c_int) void;
+    extern fn SSL_CTX_set_min_proto_version(ctx: *crypto.SSL_CTX, version: u16) c_int;
+    extern fn SSL_CTX_set_max_proto_version(ctx: *crypto.SSL_CTX, version: u16) c_int;
+    extern fn SSL_CTX_enable_ocsp_stapling(ctx: *crypto.SSL_CTX) void;
+    extern fn SSL_CTX_enable_signed_cert_timestamps(ctx: *crypto.SSL_CTX) void;
+    extern fn SSL_CTX_add_cert_compression_alg(
+        ctx: *crypto.SSL_CTX,
+        alg_id: u16,
+        compress: ?*const anyopaque,
+        decompress: ?DecompressFn,
+    ) c_int;
+    extern fn CRYPTO_BUFFER_alloc(out_data: *[*]u8, len: usize) ?*CRYPTO_BUFFER;
+    extern fn CRYPTO_BUFFER_free(buf: *CRYPTO_BUFFER) void;
+};
+
+const chrome_tls = struct {
+    // TLS 1.2 suites in Chrome's wire order. BoringSSL emits the three TLS 1.3
+    // suites ahead of these in its own fixed order (AES-128-GCM, AES-256-GCM,
+    // CHACHA20-POLY1305), which already matches Chrome, and does not let
+    // SSL_CTX_set_cipher_list reorder them.
+    const cipher_list: [:0]const u8 =
+        "ECDHE-ECDSA-AES128-GCM-SHA256:" ++ // 0xc02b
+        "ECDHE-RSA-AES128-GCM-SHA256:" ++ // 0xc02f
+        "ECDHE-ECDSA-AES256-GCM-SHA384:" ++ // 0xc02c
+        "ECDHE-RSA-AES256-GCM-SHA384:" ++ // 0xc030
+        "ECDHE-ECDSA-CHACHA20-POLY1305:" ++ // 0xcca9
+        "ECDHE-RSA-CHACHA20-POLY1305:" ++ // 0xcca8
+        "ECDHE-RSA-AES128-SHA:" ++ // 0xc013
+        "ECDHE-RSA-AES256-SHA:" ++ // 0xc014
+        "AES128-GCM-SHA256:" ++ // 0x009c
+        "AES256-GCM-SHA384:" ++ // 0x009d
+        "AES128-SHA:" ++ // 0x002f
+        "AES256-SHA"; // 0x0035
+
+    // supported_groups. BoringSSL's GREASE support prepends the GREASE group
+    // itself, matching Chrome's leading GREASE slot.
+    const groups = [_]u16{
+        boring.SSL_GROUP_X25519_MLKEM768,
+        boring.SSL_GROUP_X25519,
+        boring.SSL_GROUP_SECP256R1,
+        boring.SSL_GROUP_SECP384R1,
+    };
+
+    // signature_algorithms, in Chrome's order. This is the *verify* preference
+    // list: it is what the client advertises it will accept from the peer.
+    // SSL_CTX_set_signing_algorithm_prefs is the unrelated client-cert side.
+    const sigalgs = [_]u16{
+        0x0403, // ecdsa_secp256r1_sha256
+        0x0804, // rsa_pss_rsae_sha256
+        0x0401, // rsa_pkcs1_sha256
+        0x0503, // ecdsa_secp384r1_sha384
+        0x0805, // rsa_pss_rsae_sha384
+        0x0501, // rsa_pkcs1_sha384
+        0x0806, // rsa_pss_rsae_sha512
+        0x0601, // rsa_pkcs1_sha512
+    };
+};
+
+// curl hands the SSL_CTX callback only the CURLOPT_SSL_CTX_DATA pointer, which
+// src/sys/libcurl.zig types as *X509_STORE, leaving no room to smuggle the
+// profile through it. The fingerprint profile is fixed for the process
+// lifetime, so a module-level flag written from reset() is equivalent.
+// ponytail: process-global; thread a struct through ssl_ctx_data (and widen the
+// libcurl.zig option type) if the fingerprint ever needs to vary per connection.
+var chrome_fingerprint = false;
+
+// Result of the one-time probe below, cached for the process lifetime.
+var chrome_fingerprint_probe: ?bool = null;
+
+/// Whether the full Chrome ClientHello can be applied on this BoringSSL build.
+///
+/// applyChromeFingerprint returns on its first error, so a single rejected step
+/// (a cipher name, a group id) would otherwise leave GREASE and permuted
+/// extensions applied but the cipher list, sigalgs, OCSP/SCT and certificate
+/// compression stock — a hello that is *more* uniquely identifiable than curl's
+/// untouched one. Every step depends only on compile-time constants, so running
+/// the whole sequence once against a throwaway context answers it for good: on
+/// failure nothing is applied to a real connection and curl's stock TLS
+/// configuration is left entirely alone.
+fn chromeFingerprintSupported() bool {
+    if (chrome_fingerprint_probe) |cached| {
+        return cached;
+    }
+    const supported = blk: {
+        const ctx = boring.SSL_CTX_new(boring.TLS_method()) orelse break :blk false;
+        defer boring.SSL_CTX_free(ctx);
+        applyChromeFingerprint(ctx) catch |err| {
+            log.warn(.http, "chrome tls fingerprint unavailable", .{ .err = err });
+            break :blk false;
+        };
+        break :blk true;
+    };
+    chrome_fingerprint_probe = supported;
+    return supported;
+}
+
+/// CURLOPT_SSL_CTX_FUNCTION hook: installs our certificate store and, under the
+/// stealth profile, reshapes the ClientHello to Chrome's.
+fn sslCtxCallback(
+    _: *libcurl.Curl,
+    raw_ssl_ctx: *anyopaque,
+    raw_x509_store: *anyopaque,
+) callconv(.c) libcurl.CurlCode {
+    const ssl_ctx: *crypto.SSL_CTX = @ptrCast(raw_ssl_ctx);
+    const store: *crypto.X509_STORE = @ptrCast(raw_x509_store);
+
+    // set1 takes its own reference, released with the SSL_CTX, so this stays
+    // balanced against Network's single long-lived store.
+    const result = crypto.SSL_CTX_set1_verify_cert_store(ssl_ctx, store);
+    if (result != 1) {
+        return libcurl.CURLE.ABORTED_BY_CALLBACK;
+    }
+
+    if (chrome_fingerprint) {
+        // Unreachable in practice: chrome_fingerprint is only set once the
+        // probe has run this exact sequence to completion. A failure here still
+        // leaves a usable connection, so log rather than abort it.
+        applyChromeFingerprint(ssl_ctx) catch |err| {
+            log.warn(.http, "chrome tls fingerprint", .{ .err = err });
+        };
+    }
+
+    return libcurl.CURLE.OK;
+}
+
+fn applyChromeFingerprint(ctx: *crypto.SSL_CTX) !void {
+    // GREASE in the cipher, group, extension and version slots. Chrome 110+
+    // also permutes its ClientHello extensions per connection, so a *stable*
+    // extension order is itself the tell — randomising is the match.
+    boring.SSL_CTX_set_grease_enabled(ctx, 1);
+    boring.SSL_CTX_set_permute_extensions(ctx, 1);
+
+    if (boring.SSL_CTX_set_min_proto_version(ctx, boring.TLS1_2_VERSION) != 1) {
+        return error.TlsMinVersion;
+    }
+    if (boring.SSL_CTX_set_max_proto_version(ctx, boring.TLS1_3_VERSION) != 1) {
+        return error.TlsMaxVersion;
+    }
+    if (boring.SSL_CTX_set_cipher_list(ctx, chrome_tls.cipher_list.ptr) != 1) {
+        return error.TlsCipherList;
+    }
+    if (boring.SSL_CTX_set1_group_ids(ctx, &chrome_tls.groups, chrome_tls.groups.len) != 1) {
+        return error.TlsGroups;
+    }
+    if (boring.SSL_CTX_set_verify_algorithm_prefs(ctx, &chrome_tls.sigalgs, chrome_tls.sigalgs.len) != 1) {
+        return error.TlsSigAlgs;
+    }
+
+    // status_request and signed_certificate_timestamp; Chrome sends both.
+    boring.SSL_CTX_enable_ocsp_stapling(ctx);
+    boring.SSL_CTX_enable_signed_cert_timestamps(ctx);
+
+    // compress_certificate (extension 27) advertising brotli only, as Chrome
+    // does. BoringSSL only advertises an algorithm it can actually decompress,
+    // so the extension costs a real decoder — brotli is already linked for
+    // src/render/Compression.zig.
+    const added = boring.SSL_CTX_add_cert_compression_alg(
+        ctx,
+        boring.TLSEXT_cert_compression_brotli,
+        null, // client never compresses its own certificate chain
+        brotliDecompressCert,
+    );
+    if (added != 1) {
+        return error.TlsCertCompression;
+    }
+}
+
+fn brotliDecompressCert(
+    _: *anyopaque,
+    out: **boring.CRYPTO_BUFFER,
+    uncompressed_len: usize,
+    in: [*]const u8,
+    in_len: usize,
+) callconv(.c) c_int {
+    const brotli = @import("brotli_decode");
+
+    var data: [*]u8 = undefined;
+    const buf = boring.CRYPTO_BUFFER_alloc(&data, uncompressed_len) orelse return 0;
+
+    // BoringSSL requires the result to be exactly uncompressed_len bytes.
+    var decoded_len = uncompressed_len;
+    const result = brotli.BrotliDecoderDecompress(in_len, in, &decoded_len, data);
+    if (result != @as(c_uint, brotli.BROTLI_DECODER_RESULT_SUCCESS) or decoded_len != uncompressed_len) {
+        boring.CRYPTO_BUFFER_free(buf);
+        return 0;
+    }
+
+    // Setting *out transfers ownership to BoringSSL.
+    out.* = buf;
+    return 1;
+}
+
 pub const Connection = struct {
     _easy: *libcurl.Curl,
     transport: Transport,
     node: std.DoublyLinkedList.Node = .{},
+    ip_filter_active: bool = false,
 
     pub const Transport = union(enum) {
         none, // used for cases that manage their own connection, e.g. telemetry
@@ -500,6 +760,7 @@ pub const Connection = struct {
     ) !void {
         libcurl.curl_easy_reset(self._easy);
         self.transport = .none;
+        self.ip_filter_active = if (ip_filter) |filter| filter.hasBlockedRanges() else false;
 
         // timeouts
         try libcurl.curl_easy_setopt(self._easy, .timeout_ms, config.httpTimeout());
@@ -512,34 +773,28 @@ pub const Connection = struct {
 
         // proxy
         const http_proxy = config.httpProxy();
-        if (http_proxy) |proxy| {
-            try libcurl.curl_easy_setopt(self._easy, .proxy, proxy.ptr);
-        } else {
-            try libcurl.curl_easy_setopt(self._easy, .proxy, null);
-        }
+        try libcurl.curl_easy_setopt(
+            self._easy,
+            .proxy,
+            try proxyOptionValue(http_proxy, self.ip_filter_active),
+        );
 
         // TLS.
-        if (config.tlsVerifyHost()) {
-            // Provide certificate store to connection's SSL_CTX.
-            try libcurl.curl_easy_setopt(self._easy, .ssl_ctx_function, &(struct {
-                fn wrap(
-                    _: *libcurl.Curl,
-                    raw_ssl_ctx: *anyopaque,
-                    raw_x509_store: *anyopaque,
-                ) callconv(.c) libcurl.CurlCode {
-                    const ssl_ctx: *crypto.SSL_CTX = @ptrCast(raw_ssl_ctx);
-                    const store: *crypto.X509_STORE = @ptrCast(raw_x509_store);
+        const verify_host = config.tlsVerifyHost();
 
-                    const result = crypto.SSL_CTX_set1_verify_cert_store(ssl_ctx, store);
-                    if (result != 1) {
-                        return libcurl.CURLE.ABORTED_BY_CALLBACK;
-                    }
-                    return libcurl.CURLE.OK;
-                }
-            }).wrap);
+        // Gated on the stealth profile so non-stealth behaviour is byte-for-byte
+        // unchanged.
+        chrome_fingerprint = config.stealth() and chromeFingerprintSupported();
+
+        // The SSL_CTX hook carries both the certificate store and the Chrome
+        // ClientHello shaping, so it is installed whenever either is wanted.
+        if (verify_host or chrome_fingerprint) {
+            try libcurl.curl_easy_setopt(self._easy, .ssl_ctx_function, sslCtxCallback);
             // Pass our store to CURLOPT_SSL_CTX_FUNCTION.
             try libcurl.curl_easy_setopt(self._easy, .ssl_ctx_data, x509_store);
-        } else {
+        }
+
+        if (!verify_host) {
             try libcurl.curl_easy_setopt(self._easy, .ssl_verify_host, false);
             try libcurl.curl_easy_setopt(self._easy, .ssl_verify_peer, false);
 
@@ -566,8 +821,10 @@ pub const Connection = struct {
 
         // IP filter: block private/internal network addresses
         if (ip_filter) |filter| {
-            try libcurl.curl_easy_setopt(self._easy, .opensocket_function, opensocketCallback);
-            try libcurl.curl_easy_setopt(self._easy, .opensocket_data, @constCast(filter));
+            if (filter.hasBlockedRanges()) {
+                try libcurl.curl_easy_setopt(self._easy, .opensocket_function, opensocketCallback);
+                try libcurl.curl_easy_setopt(self._easy, .opensocket_data, @constCast(filter));
+            }
         }
     }
 
@@ -576,7 +833,11 @@ pub const Connection = struct {
     }
 
     pub fn setProxy(self: *const Connection, proxy: ?[:0]const u8) !void {
-        try libcurl.curl_easy_setopt(self._easy, .proxy, if (proxy) |p| p.ptr else null);
+        try libcurl.curl_easy_setopt(
+            self._easy,
+            .proxy,
+            try proxyOptionValue(proxy, self.ip_filter_active),
+        );
     }
 
     pub fn setFollowLocation(self: *const Connection, follow: bool) !void {
@@ -951,6 +1212,32 @@ fn makeSockAddrV4(ip: [4]u8) libcurl.CurlSockAddr {
     return curl_sa;
 }
 
+const TestCurlSockAddr = extern struct {
+    family: c_int,
+    socktype: c_int,
+    protocol: c_int,
+    addrlen: c_uint,
+    addr: posix.sockaddr.storage,
+};
+
+fn makeSockAddrV6(ip: [16]u8) TestCurlSockAddr {
+    var curl_sa: TestCurlSockAddr = .{
+        .family = posix.AF.INET6,
+        .socktype = posix.SOCK.STREAM,
+        .protocol = 0,
+        .addrlen = @sizeOf(posix.sockaddr.in6),
+        .addr = undefined,
+    };
+    const sa: *posix.sockaddr.in6 = @ptrCast(@alignCast(&curl_sa.addr));
+    sa.* = .{
+        .port = 0,
+        .flowinfo = 0,
+        .addr = ip,
+        .scope_id = 0,
+    };
+    return curl_sa;
+}
+
 const testing = @import("../testing.zig");
 
 test "isBadPort" {
@@ -995,8 +1282,17 @@ fn findHeader(headers: Headers, name: []const u8) struct { count: usize, value: 
     return .{ .count = count, .value = value };
 }
 
+// Guards the whole Chrome ClientHello: if any single step stops being accepted
+// by the linked BoringSSL, this fails instead of silently shipping a stock
+// (or worse, half-shaped) hello under --stealth.
+test "Chrome TLS fingerprint applies in full" {
+    chrome_fingerprint_probe = null;
+    defer chrome_fingerprint_probe = null;
+    try testing.expect(chromeFingerprintSupported());
+}
+
 test "Headers.set replaces an existing header instead of duplicating it" {
-    var headers = try Headers.init("User-Agent: Lightpanda/1.0", Config.HttpHeaders.sec_ch_ua_default);
+    var headers = try Headers.init("User-Agent: Lightpanda/1.0", Config.HttpHeaders.sec_ch_ua);
     defer headers.deinit();
 
     try headers.set("User-Agent: Custom/1.0");
@@ -1007,7 +1303,7 @@ test "Headers.set replaces an existing header instead of duplicating it" {
 }
 
 test "Headers.set matches header names case-insensitively" {
-    var headers = try Headers.init("User-Agent: Lightpanda/1.0", Config.HttpHeaders.sec_ch_ua_default);
+    var headers = try Headers.init("User-Agent: Lightpanda/1.0", Config.HttpHeaders.sec_ch_ua);
     defer headers.deinit();
 
     try headers.set("user-agent: Custom/1.0");
@@ -1018,7 +1314,7 @@ test "Headers.set matches header names case-insensitively" {
 }
 
 test "Headers.set adds a new header and preserves defaults" {
-    var headers = try Headers.init("User-Agent: Lightpanda/1.0", Config.HttpHeaders.sec_ch_ua_default);
+    var headers = try Headers.init("User-Agent: Lightpanda/1.0", Config.HttpHeaders.sec_ch_ua);
     defer headers.deinit();
 
     try headers.set("X-Custom: yes");
@@ -1026,6 +1322,24 @@ test "Headers.set adds a new header and preserves defaults" {
     try testing.expectEqual(@as(usize, 1), findHeader(headers, "X-Custom").count);
     try testing.expectEqual(@as(usize, 1), findHeader(headers, "User-Agent").count);
     try testing.expectEqual(@as(usize, 1), findHeader(headers, "Accept-Language").count);
+}
+
+test "proxy option disables ambient proxies and rejects filtered explicit proxies" {
+    const disabled = try proxyOptionValue(null, true);
+    try testing.expectEqual(@as(u8, 0), disabled[0]);
+
+    const explicitly_disabled: [:0]const u8 = "";
+    const empty = try proxyOptionValue(explicitly_disabled, true);
+    try testing.expectEqual(@as(u8, 0), empty[0]);
+
+    const proxy: [:0]const u8 = "http://proxy.example:8080";
+    const enabled = try proxyOptionValue(proxy, false);
+    try testing.expectString(proxy, std.mem.span(enabled));
+
+    try testing.expectError(
+        error.ProxyBypassesIpFilter,
+        proxyOptionValue(proxy, true),
+    );
 }
 
 test "opensocketCallback: private IPv4 returns CURL_SOCKET_BAD" {
@@ -1063,4 +1377,45 @@ test "opensocketCallback: block_private=false allows private IP" {
     defer _ = std.c.close(fd);
 
     try testing.expect(fd >= 0);
+}
+
+test "opensocketCallback: IPv4-embedded IPv6 cannot bypass filter" {
+    testing.silenceLog(&.{.http});
+
+    const filter = IpFilter.init(true, null);
+    const mapped_loopback = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 };
+    const translated_loopback = [16]u8{ 0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1 };
+
+    var mapped = makeSockAddrV6(mapped_loopback);
+    try testing.expectEqual(
+        libcurl.CURL_SOCKET_BAD,
+        opensocketCallback(@ptrCast(@constCast(&filter)), @intFromEnum(libcurl.CurlSockType.ipcxn), @ptrCast(&mapped)),
+    );
+
+    var translated = makeSockAddrV6(translated_loopback);
+    try testing.expectEqual(
+        libcurl.CURL_SOCKET_BAD,
+        opensocketCallback(@ptrCast(@constCast(&filter)), @intFromEnum(libcurl.CurlSockType.ipcxn), @ptrCast(&translated)),
+    );
+}
+
+test "opensocketCallback: allow CIDR applies to IPv4-embedded IPv6" {
+    testing.silenceLog(&.{.http});
+
+    const cidrs = try IpFilter.parseCidrList(testing.allocator, "-127.0.0.1/32");
+    const filter = IpFilter.init(true, cidrs);
+    defer filter.deinit(testing.allocator);
+
+    const mapped_loopback = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 };
+    const translated_loopback = [16]u8{ 0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1 };
+
+    var mapped = makeSockAddrV6(mapped_loopback);
+    const mapped_fd = opensocketCallback(@ptrCast(@constCast(&filter)), @intFromEnum(libcurl.CurlSockType.ipcxn), @ptrCast(&mapped));
+    defer _ = std.c.close(mapped_fd);
+    try testing.expect(mapped_fd >= 0);
+
+    var translated = makeSockAddrV6(translated_loopback);
+    const translated_fd = opensocketCallback(@ptrCast(@constCast(&filter)), @intFromEnum(libcurl.CurlSockType.ipcxn), @ptrCast(&translated));
+    defer _ = std.c.close(translated_fd);
+    try testing.expect(translated_fd >= 0);
 }

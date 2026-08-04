@@ -647,7 +647,7 @@ fn matchesPseudoClass(el: *Node.Element, pseudo: Selector.PseudoClass, scope: *N
             // emptiness; comments and processing instructions are ignored.
             var it = node.childrenIterator();
             while (it.next()) |child| {
-                switch (child._type) {
+                switch (child.typed()) {
                     .cdata => |cdata| switch (cdata._type) {
                         .comment, .processing_instruction => {},
                         else => if (cdata.getLength() > 0) return false,
@@ -686,7 +686,7 @@ fn matchesPseudoClass(el: *Node.Element, pseudo: Selector.PseudoClass, scope: *N
             const lang = blk: {
                 var current: ?*Node = node;
                 while (current) |cur| : (current = cur.parentNode()) {
-                    switch (cur._type) {
+                    switch (cur.typed()) {
                         .element => |ancestor| {
                             if (ancestor.getAttributeSafe(comptime .wrap("lang"))) |value| {
                                 break :blk value;

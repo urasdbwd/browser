@@ -237,14 +237,14 @@ pub const List = struct {
             if (is_id) {
                 owner.removeElementId(element, e.value());
             }
-            e.setValue(try owner.dupeString(value.str()));
+            e.setValue(try canonicalizeValue(value.str(), owner));
             entry = e;
         } else {
             try self.ensureUnusedCapacity(1, owner);
             entry = &self._entries[self._len];
             entry.* = .init(
                 try canonicalizeName(result.normalized.str(), owner),
-                try owner.dupeString(value.str()),
+                try canonicalizeValue(value.str(), owner),
             );
             self._len += 1;
         }
@@ -271,7 +271,7 @@ pub const List = struct {
             // re-canonicalize: `other` can belong to a different frame
             self._entries[len] = .init(
                 try canonicalizeName(e.name(), frame),
-                try frame.dupeString(e.value()),
+                try canonicalizeValue(e.value(), frame),
             );
             self._len = len + 1;
         }
@@ -316,7 +316,7 @@ pub const List = struct {
         try self.ensureUnusedCapacity(1, frame);
         self._entries[len] = .init(
             try canonicalizeName(name, frame),
-            try frame.dupeString(value),
+            try canonicalizeValue(value, frame),
         );
         self._len = len + 1;
     }
@@ -375,9 +375,11 @@ pub const List = struct {
         if (needed > std.math.maxInt(u16)) {
             return error.OutOfMemory;
         }
-        // Lists are sized exactly at creation; dynamic additions are rare and
-        // small, so grow slowly.
-        return self.setCapacity(@intCast(@max(needed, @as(u32, self._cap) + 2)), frame);
+        // Lists are sized exactly at creation, so the first dynamic add still
+        // only reserves 4. After that grow x2: the arena never frees a realloc'd
+        // block, so +2 steps make script-driven setAttribute churn the arena.
+        const grown = @min(@as(u32, self._cap) *| 2, std.math.maxInt(u16));
+        return self.setCapacity(@intCast(@max(needed, @max(grown, 4))), frame);
     }
 
     fn setCapacity(self: *List, new_cap: u16, frame: *Frame) !void {
@@ -529,6 +531,27 @@ fn canonicalizeName(name: []const u8, frame: *Frame) ![]const u8 {
     const gop = try frame._attribute_names.getOrPut(frame.arena, name);
     if (!gop.found_existing) {
         gop.key_ptr.* = try frame.arena.dupe(u8, name);
+    }
+    return gop.key_ptr.*;
+}
+
+// Longest value we'll put in frame._attribute_values. Above this the odds of a
+// repeat drop off (inline style, data: URIs, srcset, JSON blobs) while the map
+// entry and hash cost stay, so just dupe.
+const max_interned_value = 64;
+
+// Attribute values, unlike names, are not identity-compared anywhere - this is
+// purely dedup. Callers must treat the result as immutable.
+fn canonicalizeValue(value: []const u8, frame: *Frame) ![]const u8 {
+    if (value.len > max_interned_value) {
+        return frame.dupeString(value);
+    }
+    if (String.intern(value)) |static| {
+        return static;
+    }
+    const gop = try frame._attribute_values.getOrPut(frame.arena, value);
+    if (!gop.found_existing) {
+        gop.key_ptr.* = try frame.arena.dupe(u8, value);
     }
     return gop.key_ptr.*;
 }

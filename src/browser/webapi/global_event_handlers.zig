@@ -32,19 +32,14 @@ const Key = struct {
     /// Fuses `target` pointer and `handler` enum; used at hashing.
     /// NEVER use a fusion to retrieve a pointer back. Portability is not guaranteed.
     /// See `Context.hash`.
+    /// EventTarget is a bare tag (align 1), so there are no spare low bits to
+    /// shift out: the handler is xor'd into the high bits instead.
     fn fuse(self: *const Key) u64 {
-        // Check if we have 3 bits available from alignment of 8.
-        if (comptime IS_DEBUG) {
-            lp.assert(@alignOf(EventTarget) == 8, "Key.fuse: incorrect alignment", .{
-                .event_target_alignment = @alignOf(EventTarget),
-            });
-        }
-
-        const ptr = @intFromPtr(self.target) >> 3;
+        const ptr = @intFromPtr(self.target);
         if (comptime IS_DEBUG) {
             lp.assert(ptr < (1 << 57), "Key.fuse: pointer overflow", .{ .ptr = ptr });
         }
-        return ptr | (@as(u64, @intFromEnum(self.handler)) << 57);
+        return ptr ^ (@as(u64, @intFromEnum(self.handler)) << 57);
     }
 };
 
@@ -54,7 +49,7 @@ const Context = struct {
     }
 
     pub fn eql(_: @This(), a: Key, b: Key) bool {
-        return a.fuse() == b.fuse();
+        return a.target == b.target and a.handler == b.handler;
     }
 };
 

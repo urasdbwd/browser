@@ -298,15 +298,20 @@ fn buildJSONVersionResponse(app: *const App, port: u16) ![]const u8 {
             .message = "when --host is set to 0.0.0.0 consider setting --advertise-host to a reachable address",
         });
     }
+    const http_headers = &app.config.http_headers;
+    const browser: []const u8 = "Lightpanda/1.0";
+    const version_field: []const u8 = "\"Lightpanda-Version\": \"" ++ lp.build_config.version ++ "\", ";
+
     const body_format =
         "{{" ++
-        "\"Browser\": \"Lightpanda/1.0\", " ++
+        "\"Browser\": \"{s}\", " ++
         "\"Protocol-Version\": \"1.3\", " ++
-        "\"User-Agent\": \"Lightpanda/1.0\", " ++
-        "\"Lightpanda-Version\": \"" ++ lp.build_config.version ++ "\", " ++
+        "\"User-Agent\": \"{s}\", " ++
+        "{s}" ++
         "\"webSocketDebuggerUrl\": \"ws://{s}:{d}/\"" ++
         "}}";
-    const body_len = std.fmt.count(body_format, .{ host, port });
+    const body_args = .{ browser, http_headers.user_agent, version_field, host, port };
+    const body_len = std.fmt.count(body_format, body_args);
 
     // We send a Connection: Close (and actually close the connection)
     // because chromedp (Go driver) sends a request to /json/version and then
@@ -320,7 +325,7 @@ fn buildJSONVersionResponse(app: *const App, port: u16) ![]const u8 {
         "Connection: Close\r\n" ++
         "Content-Type: application/json; charset=UTF-8\r\n\r\n" ++
         body_format;
-    return try std.fmt.allocPrint(app.allocator, response_format, .{ body_len, host, port });
+    return try std.fmt.allocPrint(app.allocator, response_format, .{body_len} ++ body_args);
 }
 
 const testing = @import("testing.zig");
