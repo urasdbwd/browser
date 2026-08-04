@@ -6,23 +6,70 @@ function resolveTarget(target) {
   return target;
 }
 
-function configureResourcePolicy(iframe, options) {
-  const directResources = options.directResources === true;
+// "off" | "on" | "auto", matching the server's tri-state. Legacy booleans map
+// onto it so `directResources: true` keeps meaning what it always did.
+//
+// The trade this option exists to surface: with direct resources the origin
+// sees two different clients for one page load — Lightpanda's IP and TLS
+// fingerprint fetched the document, the viewer's browser fetches the assets.
+// Anything doing bot detection reads that split as a signal. "auto" hands the
+// call to the server, which resolves it against its own --stealth setting.
+function resourcePolicyMode(value) {
+  if (value === true) return "on";
+  if (value === false || value == null) return "off";
+  if (value === "on" || value === "off" || value === "auto") return value;
+  throw new TypeError(
+    `Lightpanda directResources must be "on", "off" or "auto", got ${JSON.stringify(value)}`,
+  );
+}
+
+export function configureResourcePolicy(iframe, options) {
+  const mode = resourcePolicyMode(options.directResources);
   const supportsCredentialless = "credentialless" in iframe;
   const useCredentialless = options.credentialless !== false;
-  if (options.requireCredentialless && !supportsCredentialless) {
-    throw new Error("This browser does not support credentialless iframes");
+  // Credentialless iframes are Chromium-only. Failing closed here would have
+  // made every direct-resource page unusable in Firefox and Safari, so warn and
+  // carry on; callers that genuinely cannot accept credentialed subresource
+  // requests opt into the hard failure with requireCredentialless.
+  if (!supportsCredentialless && (useCredentialless || mode !== "off")) {
+    if (options.requireCredentialless) {
+      throw new Error("This browser does not support credentialless iframes");
+    }
+    console.warn(
+      "Lightpanda: this browser has no credentialless iframe support, so " +
+      "resources the snapshot loads may carry site cookies. Pass " +
+      "requireCredentialless: true to fail closed instead.",
+    );
   }
-  if (directResources &&
-      (!supportsCredentialless || !useCredentialless) &&
+  if (mode !== "off" && !useCredentialless &&
       options.allowCredentialedResources !== true) {
     throw new Error(
-      "Direct client resources require a credentialless iframe or " +
+      "Direct client resources with credentialless: false require " +
       "allowCredentialedResources: true",
     );
   }
   if (useCredentialless && supportsCredentialless) iframe.credentialless = true;
-  return directResources;
+  return mode;
+}
+
+// A blocked subresource is otherwise invisible outside devtools: the render CSP
+// kills the request, the page comes out unstyled or imageless, and the API
+// caller is told nothing at all. Inspect the loaded document rather than racing
+// securitypolicyviolation events, which fire while it is still parsing.
+// Resources still in flight report nothing; the next snapshot catches them.
+export function blockedResources(documents) {
+  const blocked = [];
+  for (const doc of documents) {
+    for (const image of doc.querySelectorAll?.("img[src]") ?? []) {
+      if (image.complete && image.naturalWidth === 0) {
+        blocked.push({ kind: "image", uri: image.src });
+      }
+    }
+    for (const link of doc.querySelectorAll?.('link[rel~="stylesheet"][href]') ?? []) {
+      if (!link.sheet) blocked.push({ kind: "stylesheet", uri: link.href });
+    }
+  }
+  return blocked;
 }
 
 function aborted(signal) {
@@ -436,6 +483,47 @@ export function applyCanvasOps(ctx, ops, imageFor) {
       // One bad op must not abandon the rest of the frame.
     }
   }
+}
+
+const CANVAS_MIRROR_ATTR = "data-lp-canvas-image";
+
+// The snapshot iframe runs no scripts, and per the HTML rendering rules a
+// <canvas> is only a replaced element when scripting is enabled. Without it the
+// canvas lays out as an ordinary inline box: its width/height attributes are
+// ignored, explicit CSS sizes are ignored, and none of the replayed bitmap is
+// painted, however the page styles it. Measured in Chrome: a 480x280 canvas
+// holding real pixels reported a 3.75x21.25 border box. An <img> IS replaced
+// there, so mirror the bitmap into one and park it inside the canvas, where it
+// renders as the canvas's fallback content and gives the box a real size.
+// Granting the sandbox allow-scripts would also make canvas replaced; that is
+// the whole security model of a script-free snapshot and is not on the table.
+// ponytail: a PNG data URL re-encoded per snapshot, per canvas. Upgrade path if
+// it ever shows up in a profile: canvas.toBlob and a blob: object URL, which
+// the render CSP already permits, at the cost of an async hop per frame.
+export function mirrorCanvasPixels(canvas) {
+  let url;
+  try {
+    url = canvas.toDataURL();
+  } catch {
+    return null;
+  }
+  let image = canvas.querySelector?.(`img[${CANVAS_MIRROR_ATTR}]`) ?? null;
+  if (!image) {
+    image = canvas.ownerDocument.createElement("img");
+    image.setAttribute(CANVAS_MIRROR_ATTR, "");
+    image.setAttribute("style", "display:block");
+    canvas.append(image);
+  }
+  // The intrinsic size comes from the canvas's own bitmap dimensions, so page
+  // CSS that targets the canvas still positions and decorates the box.
+  if (image.getAttribute("width") !== String(canvas.width)) {
+    image.setAttribute("width", String(canvas.width));
+  }
+  if (image.getAttribute("height") !== String(canvas.height)) {
+    image.setAttribute("height", String(canvas.height));
+  }
+  if (image.getAttribute("src") !== url) image.setAttribute("src", url);
+  return image;
 }
 
 function sameSnapshotElement(current, fresh, currentKeys, keyMarker) {
@@ -1374,6 +1462,12 @@ export class LightpandaVirtualBrowser extends EventTarget {
       if (!continuityTargets.has(key)) this.#animationSignatures.delete(key);
     }
     this.#replayCanvasOps(documents);
+    const blocked = blockedResources(documents);
+    if (blocked.length !== 0) {
+      this.dispatchEvent(new CustomEvent("resourcesblocked", {
+        detail: { resources: blocked, directResources: this.#directResources },
+      }));
+    }
   }
 
   // ponytail: a canvas only replays the ops recorded since the previous
@@ -1384,19 +1478,21 @@ export class LightpandaVirtualBrowser extends EventTarget {
   // the server resend the whole log when an ack is missed.
   #replayCanvasOps(documents) {
     for (const doc of documents) {
-      for (const canvas of doc.querySelectorAll(`canvas[${CANVAS_OPS_ATTR}]`)) {
+      // Every canvas, not only the ones carrying ops: the morph strips the
+      // mirrored <img> back out on each snapshot, so a canvas that stopped
+      // changing still has to have its pixels put back on screen.
+      for (const canvas of doc.querySelectorAll("canvas")) {
         const value = canvas.getAttribute(CANVAS_OPS_ATTR);
-        canvas.removeAttribute(CANVAS_OPS_ATTR);
-        let parsed;
-        try {
-          parsed = parseCanvasOps(value ?? "");
-        } catch {
-          continue;
+        if (value !== null) {
+          canvas.removeAttribute(CANVAS_OPS_ATTR);
+          let parsed = null;
+          try {
+            parsed = parseCanvasOps(value);
+          } catch {}
+          const ctx = parsed?.ops.length ? canvas.getContext?.("2d") : null;
+          if (ctx) applyCanvasOps(ctx, parsed.ops, (src) => this.#canvasImage(src));
         }
-        if (parsed.ops.length === 0) continue;
-        const ctx = canvas.getContext?.("2d");
-        if (!ctx) continue;
-        applyCanvasOps(ctx, parsed.ops, (src) => this.#canvasImage(src));
+        mirrorCanvasPixels(canvas);
       }
     }
   }

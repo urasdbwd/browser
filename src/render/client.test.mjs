@@ -523,6 +523,141 @@ test("canvas ops replay onto the viewer's real 2D context", async () => {
   assert.deepEqual(calls, [["fillRect", 9, 9, 9, 9]]);
 });
 
+test("blocked subresources are reported instead of failing silently", async () => {
+  const { blockedResources } = await loadRenderer();
+
+  const doc = {
+    querySelectorAll(selector) {
+      if (selector === "img[src]") {
+        return [
+          { complete: true, naturalWidth: 0, src: "https://cdn.test/logo.png" },
+          { complete: true, naturalWidth: 64, src: "https://cdn.test/ok.png" },
+          // Still downloading: unknown, not blocked. The next snapshot decides.
+          { complete: false, naturalWidth: 0, src: "https://cdn.test/slow.png" },
+        ];
+      }
+      return [
+        { sheet: null, href: "https://cdn.test/site.css" },
+        { sheet: {}, href: "https://cdn.test/inline.css" },
+      ];
+    },
+  };
+
+  assert.deepEqual(blockedResources([doc]), [
+    { kind: "image", uri: "https://cdn.test/logo.png" },
+    { kind: "stylesheet", uri: "https://cdn.test/site.css" },
+  ]);
+  assert.deepEqual(blockedResources([{}]), []);
+});
+
+test("a missing credentialless iframe warns rather than breaking Firefox", async () => {
+  const { configureResourcePolicy } = await loadRenderer();
+  const warn = console.warn;
+  const warnings = [];
+  console.warn = (message) => warnings.push(message);
+  try {
+    // No "credentialless" property at all: every non-Chromium browser. Throwing
+    // here used to make directResources unusable outside Chromium.
+    assert.equal(configureResourcePolicy({}, { directResources: true }), "on");
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /credentialless/);
+
+    // Opting into the strict policy still fails closed.
+    assert.throws(
+      () => configureResourcePolicy({}, {
+        directResources: "on",
+        requireCredentialless: true,
+      }),
+      /does not support credentialless/,
+    );
+
+    // Chromium: no warning, and the iframe is switched to credentialless.
+    const chromium = { credentialless: false };
+    warnings.length = 0;
+    assert.equal(configureResourcePolicy(chromium, { directResources: "auto" }), "auto");
+    assert.equal(chromium.credentialless, true);
+    assert.deepEqual(warnings, []);
+
+    // Turning credentialless off is the one case that must still fail closed:
+    // the request would go out with the viewer's cookies.
+    assert.throws(
+      () => configureResourcePolicy({ credentialless: false }, {
+        directResources: "on",
+        credentialless: false,
+      }),
+      /allowCredentialedResources/,
+    );
+    assert.equal(
+      configureResourcePolicy({ credentialless: false }, {
+        directResources: "on",
+        credentialless: false,
+        allowCredentialedResources: true,
+      }),
+      "on",
+    );
+
+    // Default and alias mapping, plus a hard no on anything else.
+    assert.equal(configureResourcePolicy({ credentialless: false }, {}), "off");
+    assert.equal(
+      configureResourcePolicy({ credentialless: false }, { directResources: false }),
+      "off",
+    );
+    assert.throws(
+      () => configureResourcePolicy({ credentialless: false }, { directResources: "maybe" }),
+      /must be "on", "off" or "auto"/,
+    );
+  } finally {
+    console.warn = warn;
+  }
+});
+
+test("canvas pixels are mirrored into a replaced <img> the snapshot can lay out", async () => {
+  const { mirrorCanvasPixels } = await loadRenderer();
+
+  const makeElement = (localName) => {
+    const attributes = new Map();
+    return {
+      localName,
+      children: [],
+      attributes,
+      getAttribute: (name) => attributes.get(name) ?? null,
+      setAttribute: (name, value) => attributes.set(name, String(value)),
+      append(child) { this.children.push(child); },
+      querySelector(selector) {
+        const name = selector.slice(0, selector.indexOf("["));
+        const attribute = selector.slice(selector.indexOf("[") + 1, -1);
+        return this.children.find(
+          (child) => child.localName === name && child.getAttribute(attribute) !== null,
+        ) ?? null;
+      },
+    };
+  };
+  const canvas = makeElement("canvas");
+  canvas.width = 480;
+  canvas.height = 280;
+  canvas.toDataURL = () => "data:image/png;base64,AAAA";
+  canvas.ownerDocument = { createElement: makeElement };
+
+  const image = mirrorCanvasPixels(canvas);
+  assert.equal(canvas.children.length, 1);
+  assert.equal(image.localName, "img");
+  // An <img> without dimensions would lay out at 0x0 in a scripting-disabled
+  // document just as the canvas did.
+  assert.equal(image.getAttribute("width"), "480");
+  assert.equal(image.getAttribute("height"), "280");
+  assert.equal(image.getAttribute("src"), "data:image/png;base64,AAAA");
+
+  // A later frame updates the same mirror instead of stacking a second one.
+  canvas.toDataURL = () => "data:image/png;base64,BBBB";
+  assert.equal(mirrorCanvasPixels(canvas), image);
+  assert.equal(canvas.children.length, 1);
+  assert.equal(image.getAttribute("src"), "data:image/png;base64,BBBB");
+
+  // A tainted canvas throws on read; the snapshot must survive it.
+  canvas.toDataURL = () => { throw new Error("tainted"); };
+  assert.equal(mirrorCanvasPixels(canvas), null);
+});
+
 test("mousedown and mouseup are forwarded without coalescing", async () => {
   const original = {
     CustomEvent: globalThis.CustomEvent,

@@ -138,7 +138,7 @@ loopback and link-local addresses are blocked by default; use
     "http://127.0.0.1:9223/lightpanda-renderer.js";
 
   const renderer = attachLightpandaRenderer("#preview", {
-    directResources: true,
+    directResources: "auto",
     requireCredentialless: true,
   });
   await renderer.render("https://example.com", { waitUntil: "done" });
@@ -156,7 +156,7 @@ user's browser renders successive script-free snapshots:
     "http://127.0.0.1:9223/lightpanda-renderer.js";
 
   const browser = attachLightpandaVirtualBrowser("#browser", {
-    directResources: true,
+    directResources: "auto",
     requireCredentialless: true,
   });
   await browser.open("https://example.com");
@@ -214,13 +214,42 @@ closes the live session. Run one `render` process per independently concurrent
 user. If an established live WebSocket drops, the client keeps the last painted
 snapshot inert and reopens the Lightpanda session with bounded backoff.
 
-Remote visual resources are blocked by default. Set `directResources: true`
-to let the client browser fetch preserved stylesheets, images, fonts and media;
-this does not make Lightpanda decode or render them. Direct mode requires a
-credentialless iframe unless `allowCredentialedResources: true` explicitly
-accepts sending browser credentials. It also exposes the client IP and network
-to requests selected by the target page, so use it only for trusted targets or
-behind a future resource broker.
+Remote visual resources are blocked by default: the render CSP allows only
+`data:` and `blob:`, so external stylesheets, images, fonts and media are killed
+before they leave the viewer. `directResources` is a three-state option that
+decides whether the client browser may fetch them itself; this never makes
+Lightpanda decode or render them.
+
+| `directResources` | Effect |
+| --- | --- |
+| `"off"` (default) | External subresources stay blocked. One client, one fingerprint. |
+| `"on"` | The viewer fetches stylesheets, images, fonts and media directly. |
+| `"auto"` | The server decides: off when it runs with `--stealth`, on otherwise. |
+
+`true` and `false` are accepted as aliases for `"on"` and `"off"`.
+
+Direct mode is not free, and the cost is not only privacy. **The origin sees two
+different clients for one page load**: Lightpanda's IP and TLS fingerprint
+fetched the document, the end user's browser fetches the assets. Anything doing
+bot detection reads that split as a strong signal, so turning this on silently
+undermines the stealth surface the rest of the browser maintains. It also
+exposes the client IP and network to requests the target page selects. `"auto"`
+exists to make that trade follow the deployment: an operator running without
+`--stealth` has no fingerprint to protect and gets the better-looking page,
+while a stealth deployment keeps the single-client profile. Note this is the
+inverse of `--solve_captchas auto`, which turns *on* under stealth.
+
+Direct mode requires a credentialless iframe unless
+`allowCredentialedResources: true` explicitly accepts sending browser
+credentials. On browsers without credentialless iframe support (currently
+everything outside Chromium) the live client warns on the console and continues;
+pass `requireCredentialless: true` to fail closed instead.
+
+Whatever the setting, the live client reports what did not load: it emits a
+`resourcesblocked` event carrying every image and stylesheet the snapshot could
+not fetch, so a caller can tell "the page renders badly" from "the page renders
+badly because the policy blocked eleven things". The one-shot renderer cannot —
+its iframe is opaquely sandboxed and the parent cannot read into it.
 Public anonymous CSS, images, fonts and media are suitable for direct client
 rendering. Authenticated, origin-bound, signed or `blob:` visual resources need
 an opaque Lightpanda resource relay: Lightpanda performs the authorized fetch
@@ -234,8 +263,8 @@ empty-sandbox iframe. The live client uses `srcdoc` and adds only
 enters the parent via `innerHTML`. Both clients request a credentialless iframe
 where supported and send no referrer. Set
 `requireCredentialless: true` to fail closed on browsers without that feature;
-otherwise remote stylesheet, image, font or media requests may still use site
-cookies on older browsers. Those resources are fetched and decoded by the
+otherwise the client warns and remote stylesheet, image, font or media requests
+may still use site cookies there. Those resources are fetched and decoded by the
 client; Lightpanda only streams the script-free document state. The one-shot
 iframe is inert and has pointer events disabled.
 Live snapshots cancel capture-phase anchor clicks, auxiliary clicks and form

@@ -109,12 +109,41 @@ pub const Command = struct {
     width: u32 = 1280,
     height: u32 = 720,
     snapshot: bool = true,
-    direct_resources: bool = false,
+    direct_resources: DirectResources = .off,
 };
 
 pub const Target = struct {
     version: []const u8,
     id: u32,
+};
+
+/// Whether the viewer's own browser may fetch the page's stylesheets, images,
+/// fonts and media straight from their origins.
+///
+/// With it off, the render CSP allows only `data:` and `blob:`, so every
+/// external subresource is blocked and the page renders unstyled and
+/// imageless. With it on, the page looks right — but the origin then sees two
+/// different clients for one page load: Lightpanda's IP and TLS fingerprint
+/// fetched the document, the end user's fetches the assets. To anything doing
+/// bot detection that mismatch is a strong signal, and it silently undermines
+/// the stealth surface the rest of the browser works to keep intact. That is a
+/// per-deployment call, not a default, which is why this is an explicit
+/// three-state option rather than a bool with a quiet answer.
+pub const DirectResources = enum {
+    /// Off when `--stealth` is set, on otherwise: an operator who is not hiding
+    /// has no fingerprint split to lose. Note this is the *inverse* of
+    /// `--solve_captchas auto`, which turns itself on under stealth.
+    auto,
+    on,
+    off,
+
+    pub fn enabled(self: DirectResources, config: *const lp.Config) bool {
+        return switch (self) {
+            .on => true,
+            .off => false,
+            .auto => !config.stealth(),
+        };
+    }
 };
 
 pub const Outcome = struct {
@@ -383,7 +412,7 @@ fn init(
         .owner = owner,
         .next_target_generation = next_target_generation,
         .target_key_secret = target_key_secret,
-        .direct_resources = command.direct_resources,
+        .direct_resources = command.direct_resources.enabled(app.config),
     };
 }
 
@@ -904,9 +933,26 @@ test "live session: command parser reads action" {
 
     const opened = try parseCommand(
         arena.allocator(),
-        "{\"id\":10,\"type\":\"open\",\"url\":\"https://example.com\",\"direct_resources\":true}",
+        "{\"id\":10,\"type\":\"open\",\"url\":\"https://example.com\",\"direct_resources\":\"on\"}",
     );
-    try std.testing.expect(opened.direct_resources);
+    try std.testing.expectEqual(DirectResources.on, opened.direct_resources);
+    try std.testing.expect(opened.direct_resources.enabled(testing.test_app.config));
+
+    const blocked = try parseCommand(
+        arena.allocator(),
+        "{\"id\":10,\"type\":\"open\",\"url\":\"https://example.com\"}",
+    );
+    try std.testing.expectEqual(DirectResources.off, blocked.direct_resources);
+    try std.testing.expect(!blocked.direct_resources.enabled(testing.test_app.config));
+
+    const automatic = try parseCommand(
+        arena.allocator(),
+        "{\"id\":10,\"type\":\"open\",\"url\":\"https://example.com\",\"direct_resources\":\"auto\"}",
+    );
+    try std.testing.expectEqual(
+        !testing.test_app.config.stealth(),
+        automatic.direct_resources.enabled(testing.test_app.config),
+    );
 
     const held = try parseCommand(
         arena.allocator(),

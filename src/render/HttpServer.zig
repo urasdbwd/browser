@@ -465,7 +465,7 @@ fn worker(self: *HttpServer) void {
                         job.result = .live_session_active;
                         break :render;
                     }
-                    const prepared = prepareRender(arena.allocator(), job) orelse break :render;
+                    const prepared = prepareRender(self.app.config, arena.allocator(), job) orelse break :render;
                     const render_wait_ms = remainingWaitMs(job.deadline, .now(lp.io, .boot)) orelse {
                         job.result = .timeout;
                         break :render;
@@ -555,7 +555,7 @@ const RenderRequest = struct {
     wait_selector: ?[]const u8 = null,
     width: u32 = 1280,
     height: u32 = 720,
-    direct_resources: bool = false,
+    direct_resources: LiveSession.DirectResources = .off,
 };
 
 const PreparedRender = struct {
@@ -568,7 +568,11 @@ const PreparedRender = struct {
     direct_resources: bool,
 };
 
-fn prepareRender(arena: std.mem.Allocator, job: *Job) ?PreparedRender {
+fn prepareRender(
+    config: *const lp.Config,
+    arena: std.mem.Allocator,
+    job: *Job,
+) ?PreparedRender {
     const request = std.json.parseFromSliceLeaky(RenderRequest, arena, job.body, .{
         .ignore_unknown_fields = true,
     }) catch |err| {
@@ -614,7 +618,7 @@ fn prepareRender(arena: std.mem.Allocator, job: *Job) ?PreparedRender {
         .wait_selector = selector,
         .width = request.width,
         .height = request.height,
-        .direct_resources = request.direct_resources,
+        .direct_resources = request.direct_resources.enabled(config),
     };
 }
 
@@ -1424,6 +1428,8 @@ fn readRequestBody(
     return reader.allocRemaining(arena, .limited(max_request_size));
 }
 
+const testing = @import("../testing.zig");
+
 test "render server: connection slots are bounded" {
     var active: std.atomic.Value(u32) = .init(0);
     try std.testing.expect(acquireConnectionSlot(&active, 2));
@@ -1687,7 +1693,7 @@ test "render server: invalid render requests fail during preparation" {
     };
     for (bodies) |body| {
         var job: Job = .{ .body = body, .out = &output };
-        try std.testing.expect(prepareRender(arena.allocator(), &job) == null);
+        try std.testing.expect(prepareRender(testing.test_app.config, arena.allocator(), &job) == null);
         try std.testing.expectEqual(Result.bad_request, job.result);
     }
 }
@@ -1698,12 +1704,32 @@ test "render server: direct client resources are explicit" {
     var output_buffer: [1]u8 = undefined;
     var output: std.Io.Writer = .fixed(&output_buffer);
     var job: Job = .{
-        .body = "{\"url\":\"https://example.com\",\"direct_resources\":true}",
+        .body = "{\"url\":\"https://example.com\",\"direct_resources\":\"on\"}",
         .out = &output,
     };
 
-    const request = prepareRender(arena.allocator(), &job).?;
+    const request = prepareRender(testing.test_app.config, arena.allocator(), &job).?;
     try std.testing.expect(request.direct_resources);
+
+    // Omitted means off: the CSP blocks every external subresource rather than
+    // splitting the page load across two clients behind the caller's back.
+    job = .{ .body = "{\"url\":\"https://example.com\"}", .out = &output };
+    const default = prepareRender(testing.test_app.config, arena.allocator(), &job).?;
+    try std.testing.expect(!default.direct_resources);
+
+    // `auto` resolves against the deployment's stealth setting, not the request.
+    job = .{
+        .body = "{\"url\":\"https://example.com\",\"direct_resources\":\"auto\"}",
+        .out = &output,
+    };
+    const automatic = prepareRender(testing.test_app.config, arena.allocator(), &job).?;
+    try std.testing.expectEqual(!testing.test_app.config.stealth(), automatic.direct_resources);
+
+    job = .{
+        .body = "{\"url\":\"https://example.com\",\"direct_resources\":true}",
+        .out = &output,
+    };
+    try std.testing.expect(prepareRender(testing.test_app.config, arena.allocator(), &job) == null);
 }
 
 test "render server: websocket ticket is decoded and single use" {
