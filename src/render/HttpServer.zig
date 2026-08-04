@@ -28,9 +28,18 @@ const posix = std.posix;
 const ns_per_ms = std.time.ns_per_ms;
 
 const worker_stack_size = 4 * 1024 * 1024;
-// std.compress.flate's allocation-free level-1 encoder keeps about 288 KiB of
-// tables/history in this frame. The OS commits only touched stack pages.
-const connection_stack_size = 768 * 1024;
+// Connection threads compress the response on their own stack, and
+// std.compress.flate's allocation-free encoder is the largest frame by far.
+// Derive the budget from the encoder instead of guessing at it: the OS commits
+// only touched stack pages, so the headroom is free, and a std-side size change
+// can no longer silently push this back over the guard page.
+// pthread_attr_setstacksize rejects a size that is not a whole number of pages,
+// so round up rather than hand back an unspawnable thread.
+const connection_stack_size = std.mem.alignForward(
+    usize,
+    512 * 1024 + Compression.gzip_stack_bytes,
+    64 * 1024,
+);
 const worker_retained_arena_bytes = 64 * 1024;
 const live_socket_timeout_ms = 5 * 60 * 1000;
 const live_ticket_ttl_ms = 30_000;
@@ -1448,6 +1457,31 @@ test "render server: live snapshot compression is negotiated and bounded" {
 
     const unsupported = liveCompressionPreferences(null);
     try std.testing.expectEqual(Compression.Encoding.identity, unsupported.preferred());
+}
+
+// Chrome's DecompressionStream implements gzip but not br, so every live
+// snapshot from a real browser takes the gzip path on a connection thread. The
+// encoder frame outgrew the old hand-written 768 KiB budget and overran the
+// guard page, taking the whole process down with it. Run the real encoder on a
+// real thread of the configured size: if the budget is ever short again, this
+// dies here instead of in front of a user.
+test "render server: a connection thread's stack survives the gzip encoder" {
+    const input = "<!doctype html><main>Lightpanda live snapshot</main>" ** 256;
+    const Case = struct {
+        fn run(body: []const u8) void {
+            var encoded: ResponseBuffer = .init(std.testing.allocator, body.len);
+            defer encoded.deinit();
+            const compressed = encodeLiveSnapshot(body, .{ .gzip = 1000 }, &encoded);
+            std.debug.assert(compressed.encoding == .gzip);
+            std.debug.assert(compressed.bytes.len < body.len);
+        }
+    };
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = connection_stack_size },
+        Case.run,
+        .{input},
+    );
+    thread.join();
 }
 
 test "render server: job deadlines preserve only remaining time" {
