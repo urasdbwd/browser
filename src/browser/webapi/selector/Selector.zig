@@ -114,8 +114,13 @@ pub const Cache = struct {
     }
 };
 
+// Both branches make a single TreeWalker pass, so a node is offered at most
+// once and the result cannot contain duplicates. It used to collect into an
+// AutoArrayHashMap anyway; on a 40k-match query the stored hashes and the index
+// table (both grown by doubling inside an arena that never frees) cost ~2.7 MiB
+// per query against ~0.6 MiB for the plain list.
 fn collectAll(arena: *lp.Arena, selectors: []const Selector, root: *Node, frame: *Frame) !*List {
-    var nodes: std.AutoArrayHashMapUnmanaged(*Node, void) = .empty;
+    var nodes: std.ArrayListUnmanaged(*Node) = .empty;
     if (selectors.len == 1) {
         try List.collect(arena.allocator(), root, selectors[0], &nodes, frame);
     } else {
@@ -124,7 +129,7 @@ fn collectAll(arena: *lp.Arena, selectors: []const Selector, root: *Node, frame:
         while (walker.next()) |node| {
             const element = node.is(Node.Element) orelse continue;
             if (matchesAny(selectors, element, root, frame)) {
-                try nodes.put(arena.allocator(), node, {});
+                try nodes.append(arena.allocator(), node);
             }
         }
     }
@@ -132,7 +137,7 @@ fn collectAll(arena: *lp.Arena, selectors: []const Selector, root: *Node, frame:
     const list = try arena.create(List);
     list.* = .{
         ._arena = arena,
-        ._nodes = nodes.keys(),
+        ._nodes = nodes.items,
     };
     return list;
 }
