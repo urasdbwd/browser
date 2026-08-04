@@ -144,6 +144,10 @@ test-client:
 bench:
 	@bench/run.sh zig-out/bin/lightpanda $(BENCH_ITERS)
 
+## Run the bot-detection probe; non-zero exit if any tell is detectable
+detect:
+	@bench/detect.sh zig-out/bin/lightpanda
+
 ## Run demo/runner end to end tests
 end2end:
 	@test -d ../demo
