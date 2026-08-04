@@ -318,19 +318,9 @@ pub fn getImageData(
     const image = try ImageData.init(@intCast(sw), @intCast(sh), null, exec);
     // Undrawn canvas: transparent black (spec). After drawing: stable fingerprint pixels.
     if (!self._dirty) return image;
-    var rng = self._fp_seed ^ (@as(u64, @bitCast(@as(i64, sx))) *% 0x9e3779b97f4a7c15) ^ (@as(u64, @bitCast(@as(i64, sy))) *% 0xbf58476d1ce4e5b9);
+    const seed = self._fp_seed ^ (@as(u64, @bitCast(@as(i64, sx))) *% 0x9e3779b97f4a7c15) ^ (@as(u64, @bitCast(@as(i64, sy))) *% 0xbf58476d1ce4e5b9);
     const local = exec.js.local.?;
-    const pixels = image._data.local(local).slice();
-    var i: usize = 0;
-    while (i + 3 < pixels.len) : (i += 4) {
-        rng ^= rng << 13;
-        rng ^= rng >> 7;
-        rng ^= rng << 17;
-        pixels[i] = @truncate(rng);
-        pixels[i + 1] = @truncate(rng >> 8);
-        pixels[i + 2] = @truncate(rng >> 16);
-        pixels[i + 3] = 255;
-    }
+    Canvas.fillFingerprintPixels(image._data.local(local).slice(), seed, @intCast(sw));
     return image;
 }
 

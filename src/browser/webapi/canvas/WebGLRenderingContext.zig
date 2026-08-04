@@ -209,6 +209,33 @@ fn Context(comptime version: Version) type {
 
         /// Parent canvas (spec requires .canvas).
         _canvas: *Canvas,
+        /// Seeded from the browser fingerprint profile when the context is
+        /// created; drives readPixels / toDataURL so the GPU probe isn't an
+        /// all-zero buffer.
+        _fp_seed: u64 = 0xcbf29ce484222325,
+
+        /// Distinct from the 2d context seed on the same canvas
+        /// (0x57454247 = "WEBG"), and from the sibling WebGL version.
+        pub fn fingerprintSeed(self: *const Self) u64 {
+            return self._fp_seed ^ 0x57454247 ^ @intFromEnum(version);
+        }
+
+        /// Fingerprint probes draw a scene then hash readPixels — an all-zero
+        /// buffer is a louder headless tell than a wrong GPU string. Fill it
+        /// with the same seeded generator the 2d canvas and toDataURL use.
+        /// ponytail: byte destinations only (UNSIGNED_BYTE, the format every
+        /// probe uses); handle float/half-float views when something reads them.
+        pub fn readPixels(self: *const Self, x: i32, y: i32, width: i32, height: i32, _: u32, _: u32, dest: ?js.Value) void {
+            const value = dest orelse return;
+            if (!value.isUint8Array() and !value.isUint8ClampedArray()) return;
+            const pixels = value.local.jsValueToZig([]u8, value) catch return;
+
+            var seed = self.fingerprintSeed();
+            inline for (.{ x, y, width, height }) |v| {
+                seed = (seed ^ @as(u64, @bitCast(@as(i64, v)))) *% 0x100000001b3;
+            }
+            Canvas.fillFingerprintPixels(pixels, seed, if (width > 0) @intCast(width) else 1);
+        }
 
         pub fn getCanvas(self: *const Self) *Canvas {
             return self._canvas;
@@ -361,7 +388,6 @@ fn Context(comptime version: Version) type {
         pub fn depthFunc(_: *const Self, _: u32) void {}
         pub fn cullFace(_: *const Self, _: u32) void {}
         pub fn frontFace(_: *const Self, _: u32) void {}
-        pub fn readPixels(_: *const Self, _: i32, _: i32, _: i32, _: i32, _: u32, _: u32, _: ?js.Value) void {}
 
         pub const JsApi = struct {
             pub const bridge = js.Bridge(Self);
@@ -452,7 +478,7 @@ fn Context(comptime version: Version) type {
             pub const depthFunc = bridge.function(Self.depthFunc, .{ .noop = true });
             pub const cullFace = bridge.function(Self.cullFace, .{ .noop = true });
             pub const frontFace = bridge.function(Self.frontFace, .{ .noop = true });
-            pub const readPixels = bridge.function(Self.readPixels, .{ .noop = true });
+            pub const readPixels = bridge.function(Self.readPixels, .{});
         };
     };
 }
