@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<!-- 'self' allows the document's own origin and blocks another one, here the
+     same test server reached through a different host name. -->
+<html>
+<head>
+<script src="../testing.js"></script>
+<meta http-equiv="Content-Security-Policy" content="script-src 'self'">
+<script src="a.js"></script>
+<script src="http://localhost:9582/src/browser/tests/csp/b.js"></script>
+</head>
+<body>
+<script id="self">
+  testing.expectEqual(true, window.__a);
+  testing.expectEqual(true, window.__b === undefined);
+</script>
+</body>
+</html>

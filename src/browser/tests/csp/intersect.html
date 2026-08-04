@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<!-- Two policies intersect: 'self' allows a.js, https: does not, and a policy
+     can only ever narrow, never widen, so a.js is blocked. -->
+<html>
+<head>
+<script src="../testing.js"></script>
+<meta http-equiv="Content-Security-Policy" content="script-src 'self'">
+<meta http-equiv="Content-Security-Policy" content="script-src https:">
+<script src="a.js"></script>
+</head>
+<body>
+<script id="intersect">
+  testing.expectEqual(true, window.__a === undefined);
+</script>
+</body>
+</html>

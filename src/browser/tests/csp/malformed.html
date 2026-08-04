@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<!-- A source expression the parser cannot decide fails open. Wrongly blocking
+     breaks a real page on every load; wrongly allowing only leaves the
+     behaviour that existed before CSP was enforced at all. -->
+<html>
+<head>
+<script src="../testing.js"></script>
+<meta http-equiv="Content-Security-Policy" content="script-src ://">
+<script src="a.js"></script>
+</head>
+<body>
+<script id="malformed">
+  testing.expectEqual(true, window.__a);
+</script>
+</body>
+</html>

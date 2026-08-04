@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<!-- script-src replaces a stricter default-src rather than intersecting it. -->
+<html>
+<head>
+<script src="../testing.js"></script>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'">
+<script src="a.js"></script>
+</head>
+<body>
+<script id="script_src_override">
+  testing.expectEqual(true, window.__a);
+</script>
+</body>
+</html>

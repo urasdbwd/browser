@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<!-- default-src is the fallback when script-src is absent. -->
+<html>
+<head>
+<script src="../testing.js"></script>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'">
+<script src="a.js"></script>
+</head>
+<body>
+<script id="default_src">
+  testing.expectEqual(true, window.__a === undefined);
+</script>
+</body>
+</html>

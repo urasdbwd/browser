@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<!-- The upgrade allowance only runs one way: https: never authorises http. -->
+<html>
+<head>
+<script src="../testing.js"></script>
+<meta http-equiv="Content-Security-Policy" content="script-src https:">
+<script src="a.js"></script>
+</head>
+<body>
+<script id="scheme_mismatch">
+  testing.expectEqual(true, window.__a === undefined);
+</script>
+</body>
+</html>

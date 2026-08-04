@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<!-- A host expression that matches nothing this page loads. -->
+<html>
+<head>
+<script src="../testing.js"></script>
+<meta http-equiv="Content-Security-Policy" content="script-src http://*.example.com">
+<script src="a.js"></script>
+</head>
+<body>
+<script id="host_mismatch">
+  testing.expectEqual(true, window.__a === undefined);
+</script>
+</body>
+</html>

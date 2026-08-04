@@ -22,6 +22,7 @@ const lp = @import("lightpanda");
 const HttpClient = @import("../network/HttpClient.zig");
 
 const js = @import("js/js.zig");
+const Csp = @import("Csp.zig");
 const URL = @import("URL.zig");
 const Frame = @import("Frame.zig");
 const ScriptManagerBase = @import("ScriptManagerBase.zig");
@@ -240,6 +241,22 @@ pub fn addFromElement(self: *ScriptManager, comptime from_parser: bool, script_e
 
     const remote_url = try URL.resolve(arena.allocator(), base_url, src, .{ .encoding = frame.charset });
     script_element._executed = true;
+
+    // The single chokepoint every external script goes through. Fetching a
+    // script the page's own CSP forbids is what `Page.setBypassCSP` looks like
+    // from the outside.
+    if (Csp.allowsScript(frame, remote_url) == false) {
+        Csp.logBlocked(remote_url, ctx);
+        // A blocked script still fires `error` on its element, queued rather
+        // than dispatched inline because we may be inside the appendChild that
+        // inserted it. Silence would be its own tell: a page that probes CSP
+        // by racing onload against onerror would simply hang.
+        frame.queueElementEvent(script_element._proto, .@"error") catch |err| {
+            log.warn(.js, "csp block event", .{ .url = remote_url, .err = err });
+        };
+        arena.release();
+        return;
+    }
 
     const mode: Script.Extra.FrameExtra.Mode = blk: {
         if (element.getAttributeSafe(comptime .wrap("async")) != null) {

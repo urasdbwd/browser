@@ -101,10 +101,10 @@
   // The root containers keep their synthetic size rather than summing
   // children, so horizontal page-overflow checks stay stable.
   testing.expectEqual(document.body.clientWidth, document.body.scrollWidth);
-  testing.expectEqual(
-    document.documentElement.clientWidth,
-    document.documentElement.scrollWidth,
-  );
+  // ...but on the root element clientWidth/clientHeight are the viewport
+  // (CSSOM), not that synthetic box, which is what scrollWidth still reports.
+  testing.expectEqual(window.innerWidth, document.documentElement.clientWidth);
+  testing.expectEqual(window.innerHeight, document.documentElement.clientHeight);
 }
 </script>
 

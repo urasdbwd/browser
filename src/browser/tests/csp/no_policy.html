@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<!-- Control: no policy at all. Both the same-origin and the cross-origin
+     script run, which is what makes every "blocked" assertion in this
+     directory meaningful rather than vacuous. -->
+<html>
+<head>
+<script src="../testing.js"></script>
+<script src="a.js"></script>
+<script src="http://localhost:9582/src/browser/tests/csp/b.js"></script>
+</head>
+<body>
+<script id="no_policy">
+  testing.expectEqual(true, window.__a);
+  testing.expectEqual(true, window.__b);
+</script>
+</body>
+</html>

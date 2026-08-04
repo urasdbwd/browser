@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<!-- Host expression with a subdomain wildcard and an explicit port. -->
+<html>
+<head>
+<script src="../testing.js"></script>
+<meta http-equiv="Content-Security-Policy" content="script-src http://*.0.0.1:9582">
+<script src="a.js"></script>
+</head>
+<body>
+<script id="host_wildcard">
+  testing.expectEqual(true, window.__a);
+</script>
+</body>
+</html>

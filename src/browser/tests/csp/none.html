@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<!-- 'none' matches nothing. testing.js loads before the meta, exactly as a
+     real browser would let it: a policy only governs what is fetched after
+     the parser has seen it. -->
+<html>
+<head>
+<script src="../testing.js"></script>
+<meta http-equiv="Content-Security-Policy" content="script-src 'none'">
+<script src="a.js"></script>
+</head>
+<body>
+<script id="none">
+  testing.expectEqual(true, window.__a === undefined);
+</script>
+</body>
+</html>

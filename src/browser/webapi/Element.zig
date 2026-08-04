@@ -1313,9 +1313,22 @@ pub fn getElementDimensions(self: *Element, frame: *Frame) struct { width: f64, 
     return .{ .width = width, .height = height };
 }
 
+// CSSOM: on the root element, clientWidth/clientHeight are the viewport, not
+// the element box. Without this the artificial 1920 x 100_000_000 default
+// getElementDimensions hands <html> leaks straight out to script, and
+// `Math.max(documentElement.clientHeight, innerHeight)` — what bot scanners
+// read for the viewport — reports a 100-million-pixel display.
+fn isRootElement(self: *Element) bool {
+    const parent = self.asNode().parentNode() orelse return false;
+    return parent._type == .document;
+}
+
 pub fn getClientWidth(self: *Element, frame: *Frame) f64 {
     if (!self.checkVisibilityCached(null, frame)) {
         return 0.0;
+    }
+    if (self.isRootElement()) {
+        return @floatFromInt(frame._page.getViewport().width);
     }
     const dims = self.getElementDimensions(frame);
     return dims.width;
@@ -1324,6 +1337,9 @@ pub fn getClientWidth(self: *Element, frame: *Frame) f64 {
 pub fn getClientHeight(self: *Element, frame: *Frame) f64 {
     if (!self.checkVisibilityCached(null, frame)) {
         return 0.0;
+    }
+    if (self.isRootElement()) {
+        return @floatFromInt(frame._page.getViewport().height);
     }
     const dims = self.getElementDimensions(frame);
     return dims.height;
