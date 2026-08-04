@@ -270,6 +270,34 @@ async function decodeSnapshot(data, encoding, expectedBytes) {
   return output;
 }
 
+/**
+ * Rebuild a full snapshot from the frame this connection already holds.
+ *
+ * The server re-serializes the whole document on every update, so it sends only
+ * the region that moved: a shared head length, a shared tail length, and the
+ * literal bytes between them. `base_bytes` is checked rather than trusted --
+ * patching the wrong document would corrupt the page silently, so a desync has
+ * to surface as an error and close the socket.
+ */
+export function applySnapshotDelta(base, body, delta) {
+  const { prefix, suffix, base_bytes: baseBytes } = delta;
+  for (const value of [prefix, suffix, baseBytes]) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error("Lightpanda live snapshot delta is malformed");
+    }
+  }
+  if (base == null || base.byteLength !== baseBytes ||
+      prefix + suffix > base.byteLength) {
+    throw new Error("Lightpanda live snapshot delta does not match the held document");
+  }
+  const patch = new Uint8Array(body);
+  const rebuilt = new Uint8Array(prefix + patch.byteLength + suffix);
+  rebuilt.set(base.subarray(0, prefix), 0);
+  rebuilt.set(patch, prefix);
+  rebuilt.set(base.subarray(base.byteLength - suffix), prefix + patch.byteLength);
+  return rebuilt;
+}
+
 function editableValueElement(element) {
   if (element?.nodeType !== 1) return false;
   if (element.localName === "textarea" || element.localName === "select") return true;
@@ -624,6 +652,10 @@ export class LightpandaVirtualBrowser extends EventTarget {
   #connectTimeoutMs;
   #commandTimeoutMs;
   #lastSnapshotBytes = 0;
+  // The last full snapshot this connection reconstructed. Deltas are measured
+  // against it server-side, so the two copies must stay in lockstep; the server
+  // keeps its base per connection, so this resets with the socket.
+  #snapshotBase = null;
   #snapshotLoadTimeoutMs;
   #viewEpoch = 0;
   #lifecycleToken = 0;
@@ -750,6 +782,8 @@ export class LightpandaVirtualBrowser extends EventTarget {
       socket.binaryType = "arraybuffer";
       this.#socket = socket;
       this.#closeDispatched = false;
+      // A fresh connection starts with an empty base on both ends.
+      this.#snapshotBase = null;
       socket.addEventListener("message", (event) => this.#onMessage(socket, event));
       socket.addEventListener("close", () => this.#onSocketClose(socket));
 
@@ -960,11 +994,20 @@ export class LightpandaVirtualBrowser extends EventTarget {
           this.#protocolError(socket, "Lightpanda live WebSocket returned invalid snapshot encoding metadata");
           return;
         }
+        const delta = response.snapshot_delta;
+        if (delta != null && (typeof delta !== "object" ||
+            !Number.isSafeInteger(delta.prefix) || delta.prefix < 0 ||
+            !Number.isSafeInteger(delta.suffix) || delta.suffix < 0 ||
+            !Number.isSafeInteger(delta.base_bytes) || delta.base_bytes < 0)) {
+          this.#protocolError(socket, "Lightpanda live WebSocket returned an invalid snapshot delta");
+          return;
+        }
         pending.response = response;
         return;
       }
       if (response.target_version !== null ||
           response.snapshot_encoding !== null ||
+          response.snapshot_delta != null ||
           response.snapshot_bytes !== 0) {
         this.#protocolError(socket, "Lightpanda live WebSocket returned unexpected snapshot metadata");
         return;
@@ -992,24 +1035,35 @@ export class LightpandaVirtualBrowser extends EventTarget {
 
     const response = pending.response;
     pending.receiving = true;
-    if (pending.viewEpoch !== this.#viewEpoch) {
-      this.#takePending(pending)?.resolve({ response, superseded: true });
-      return;
-    }
+    const superseded = pending.viewEpoch !== this.#viewEpoch;
     decodeSnapshot(
       event.data,
       response.snapshot_encoding,
       response.snapshot_bytes,
-    ).then((snapshot) => this.#swapSnapshot(
-      snapshot,
-      response.target_version,
-      liveNavigationCommand(pending.type),
-      pending.context,
-      () => this.#pending === pending &&
-        this.#socket === socket &&
-        pending.viewEpoch === this.#viewEpoch,
-    )).then(
+    ).then((body) => {
+      // The server measures its next delta against the frame it just sent, so
+      // the base has to advance even for a frame this view will never paint.
+      // Skipping it here would desynchronize every later delta.
+      const full = response.snapshot_delta == null
+        ? new Uint8Array(body)
+        : applySnapshotDelta(this.#snapshotBase, body, response.snapshot_delta);
+      this.#snapshotBase = full;
+      if (superseded) return undefined;
+      return this.#swapSnapshot(
+        full.buffer,
+        response.target_version,
+        liveNavigationCommand(pending.type),
+        pending.context,
+        () => this.#pending === pending &&
+          this.#socket === socket &&
+          pending.viewEpoch === this.#viewEpoch,
+      );
+    }).then(
       () => {
+        if (superseded) {
+          this.#takePending(pending)?.resolve({ response, superseded: true });
+          return;
+        }
         const page = this.#readPageState();
         response.url = page.url;
         response.title = page.title;

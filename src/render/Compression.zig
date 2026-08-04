@@ -22,6 +22,16 @@ pub const min_input_bytes = 1024;
 const brotli_window_bits = 18;
 const stream_buffer_bytes = 16 * 1024;
 
+/// Stack a single `writeGzip` call needs. `std.compress.flate.Compress` is an
+/// allocation-free encoder: its tables live in the caller's frame, `init`
+/// returns it by value (so a copy can be live at once), and the window and the
+/// drain buffer sit beside it. Threads that may compress MUST size their stack
+/// from this rather than from a hand-written constant — the previous 288 KiB
+/// guess was ~240 KiB short of the real frame and overran the guard page
+/// mid-session (SIGBUS/SIGSEGV that killed the whole process).
+pub const gzip_stack_bytes = 2 * @sizeOf(std.compress.flate.Compress) +
+    std.compress.flate.max_window_len + stream_buffer_bytes;
+
 pub const Encoding = enum {
     identity,
     gzip,
