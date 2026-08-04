@@ -149,11 +149,20 @@ const TargetTable = struct {
     page_incarnation: u64 = 0,
     dom_version: usize = 0,
     generation: u64 = 0,
+    /// Set when this snapshot's id->element mapping differs from the one the
+    /// client last saw under the same generation. Targets are refused while it
+    /// is set and the next snapshot rotates the generation.
+    remapped: bool = false,
     elements: std.ArrayList(*Element) = .empty,
 
+    /// The generation is baked into the `data-lp-t-*` attribute *name* on every
+    /// element, so rotating it rewrites the whole document and costs the delta
+    /// encoder its shared prefix. It only has to rotate when the id->element
+    /// mapping changes; a page that only animates styles keeps the same mapping
+    /// frame after frame and so keeps the same generation.
     fn boundTo(self: *const TargetTable, page: *const lp.Page) bool {
         return self.page_incarnation == page.incarnation and
-            self.dom_version == page.dom_version and
+            !self.remapped and
             self.page_incarnation != 0 and
             self.generation != 0;
     }
@@ -685,6 +694,12 @@ fn writeSnapshot(self: *LiveSession, out: *std.Io.Writer) ProcessError!?[]const 
         error.WriteFailed => return self.degrade(page, frame, &targets),
     };
     out.flush() catch return self.degrade(page, frame, &targets);
+    // Only knowable once the traversal that assigns the ids has run, so the
+    // generation this document was written with is already spent. Refusing
+    // targets until the next snapshot rotates it keeps a stale id from ever
+    // resolving against a mapping it was not minted from.
+    targets.remapped = self.targets.generation == generation and
+        !std.mem.eql(*Element, self.targets.elements.items, targets.elements.items);
     self.snapshot_cursor.mark(self.app.allocator, page, frame.base()) catch
         return error.InternalError;
     self.targets.deinit(self.app.allocator);
@@ -711,6 +726,10 @@ fn degrade(
 fn snapshotChanged(self: *LiveSession) ProcessError!bool {
     const page = self.page.page() orelse return error.NavigationFailed;
     const frame = self.page.frame() orelse return error.NavigationFailed;
+    // A remapped table refuses every target, so one more snapshot is owed even
+    // if the document is otherwise identical: it rotates the generation and
+    // gives the client usable targets again.
+    if (self.targets.remapped) return true;
     return self.snapshot_cursor.changed(page, frame.base());
 }
 
@@ -738,6 +757,7 @@ fn findTarget(self: *LiveSession, frame: *lp.Frame, target: Target) ProcessError
     const page = self.page.page() orelse return error.StaleTarget;
     if (self.targets.page_incarnation != page.incarnation or
         self.targets.dom_version != page.dom_version or
+        self.targets.remapped or
         self.targets.page_incarnation == 0 or
         self.targets.generation == 0)
     {
@@ -1032,6 +1052,100 @@ test "live session: target versions are exact lowercase nonzero hex" {
     try std.testing.expectEqual(@as(?u64, null), parseTargetVersion("000000000000000g"));
 }
 
+test "live session: the target generation survives a mutation that keeps the mapping" {
+    var browser: lp.Browser = undefined;
+    try browser.init(testing.test_app, .{}, null);
+    defer browser.deinit();
+
+    var state: ?LiveSession = null;
+    defer if (state) |*live| live.deinit();
+    var arena_instance: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    const owner: u64 = 71;
+    const opened = try process(
+        &state,
+        testing.test_app,
+        &browser,
+        arena,
+        owner,
+        "{\"id\":1,\"type\":\"open\",\"url\":\"http://127.0.0.1:9582/src/browser/tests/render/live_session_targets.html\"}",
+        2_000,
+        &out.writer,
+    );
+    const first_version = opened.target_version.?;
+    out.clearRetainingCapacity();
+
+    // Text-only mutation: same elements, same ids, so the whole document except
+    // the changed text must stay byte-identical for the delta encoder.
+    const restyled = try process(
+        &state,
+        testing.test_app,
+        &browser,
+        arena,
+        owner,
+        "{\"id\":2,\"type\":\"click\",\"selector\":\"#restyle\"}",
+        2_000,
+        &out.writer,
+    );
+    try std.testing.expect(restyled.snapshot);
+    try std.testing.expectEqualSlices(u8, &first_version, &restyled.target_version.?);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), ">1</p>") != null);
+    out.clearRetainingCapacity();
+
+    // Structural mutation: the mapping moved, so targets are refused until the
+    // next snapshot, which `snapshotChanged` owes the client, rotates.
+    const grown = try process(
+        &state,
+        testing.test_app,
+        &browser,
+        arena,
+        owner,
+        "{\"id\":3,\"type\":\"click\",\"selector\":\"#grow\"}",
+        2_000,
+        &out.writer,
+    );
+    try std.testing.expect(grown.snapshot);
+    try std.testing.expect(state.?.targets.remapped);
+    try std.testing.expect(try state.?.snapshotChanged());
+    out.clearRetainingCapacity();
+
+    const stale = try std.fmt.allocPrint(
+        arena,
+        "{{\"id\":4,\"type\":\"click\",\"target\":{{\"version\":\"{s}\",\"id\":1}},\"snapshot\":false}}",
+        .{&grown.target_version.?},
+    );
+    try std.testing.expectError(error.StaleTarget, process(
+        &state,
+        testing.test_app,
+        &browser,
+        arena,
+        owner,
+        stale,
+        2_000,
+        &out.writer,
+    ));
+    out.clearRetainingCapacity();
+
+    const resynced = try process(
+        &state,
+        testing.test_app,
+        &browser,
+        arena,
+        owner,
+        "{\"id\":5,\"type\":\"snapshot\"}",
+        2_000,
+        &out.writer,
+    );
+    try std.testing.expect(resynced.snapshot);
+    try std.testing.expect(!state.?.targets.remapped);
+    try std.testing.expect(!std.mem.eql(u8, &first_version, &resynced.target_version.?));
+}
+
 test "live session: snapshot cursor detects page and state changes" {
     const first = try std.testing.allocator.create(lp.Page);
     defer std.testing.allocator.destroy(first);
@@ -1065,6 +1179,40 @@ fn tableTargetId(live: *const LiveSession, element_id: []const u8) ?u32 {
         if (std.mem.eql(u8, value, element_id)) return @intCast(id);
     }
     return null;
+}
+
+/// A changed id->element mapping is only visible once the document that carries
+/// it has been serialized, so the generation rotates on the snapshot after it.
+/// `snapshotChanged` forces that one, which in the real client is what its
+/// stale-target retry fetches. Leaves the second document in `out`.
+fn snapshotAfterRemap(
+    state: *?LiveSession,
+    browser: *lp.Browser,
+    arena: std.mem.Allocator,
+    owner: u64,
+    out: *std.Io.Writer.Allocating,
+) !Outcome {
+    _ = try process(
+        state,
+        testing.test_app,
+        browser,
+        arena,
+        owner,
+        "{\"id\":1000,\"type\":\"snapshot\"}",
+        2_000,
+        &out.writer,
+    );
+    out.clearRetainingCapacity();
+    return process(
+        state,
+        testing.test_app,
+        browser,
+        arena,
+        owner,
+        "{\"id\":1001,\"type\":\"snapshot\"}",
+        2_000,
+        &out.writer,
+    );
 }
 
 fn snapshotTargetId(
@@ -1427,11 +1575,13 @@ test "live session: opaque targets cover rendered shadow and slot elements" {
     );
     try std.testing.expect(clicked.snapshot);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), ">clicked</output>") != null);
-    try std.testing.expect(!std.mem.eql(
+    // Text changed, the element list did not, so the generation holds and the
+    // whole document outside that text stays byte-identical for the delta.
+    try std.testing.expectEqualSlices(
         u8,
         &first_version,
         &clicked.target_version.?,
-    ));
+    );
     const reorder_version = clicked.target_version.?;
     const original_reorder_key = snapshotTargetKey(
         out.written(),
@@ -1672,16 +1822,7 @@ test "live session: composed tree changes invalidate opaque targets" {
         &out.writer,
     ));
 
-    const after_shadow = try process(
-        &state,
-        testing.test_app,
-        &browser,
-        arena,
-        owner,
-        "{\"id\":3,\"type\":\"snapshot\"}",
-        2_000,
-        &out.writer,
-    );
+    const after_shadow = try snapshotAfterRemap(&state, &browser, arena, owner, &out);
     try std.testing.expect(after_shadow.snapshot);
     const shadow_version = after_shadow.target_version.?;
     try std.testing.expect(!std.mem.eql(u8, &first_version, &shadow_version));
@@ -1719,16 +1860,7 @@ test "live session: composed tree changes invalidate opaque targets" {
         &out.writer,
     ));
 
-    const after_assign = try process(
-        &state,
-        testing.test_app,
-        &browser,
-        arena,
-        owner,
-        "{\"id\":5,\"type\":\"snapshot\"}",
-        2_000,
-        &out.writer,
-    );
+    const after_assign = try snapshotAfterRemap(&state, &browser, arena, owner, &out);
     try std.testing.expect(after_assign.snapshot);
     const assign_version = after_assign.target_version.?;
     try std.testing.expect(!std.mem.eql(u8, &shadow_version, &assign_version));
@@ -1771,16 +1903,7 @@ test "live session: composed tree changes invalidate opaque targets" {
         &out.writer,
     ));
 
-    const after_detached_assign = try process(
-        &state,
-        testing.test_app,
-        &browser,
-        arena,
-        owner,
-        "{\"id\":7,\"type\":\"snapshot\"}",
-        2_000,
-        &out.writer,
-    );
+    const after_detached_assign = try snapshotAfterRemap(&state, &browser, arena, owner, &out);
     try std.testing.expect(after_detached_assign.snapshot);
     const detached_version = after_detached_assign.target_version.?;
     try std.testing.expect(!std.mem.eql(u8, &assign_version, &detached_version));

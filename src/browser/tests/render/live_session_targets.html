@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html>
+<body>
+  <p id="tick">0</p>
+  <button id="restyle">restyle</button>
+  <button id="grow">grow</button>
+  <script>
+    const tick = document.querySelector("#tick");
+    document.querySelector("#restyle").addEventListener("click", () => {
+      tick.textContent = String(Number(tick.textContent) + 1);
+    });
+    document.querySelector("#grow").addEventListener("click", () => {
+      document.body.appendChild(document.createElement("span"));
+    });
+  </script>
+</body>
+</html>
