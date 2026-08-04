@@ -34,6 +34,9 @@ const WebGLRenderingContext = @This();
 
 /// Parent canvas (spec requires .canvas).
 _canvas: *Canvas,
+/// Seeded from the browser fingerprint profile when the context is created;
+/// drives readPixels / toDataURL so the GPU probe isn't an all-zero buffer.
+_fp_seed: u64 = 0xcbf29ce484222325,
 
 const VENDOR = "WebKit";
 const RENDERER = "WebKit WebGL";
@@ -179,6 +182,11 @@ pub const Extension = union(enum) {
 
 pub fn getCanvas(self: *const WebGLRenderingContext) *Canvas {
     return self._canvas;
+}
+
+/// Distinct from the 2d context seed on the same canvas (0x57454247 = "WEBG").
+pub fn fingerprintSeed(self: *const WebGLRenderingContext) u64 {
+    return self._fp_seed ^ 0x57454247;
 }
 
 pub fn isContextLost(_: *const WebGLRenderingContext) bool {
@@ -328,7 +336,22 @@ pub fn blendFunc(_: *const WebGLRenderingContext, _: u32, _: u32) void {}
 pub fn depthFunc(_: *const WebGLRenderingContext, _: u32) void {}
 pub fn cullFace(_: *const WebGLRenderingContext, _: u32) void {}
 pub fn frontFace(_: *const WebGLRenderingContext, _: u32) void {}
-pub fn readPixels(_: *const WebGLRenderingContext, _: i32, _: i32, _: i32, _: i32, _: u32, _: u32, _: ?js.Value) void {}
+/// Fingerprint probes draw a scene then hash readPixels — an all-zero buffer is
+/// a louder headless tell than a wrong GPU string. Fill it with the same seeded
+/// generator the 2d canvas and toDataURL use.
+/// ponytail: byte destinations only (UNSIGNED_BYTE, the format every probe
+/// uses); handle float/half-float views when something actually reads them.
+pub fn readPixels(self: *const WebGLRenderingContext, x: i32, y: i32, width: i32, height: i32, _: u32, _: u32, dest: ?js.Value) void {
+    const value = dest orelse return;
+    if (!value.isUint8Array() and !value.isUint8ClampedArray()) return;
+    const pixels = value.local.jsValueToZig([]u8, value) catch return;
+
+    var seed = self.fingerprintSeed();
+    inline for (.{ x, y, width, height }) |v| {
+        seed = (seed ^ @as(u64, @bitCast(@as(i64, v)))) *% 0x100000001b3;
+    }
+    Canvas.fillFingerprintPixels(pixels, seed, if (width > 0) @intCast(width) else 1);
+}
 
 pub const JsApi = struct {
     pub const bridge = js.Bridge(WebGLRenderingContext);
@@ -419,7 +442,7 @@ pub const JsApi = struct {
     pub const depthFunc = bridge.function(WebGLRenderingContext.depthFunc, .{ .noop = true });
     pub const cullFace = bridge.function(WebGLRenderingContext.cullFace, .{ .noop = true });
     pub const frontFace = bridge.function(WebGLRenderingContext.frontFace, .{ .noop = true });
-    pub const readPixels = bridge.function(WebGLRenderingContext.readPixels, .{ .noop = true });
+    pub const readPixels = bridge.function(WebGLRenderingContext.readPixels, .{});
 };
 
 const testing = @import("../../../testing.zig");

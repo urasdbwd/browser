@@ -98,7 +98,11 @@ pub fn getContext(self: *Canvas, context_type: []const u8, frame: *Frame) !?Draw
         // Common draw/resource calls are no-ops so partial consumers don't
         // cascade TypeError; full WebGL apps still won't render frames.
         if (std.mem.eql(u8, context_type, "webgl") or std.mem.eql(u8, context_type, "experimental-webgl")) {
-            const ctx = try frame._factory.create(WebGLRenderingContext{ ._canvas = self });
+            const noise = frame._session.browser.app.config.fingerprint_profile.noise_seed;
+            const ctx = try frame._factory.create(WebGLRenderingContext{
+                ._canvas = self,
+                ._fp_seed = noise,
+            });
             break :blk .{ .webgl = ctx };
         }
         return null;
@@ -131,7 +135,7 @@ pub fn toDataURL(self: *Canvas, mime_type: ?[]const u8, _: ?f64, exec: *Executio
     if (self._cached) |cached| {
         switch (cached) {
             .@"2d" => |ctx| seed ^= ctx.fingerprintSeed(),
-            .webgl => seed ^= 0x57454247,
+            .webgl => |ctx| seed ^= ctx.fingerprintSeed(),
         }
     }
 
@@ -146,6 +150,27 @@ fn fnv(h: u64, v: u64) u64 {
     return x;
 }
 
+/// The one seeded pixel generator for every fingerprint surface: 2d
+/// getImageData, WebGL readPixels and the toDataURL PNG body. Deterministic in
+/// (seed, x, y) so a probe hashes the same every load, per-pixel varying so it
+/// doesn't read as a flat/blank buffer, and opaque like a real render would be.
+pub fn fillFingerprintPixels(pixels: []u8, seed: u64, width: u32) void {
+    var rng = if (seed == 0) 0x9e3779b97f4a7c15 else seed;
+    const w: usize = if (width == 0) 1 else width;
+    var i: usize = 0;
+    while (i + 3 < pixels.len) : (i += 4) {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        const p = i / 4;
+        const px = rng ^ (@as(u64, p % w) *% 0x9e3779b97f4a7c15) ^ (@as(u64, p / w) *% 0xbf58476d1ce4e5b9);
+        pixels[i] = @truncate(px);
+        pixels[i + 1] = @truncate(px >> 8);
+        pixels[i + 2] = @truncate(px >> 16);
+        pixels[i + 3] = 255;
+    }
+}
+
 /// Build a valid PNG: IHDR + zlib-stored IDAT of seed-derived pixels + IEND.
 /// Caps at 32×32 so fingerprint encoding stays cheap.
 fn buildFingerprintPng(allocator: std.mem.Allocator, width: u32, height: u32, seed: u64) ![]u8 {
@@ -156,24 +181,18 @@ fn buildFingerprintPng(allocator: std.mem.Allocator, width: u32, height: u32, se
     const raw = try allocator.alloc(u8, raw_len);
     defer allocator.free(raw);
 
-    var rng = seed;
+    const stride = @as(usize, w) * 4;
+    const pixels = try allocator.alloc(u8, @as(usize, h) * stride);
+    defer allocator.free(pixels);
+    fillFingerprintPixels(pixels, seed, w);
+
     var offset: usize = 0;
     var y: u32 = 0;
     while (y < h) : (y += 1) {
         raw[offset] = 0; // filter None
         offset += 1;
-        var x: u32 = 0;
-        while (x < w) : (x += 1) {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            const px = rng ^ (@as(u64, x) *% 0x9e3779b97f4a7c15) ^ (@as(u64, y) *% 0xbf58476d1ce4e5b9);
-            raw[offset] = @truncate(px);
-            raw[offset + 1] = @truncate(px >> 8);
-            raw[offset + 2] = @truncate(px >> 16);
-            raw[offset + 3] = 255;
-            offset += 4;
-        }
+        @memcpy(raw[offset..][0..stride], pixels[y * stride ..][0..stride]);
+        offset += stride;
     }
 
     // zlib stream with a single stored (uncompressed) block — no flate dependency.
@@ -249,3 +268,30 @@ pub const JsApi = struct {
     pub const toDataURL = bridge.function(Canvas.toDataURL, .{});
     pub const transferControlToOffscreen = bridge.function(Canvas.transferControlToOffscreen, .{});
 };
+
+const testing = @import("../../../../testing.zig");
+
+test "Canvas: fingerprint pixels are stable, seeded and non-uniform" {
+    var a: [16 * 16 * 4]u8 = undefined;
+    var b: [16 * 16 * 4]u8 = undefined;
+    var c: [16 * 16 * 4]u8 = undefined;
+    fillFingerprintPixels(&a, 424242, 16);
+    fillFingerprintPixels(&b, 424242, 16);
+    fillFingerprintPixels(&c, 424243, 16);
+
+    // Same seed => byte-identical (a fingerprint that moves is itself a tell).
+    try testing.expect(std.mem.eql(u8, &a, &b));
+    try testing.expect(!std.mem.eql(u8, &a, &c));
+
+    // Not a flat buffer, and opaque like a real render.
+    var varied = false;
+    var i: usize = 4;
+    while (i < a.len) : (i += 4) {
+        if (!std.mem.eql(u8, a[i .. i + 4], a[0..4])) {
+            varied = true;
+        }
+        try testing.expectEqual(255, a[i + 3]);
+    }
+    try testing.expect(varied);
+    try testing.expectEqual(255, a[3]);
+}
