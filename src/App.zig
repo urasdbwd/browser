@@ -46,6 +46,9 @@ arena_pool: ArenaPool,
 app_dir_path: ?[]const u8,
 
 pub fn init(allocator: Allocator, config: *const Config) !*App {
+    // Must run before V8/ICU caches the default timezone.
+    config.applyTimezone();
+
     // Profile flags first, user flags last: V8 takes the last occurrence.
     var v8_flag_buf: [512]u8 = undefined;
     const v8_flags: ?[]const u8 = blk: {

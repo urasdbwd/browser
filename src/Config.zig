@@ -249,6 +249,12 @@ const CommonOptions = .{
     // Platform reported to JS: windows|macos|linux. Defaults to the host OS on
     // macOS, windows elsewhere.
     .{ .name = "fingerprint_platform", .type = ?[]const u8 },
+    // IANA timezone name (e.g. "America/New_York") for Date and Intl. Behind a
+    // proxy the host timezone contradicts the exit IP, which is one of the
+    // checks commercial detection vendors weight most heavily.
+    .{ .name = "timezone", .type = ?[:0]const u8 },
+    // BCP-47 tag driving navigator.language / navigator.languages (e.g. "fr-FR").
+    .{ .name = "locale", .type = ?[]const u8 },
     // Click managed Turnstile checkboxes and wait for a token after load.
     // auto (default) = on when --stealth; on/off force either way.
     .{ .name = "solve_captchas", .type = SolveCaptchas, .default = .auto },
@@ -843,6 +849,40 @@ pub fn fingerprintPlatform(self: *const Config) ?[]const u8 {
         else => null,
     };
 }
+
+pub fn timezone(self: *const Config) ?[:0]const u8 {
+    return switch (self.mode) {
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.timezone,
+        else => null,
+    };
+}
+
+/// BCP-47 tag for navigator.language / navigator.languages.
+pub fn locale(self: *const Config) []const u8 {
+    return switch (self.mode) {
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.locale orelse "en-US",
+        else => "en-US",
+    };
+}
+
+/// V8/ICU resolve the default timezone from the process `TZ` variable the first
+/// time a Date or Intl object is built. The zig-v8 fork exposes no
+/// `DateTimeConfigurationChangeNotification` binding, so set it before the
+/// isolate exists rather than patching JS (which would be visible to scanners).
+/// ponytail: process-wide, so it is one timezone per process. Fine while a
+/// process serves one identity; needs the V8 binding if that ever changes.
+pub fn applyTimezone(self: *const Config) void {
+    const tz = self.timezone() orelse return;
+    if (setenv("TZ", tz.ptr, 1) != 0) {
+        log.warn(.app, "timezone not applied", .{ .timezone = tz });
+        return;
+    }
+    tzset();
+}
+
+// Neither is declared in std.c.
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn tzset() void;
 
 pub fn userAgent(self: *const Config) ?[]const u8 {
     return switch (self.mode) {

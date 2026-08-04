@@ -209,6 +209,7 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "Console";
+        pub const no_interface_object = true;
 
         // Per the console spec, members are own properties of the namespace
         // object, so Object.entries(console) returns them.

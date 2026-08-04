@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+
+<!-- Comprehensive in-repo probe covering gist FAIL tasks 2,4,7,9,10,11,12,15 API surface -->
+
+<script id=stealth_plugins>
+{
+  testing.expectEqual(true, navigator.plugins.length >= 3);
+  testing.expectEqual(true, navigator.mimeTypes.length >= 1);
+  const names = [...navigator.plugins].map(p => p.name).join(",");
+  testing.expectEqual(true, /PDF/i.test(names));
+}
+</script>
+
+<script id=stealth_webdriver_cdp>
+{
+  testing.expectEqual(false, navigator.webdriver);
+  testing.expectEqual(undefined, window.cdc_adoQpoasnfa76pfcZLmcfl_Array);
+  testing.expectEqual(undefined, window.$cdc_asdjflasutopfhvcZLmcfl_);
+  testing.expectEqual(undefined, document.$cdc_asdjflasutopfhvcZLmcfl_);
+}
+</script>
+
+<script id=stealth_notification_permissions type=module>
+{
+  const state = await testing.async();
+  const status = await navigator.permissions.query({ name: "notifications" });
+  state.resolve();
+  await state.done(() => {
+    testing.expectEqual("default", Notification.permission);
+    testing.expectEqual("prompt", status.state);
+  });
+}
+</script>
+
+<script id=stealth_chrome_outer>
+{
+  testing.expectEqual(true, typeof window.chrome === "object" && window.chrome !== null);
+  testing.expectEqual(true, typeof window.chrome.runtime === "object" && window.chrome.runtime !== null);
+  testing.expectEqual(true, typeof window.chrome.csi === "function");
+  testing.expectEqual(true, typeof window.chrome.loadTimes === "function");
+  testing.expectEqual(true, window.outerWidth > 0);
+  testing.expectEqual(true, window.outerHeight > 0);
+  testing.expectEqual(true, window.outerHeight >= window.innerHeight);
+}
+</script>
+
+<script id=stealth_webgl>
+{
+  const c = document.createElement("canvas");
+  const gl = c.getContext("webgl") || c.getContext("experimental-webgl");
+  testing.expectEqual(true, gl != null);
+  testing.expectEqual(true, gl instanceof WebGLRenderingContext);
+  const ext = gl.getExtension("WEBGL_debug_renderer_info");
+  testing.expectEqual(true, ext != null);
+  const vendor = gl.getParameter(ext.UNMASKED_VENDOR_WEBGL);
+  const renderer = gl.getParameter(ext.UNMASKED_RENDERER_WEBGL);
+  testing.expectEqual(true, vendor.length > 0);
+  testing.expectEqual(true, renderer.length > 0);
+  testing.expectEqual(false, /swiftshader|llvmpipe/i.test(vendor + " " + renderer));
+  // Noop surface should not throw
+  gl.createTexture();
+  gl.createBuffer();
+  gl.getError();
+}
+</script>
+
+<script id=stealth_canvas_fingerprint>
+{
+  function canvasFp() {
+    const c = document.createElement("canvas");
+    c.width = 240; c.height = 60;
+    const ctx = c.getContext("2d");
+    ctx.textBaseline = "alphabetic";
+    ctx.fillStyle = "#f60";
+    ctx.fillRect(125, 1, 62, 20);
+    ctx.fillStyle = "#069";
+    ctx.font = "11pt Arial";
+    ctx.fillText("Cwm fjordbank glyphs vext quiz, 😃", 2, 15);
+    ctx.fillStyle = "rgba(102, 204, 0, 0.7)";
+    ctx.font = "18pt Arial";
+    ctx.fillText("Cwm fjordbank glyphs vext quiz, 😃", 4, 45);
+    return c.toDataURL();
+  }
+  const a = canvasFp();
+  const b = canvasFp();
+  testing.expectEqual(true, a.startsWith("data:image/png;base64,"));
+  testing.expectEqual(true, a.length > 64);
+  testing.expectEqual(a, b);
+}
+</script>
+
+<script id=stealth_fonts>
+{
+  const ctx = document.createElement("canvas").getContext("2d");
+  const fonts = ["Arial", "Courier New", "Times New Roman", "Georgia", "Verdana", "Comic Sans MS", "Impact"];
+  const widths = {};
+  for (const f of fonts) {
+    ctx.font = "72px '" + f + "'";
+    widths[f] = ctx.measureText("mmmmmmmmmmlli").width;
+  }
+  // Not all identical (would mean no font differentiation)
+  const unique = new Set(Object.values(widths));
+  testing.expectEqual(true, unique.size >= 3);
+  testing.expectEqual(true, widths["Arial"] > 0);
+}
+</script>
+
+<script id=stealth_audio type=module>
+{
+  const state = await testing.async();
+  async function audioFp() {
+    const ctx = new OfflineAudioContext(1, 44100, 44100);
+    const osc = ctx.createOscillator();
+    osc.type = "triangle";
+    osc.frequency.setValueAtTime(10000, ctx.currentTime);
+    const comp = ctx.createDynamicsCompressor();
+    comp.threshold.setValueAtTime(-50, ctx.currentTime);
+    osc.connect(comp);
+    comp.connect(ctx.destination);
+    osc.start(0);
+    const buf = await ctx.startRendering();
+    const data = buf.getChannelData(0);
+    let sum = 0;
+    for (let i = 4500; i < 5000; i++) sum += Math.abs(data[i]);
+    return sum;
+  }
+  const a = await audioFp();
+  const b = await audioFp();
+  state.resolve();
+  await state.done(() => {
+    testing.expectEqual(true, a > 0);
+    testing.expectEqual(a, b);
+  });
+}
+</script>
+
+<script id=stealth_no_leaked_interface_names>
+{
+  // Real Chrome exposes no interface object for these; CreepJS/fpjs diff
+  // Object.getOwnPropertyNames(window) against a reference list.
+  const globals = new Set(Object.getOwnPropertyNames(window));
+  for (const leaked of ["Chrome", "ChromeRuntime", "ChromeApp", "ModelContext",
+                        "ModelContextClient", "Console", "Css", "CrossOriginWindow",
+                        "StorageEstimate", "SVGGenericElement",
+                        "ReadableStreamAsyncIterator"]) {
+    testing.expectEqual(false, globals.has(leaked));
+  }
+  // ...while the instances they back still work.
+  testing.expectEqual("object", typeof window.chrome.runtime);
+  testing.expectEqual("object", typeof console);
+  testing.expectEqual("function", typeof console.log);
+  testing.expectEqual("function", typeof CSS.escape);
+  testing.expectEqual(true, globals.has("CSS"));
+}
+</script>
+
+<script id=stealth_chrome_timing>
+{
+  const csi = window.chrome.csi();
+  testing.expectEqual(true, csi.startE > 0);
+  testing.expectEqual(true, csi.onloadT >= csi.startE);
+  testing.expectEqual(true, csi.pageT > 0);
+  testing.expectEqual(15, csi.tran);
+  // startE is epoch-ms of navigation start, so it must sit in the past.
+  testing.expectEqual(true, csi.startE <= Date.now());
+
+  const lt = window.chrome.loadTimes();
+  testing.expectEqual(true, lt.requestTime > 0);
+  testing.expectEqual(true, lt.commitLoadTime >= lt.requestTime);
+  testing.expectEqual(true, lt.finishDocumentLoadTime >= lt.commitLoadTime);
+  testing.expectEqual(true, lt.finishLoadTime >= lt.finishDocumentLoadTime);
+  // loadTimes is in seconds, csi in milliseconds.
+  testing.expectEqual(true, Math.abs(lt.requestTime * 1000 - csi.startE) < 1000);
+}
+</script>
+
+<script id=stealth_screen_coherence>
+{
+  testing.expectEqual(true, screen.availWidth > 0);
+  testing.expectEqual(true, screen.availHeight > 0);
+  testing.expectEqual(true, screen.availWidth <= screen.width);
+  testing.expectEqual(true, screen.availHeight <= screen.height);
+  testing.expectEqual("number", typeof screen.availLeft);
+  testing.expectEqual("number", typeof screen.availTop);
+  testing.expectEqual(true, screen.availTop + screen.availHeight <= screen.height);
+}
+</script>
+
+<script id=stealth_missing_apis>
+{
+  // navigator.pdfViewerEnabled must agree with the PDF plugin array.
+  testing.expectEqual(true, navigator.pdfViewerEnabled);
+
+  testing.expectEqual("function", typeof RTCPeerConnection);
+  testing.expectEqual("function", typeof webkitRTCPeerConnection);
+  const pc = new RTCPeerConnection();
+  testing.expectEqual("stable", pc.signalingState);
+  testing.expectEqual("new", pc.iceGatheringState);
+  testing.expectEqual("new", pc.connectionState);
+  testing.expectEqual(null, pc.localDescription);
+  const dc = pc.createDataChannel("probe");
+  testing.expectEqual("probe", dc.label);
+  pc.close();
+  testing.expectEqual("closed", pc.signalingState);
+
+  testing.expectEqual("object", typeof navigator.mediaDevices);
+  const constraints = navigator.mediaDevices.getSupportedConstraints();
+  testing.expectEqual(true, constraints.deviceId);
+  testing.expectEqual(true, constraints.echoCancellation);
+
+  testing.expectEqual("object", typeof navigator.connection);
+  testing.expectEqual("4g", navigator.connection.effectiveType);
+  testing.expectEqual(true, navigator.connection.downlink > 0);
+  testing.expectEqual(true, navigator.connection.rtt > 0);
+  testing.expectEqual(false, navigator.connection.saveData);
+
+  const pads = navigator.getGamepads();
+  testing.expectEqual(4, pads.length);
+  testing.expectEqual(null, pads[0]);
+
+  // Chrome 131 always has both WebGL versions.
+  const c = document.createElement("canvas");
+  const gl2 = c.getContext("webgl2");
+  testing.expectEqual(true, gl2 instanceof WebGL2RenderingContext);
+  testing.expectEqual(true, /WebGL 2\.0/.test(gl2.getParameter(gl2.VERSION)));
+  // Sibling interface, not a subclass — matches Chrome.
+  testing.expectEqual(false, WebGL2RenderingContext.prototype instanceof WebGLRenderingContext);
+}
+</script>
+
+<script id=stealth_async_apis type=module>
+{
+  const state = await testing.async();
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const kinds = devices.map((d) => d.kind);
+  // A browser that has never been granted media permission reports empty
+  // ids/labels, so there is nothing fabricated to contradict.
+  const blank = devices.every((d) => d.deviceId === "" && d.label === "");
+
+  let denied = null;
+  try {
+    await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    denied = e.name;
+  }
+
+  const battery = await navigator.getBattery();
+  const offer = await new RTCPeerConnection().createOffer();
+
+  state.resolve();
+  await state.done(() => {
+    testing.expectEqual(true, devices.length >= 2);
+    testing.expectEqual(true, kinds.includes("audioinput"));
+    testing.expectEqual(true, kinds.includes("audiooutput"));
+    testing.expectEqual(true, blank);
+    testing.expectEqual("NotAllowedError", denied);
+
+    testing.expectEqual("boolean", typeof battery.charging);
+    testing.expectEqual(true, battery.level > 0 && battery.level <= 1);
+    testing.expectEqual(true, battery.chargingTime === Infinity || battery.dischargingTime === Infinity);
+
+    testing.expectEqual("offer", offer.type);
+    testing.expectEqual(true, offer.sdp.startsWith("v=0"));
+    // Deliberately no ICE candidates: gathering fails gracefully rather than
+    // leaking a fabricated (and, behind a proxy, contradictory) IP.
+    testing.expectEqual(false, /a=candidate:/.test(offer.sdp));
+  });
+}
+</script>
+
+<script id=stealth_creepjs_no_throw>
+{
+  // Property walks that previously crashed CreepJS on Lightpanda.
+  testing.expectEqual(true, typeof navigator.platform === "string" && navigator.platform.length > 0);
+  testing.expectEqual(true, navigator.hardwareConcurrency > 0);
+  testing.expectEqual(true, navigator.deviceMemory > 0);
+  testing.expectEqual(true, typeof window.outerHeight === "number");
+  const ctx = document.createElement("canvas").getContext("2d");
+  const g = ctx.createRadialGradient(0, 0, 1, 10, 10, 20);
+  g.addColorStop(0, "#000");
+  testing.expectEqual(true, navigator.plugins.length > 0);
+  for (const p of navigator.plugins) {
+    testing.expectEqual(true, typeof p.name === "string");
+  }
+}
+</script>

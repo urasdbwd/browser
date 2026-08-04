@@ -30,6 +30,8 @@ const Permissions = @import("Permissions.zig");
 const StorageManager = @import("StorageManager.zig");
 const NavigatorUAData = @import("NavigatorUAData.zig");
 const ModelContext = @import("ModelContext.zig");
+const MediaDevices = @import("MediaDevices.zig");
+const device = @import("device.zig");
 
 const Navigator = @This();
 _pad: bool = false,
@@ -38,6 +40,9 @@ _mime_types: MimeTypeArray = .{},
 _permissions: Permissions = .{},
 _storage: StorageManager = .{},
 _ua_data: NavigatorUAData = .{},
+_media_devices: MediaDevices = .{},
+_battery: device.BatteryManager = .{},
+_connection: device.NetworkInformation = .{},
 
 pub const init: Navigator = .{};
 
@@ -45,9 +50,15 @@ pub fn getUserAgent(_: *const Navigator, exec: *const Execution) []const u8 {
     return exec.session.browser.http_client.getUserAgent();
 }
 
-pub fn getLanguages(_: *const Navigator, exec: *const Execution) !js.Value {
+/// `--locale`, split into the full tag plus its primary subtag, the way Chrome
+/// reports it ("fr-FR" -> ["fr-FR", "fr"]). A tag with no region yields the
+/// same value twice, which is what Chrome shows for a region-less locale.
+/// Chrome freezes the array, so we do too.
+pub fn getLanguages(self: *const Navigator, exec: *const Execution) !js.Value {
+    const tag = self.getLanguage(exec);
+    const end = std.mem.indexOfScalar(u8, tag, '-') orelse tag.len;
     const local = exec.js.local.?;
-    const languages = try local.zigValueToJs([2][]const u8{ "en-US", "en" }, .{});
+    const languages = try local.zigValueToJs([2][]const u8{ tag, tag[0..end] }, .{});
     return local.freeze(languages);
 }
 
@@ -85,8 +96,8 @@ pub fn getAppVersion(self: *const Navigator, exec: *const Execution) ![]const u8
     return std.mem.concat(exec.js.local.?.call_arena, u8, &.{ trail[0..separator], ")" });
 }
 
-pub fn getLanguage(_: *const Navigator) []const u8 {
-    return "en-US";
+pub fn getLanguage(_: *const Navigator, exec: *const Execution) []const u8 {
+    return exec.session.browser.app.config.locale();
 }
 
 pub fn getOnLine(_: *const Navigator) bool {
@@ -183,6 +194,29 @@ pub fn getStorage(self: *Navigator) *StorageManager {
 
 pub fn getUserAgentData(self: *Navigator) *NavigatorUAData {
     return &self._ua_data;
+}
+
+/// The PDF plugin array already claims a viewer; reporting false here would
+/// contradict it, and mismatched pairs are exactly what scanners look for.
+pub fn getPdfViewerEnabled(_: *const Navigator) bool {
+    return true;
+}
+
+pub fn getMediaDevices(self: *Navigator) *MediaDevices {
+    return &self._media_devices;
+}
+
+pub fn getConnection(self: *Navigator) *device.NetworkInformation {
+    return &self._connection;
+}
+
+pub fn getBattery(self: *Navigator, exec: *const Execution) !js.Promise {
+    return exec.js.local.?.resolvePromise(&self._battery);
+}
+
+/// Chrome hands out four fixed slots, all null when nothing is plugged in.
+pub fn getGamepads(_: *const Navigator) [4]?u8 {
+    return .{ null, null, null, null };
 }
 
 pub fn getModelContext(_: *const Navigator, frame: *Frame) *ModelContext {
@@ -292,6 +326,11 @@ pub const JsApi = struct {
     pub const userAgentData = bridge.accessor(Navigator.getUserAgentData, null, .{});
 
     // window only
+    pub const pdfViewerEnabled = bridge.accessor(Navigator.getPdfViewerEnabled, null, .{ .exposed = .window });
+    pub const mediaDevices = bridge.accessor(Navigator.getMediaDevices, null, .{ .exposed = .window });
+    pub const connection = bridge.accessor(Navigator.getConnection, null, .{ .exposed = .window });
+    pub const getBattery = bridge.function(Navigator.getBattery, .{ .exposed = .window });
+    pub const getGamepads = bridge.function(Navigator.getGamepads, .{ .exposed = .window });
     pub const plugins = bridge.accessor(Navigator.getPlugins, null, .{ .exposed = .window });
     pub const mimeTypes = bridge.accessor(Navigator.getMimeTypes, null, .{ .exposed = .window });
     pub const modelContext = bridge.accessor(Navigator.getModelContext, null, .{ .exposed = .window });

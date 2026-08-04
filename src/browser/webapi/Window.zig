@@ -1441,6 +1441,7 @@ const CrossOriginWindow = struct {
 
         pub const Meta = struct {
             pub const name = "CrossOriginWindow";
+            pub const no_interface_object = true;
             pub const prototype_chain = bridge.prototypeChain();
             pub var class_id: bridge.ClassId = undefined;
         };

@@ -61,6 +61,24 @@ pub fn getAvailHeight(_: *const Screen, frame: *Frame) u32 {
     return frame._page.getViewport().outerHeight();
 }
 
+// The maximized window is flush left on every desktop we emulate; only the
+// vertical inset varies. Chrome always exposes availLeft, so a missing property
+// is itself a tell.
+pub fn getAvailLeft(_: *const Screen, _: *Frame) u32 {
+    return 0;
+}
+
+// System chrome above the window: the macOS menu bar or the GNOME top bar.
+// Windows puts its taskbar at the bottom, so availTop stays 0 there. A macOS
+// profile reporting availTop === 0 is the headless shape.
+pub fn getAvailTop(_: *const Screen, frame: *Frame) u32 {
+    return switch (frame._session.browser.app.config.fingerprint_profile.platform) {
+        .macos => 25,
+        .windows => 0,
+        .linux => 27,
+    };
+}
+
 pub const JsApi = struct {
     pub const bridge = js.Bridge(Screen);
 
@@ -73,7 +91,9 @@ pub const JsApi = struct {
     pub const width = bridge.accessor(Screen.getWidth, null, .{});
     pub const height = bridge.accessor(Screen.getHeight, null, .{});
     pub const availWidth = bridge.accessor(Screen.getWidth, null, .{});
-    pub const availHeight = bridge.accessor(getAvailHeight, null, .{});
+    pub const availHeight = bridge.accessor(Screen.getAvailHeight, null, .{});
+    pub const availLeft = bridge.accessor(Screen.getAvailLeft, null, .{});
+    pub const availTop = bridge.accessor(Screen.getAvailTop, null, .{});
     pub const colorDepth = bridge.property(24, .{ .template = false });
     pub const pixelDepth = bridge.property(24, .{ .template = false });
     pub const orientation = bridge.accessor(Screen.getOrientation, null, .{});

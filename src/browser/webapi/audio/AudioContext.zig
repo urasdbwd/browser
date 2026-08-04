@@ -373,7 +373,10 @@ pub const OfflineAudioContext = struct {
         if (ch == 0 or ch > 32 or len == 0 or rate < 3000 or rate > 768000) {
             return error.NotSupportedError;
         }
-        var seed: u64 = 0xcbf29ce484222325;
+        // Mix the profile noise seed in here (not only at render time) so every
+        // seed-derived audio path differs per instance instead of sharing one
+        // product-wide hash.
+        var seed: u64 = exec.session.browser.app.config.fingerprint_profile.noise_seed;
         seed = fnv(seed, ch);
         seed = fnv(seed, len);
         seed = fnv(seed, @as(u32, @bitCast(rate)));
@@ -484,7 +487,7 @@ pub const AudioContext = struct {
             ._base = .{
                 .sample_rate = rate,
                 .state = "running",
-                .seed = fnv(0xcbf29ce484222325, @as(u32, @bitCast(rate))),
+                .seed = fnv(exec.session.browser.app.config.fingerprint_profile.noise_seed, @as(u32, @bitCast(rate))),
             },
         });
     }
@@ -574,6 +577,34 @@ pub const AudioContext = struct {
 };
 
 const testing = @import("../../../testing.zig");
+const Fingerprint = @import("../../Fingerprint.zig");
+
 test "WebApi: AudioContext" {
     try testing.htmlRunner("audio/audio_context.html", .{});
+}
+
+/// The hash a page computes from `startRendering()`'s samples, for a fixed
+/// (channels, length, rate) and a given profile.
+fn audioHash(noise_seed: u64) u64 {
+    var samples: [8192]f32 = undefined;
+    var seed = fnv(noise_seed, 1);
+    seed = fnv(seed, samples.len);
+    seed = fnv(seed, @as(u32, @bitCast(@as(f32, 44100))));
+    fillSamples(&samples, seed, 44100);
+
+    var hash: u64 = 0xcbf29ce484222325;
+    for (samples) |sample| {
+        hash = fnv(hash, @as(u32, @bitCast(sample)));
+    }
+    return hash;
+}
+
+test "AudioContext: audio fingerprint follows the profile seed" {
+    const a = Fingerprint.Profile.fromSeed(1234, .windows).noise_seed;
+    const b = Fingerprint.Profile.fromSeed(5678, .windows).noise_seed;
+
+    // Same seed reproduces; different seeds must not share one product-wide hash.
+    try testing.expectEqual(audioHash(a), audioHash(a));
+    try testing.expect(audioHash(a) != audioHash(b));
+    try testing.expect(audioHash(a) != audioHash(Fingerprint.Profile.stock.noise_seed));
 }
