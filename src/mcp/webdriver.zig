@@ -8,6 +8,8 @@ const lp = @import("lightpanda");
 const cdp_id = @import("../cdp/id.zig");
 const Element = @import("../browser/webapi/Element.zig");
 const DOMNode = @import("../browser/webapi/Node.zig");
+const Evaluator = @import("../browser/xpath/Evaluator.zig");
+const TreeWalker = @import("../browser/webapi/TreeWalker.zig");
 const Input = @import("../browser/webapi/element/html/Input.zig");
 const Option = @import("../browser/webapi/element/html/Option.zig");
 const Select = @import("../browser/webapi/element/html/Select.zig");
@@ -651,19 +653,17 @@ fn findElement(
 ) !std.http.Status {
     const locator = (try parseLocator(arena, body, out)) orelse return .bad_request;
     const root = (try searchRoot(session, parent_id, out)) orelse return .not_found;
-    if (!std.mem.eql(u8, locator.using, "css selector")) {
-        return sendError(out, .bad_request, "invalid argument", "Only the css selector locator strategy is supported");
-    }
-    const selectors = parseCssSelectors(arena, locator.value) catch |err|
+    const strategy = parseStrategy(arena, locator) catch |err|
         return sendSelectorError(out, err);
     var wait = ImplicitWait.init(session, server.webdriverImplicitTimeout());
     defer wait.deinit(session);
 
     while (true) {
         const frame = (try activeSearchFrame(session, root, out)) orelse return .not_found;
-        const element = Selector.queryInTreeOrder(selectors, root.node, frame);
-        if (element) |found| {
-            return sendValue(out, try elementReference(session, found));
+        const elements = queryElements(arena, strategy, root.node, frame, true) catch |err|
+            return sendSelectorError(out, err);
+        if (elements.len > 0) {
+            return sendValue(out, try elementReference(session, elements[0]));
         }
 
         if (wait.expired(session)) {
@@ -695,29 +695,22 @@ fn findElements(
 ) !std.http.Status {
     const locator = (try parseLocator(arena, body, out)) orelse return .bad_request;
     const root = (try searchRoot(session, parent_id, out)) orelse return .not_found;
-    if (!std.mem.eql(u8, locator.using, "css selector")) {
-        return sendError(out, .bad_request, "invalid argument", "Only the css selector locator strategy is supported");
-    }
-    const selectors = parseCssSelectors(arena, locator.value) catch |err|
+    const strategy = parseStrategy(arena, locator) catch |err|
         return sendSelectorError(out, err);
     var wait = ImplicitWait.init(session, server.webdriverImplicitTimeout());
     defer wait.deinit(session);
 
     while (true) {
         const frame = (try activeSearchFrame(session, root, out)) orelse return .not_found;
-        const elements = Selector.queryAll(selectors, root.node, frame) catch
-            return sendError(out, .internal_server_error, "unknown error", "Could not query elements");
-        const references: ?[]ElementReference = blk: {
-            defer elements.deinit(frame._page);
-            if (elements._nodes.len == 0) break :blk null;
-
-            const found = try arena.alloc(ElementReference, elements._nodes.len);
-            for (elements._nodes, found) |node, *reference| {
-                reference.* = try elementReference(session, node.is(Element).?);
+        const elements = queryElements(arena, strategy, root.node, frame, false) catch |err|
+            return sendSelectorError(out, err);
+        if (elements.len > 0) {
+            const found = try arena.alloc(ElementReference, elements.len);
+            for (elements, found) |element, *reference| {
+                reference.* = try elementReference(session, element);
             }
-            break :blk found;
-        };
-        if (references) |found| return sendValue(out, found);
+            return sendValue(out, found);
+        }
 
         if (wait.expired(session)) {
             _ = wait.finish(session);
@@ -762,6 +755,86 @@ fn searchRoot(session: *Server.Session, parent_id: ?[]const u8, out: *std.Io.Wri
     };
 }
 
+const Strategy = union(enum) {
+    css: []const Selector.Selector,
+    link_text: []const u8,
+    partial_link_text: []const u8,
+    tag_name: []const u8,
+    xpath: []const u8,
+};
+
+fn parseStrategy(arena: Allocator, locator: Locator) !Strategy {
+    if (std.mem.eql(u8, locator.using, "css selector")) {
+        return .{ .css = try parseCssSelectors(arena, locator.value) };
+    }
+    if (std.mem.eql(u8, locator.using, "link text")) return .{ .link_text = locator.value };
+    if (std.mem.eql(u8, locator.using, "partial link text")) return .{ .partial_link_text = locator.value };
+    if (std.mem.eql(u8, locator.using, "tag name")) return .{ .tag_name = locator.value };
+    if (std.mem.eql(u8, locator.using, "xpath")) return .{ .xpath = locator.value };
+    return error.UnsupportedStrategy;
+}
+
+// Descendants of `root` matching `strategy`, in tree order. `first_only` stops
+// at the first hit so Find Element does not build the full match set.
+fn queryElements(
+    arena: Allocator,
+    strategy: Strategy,
+    root: *DOMNode,
+    frame: *lp.Frame,
+    first_only: bool,
+) ![]const *Element {
+    switch (strategy) {
+        .css => |selectors| {
+            if (first_only) {
+                const element = Selector.queryInTreeOrder(selectors, root, frame) orelse return &.{};
+                return arena.dupe(*Element, &.{element});
+            }
+            const list = try Selector.queryAll(selectors, root, frame);
+            defer list.deinit(frame._page);
+            const found = try arena.alloc(*Element, list._nodes.len);
+            for (list._nodes, found) |node, *slot| slot.* = node.is(Element).?;
+            return found;
+        },
+        .xpath => |expression| {
+            var found: std.ArrayList(*Element) = .empty;
+            for (try Evaluator.searchAll(arena, root, expression, frame)) |node| {
+                const element = node.is(Element) orelse continue;
+                try found.append(arena, element);
+                if (first_only) break;
+            }
+            return found.items;
+        },
+        else => {
+            var found: std.ArrayList(*Element) = .empty;
+            var walker = TreeWalker.FullExcludeSelf.Elements.init(root, .{});
+            while (walker.next()) |element| {
+                if (!matchesStrategy(arena, strategy, element, frame)) continue;
+                try found.append(arena, element);
+                if (first_only) break;
+            }
+            return found.items;
+        },
+    }
+}
+
+fn matchesStrategy(arena: Allocator, strategy: Strategy, element: *Element, frame: *lp.Frame) bool {
+    switch (strategy) {
+        .tag_name => |name| return std.mem.eql(u8, element.getLocalName(), name),
+        .link_text, .partial_link_text => |text| {
+            if (element.getTag() != .anchor) return false;
+            var rendered: std.Io.Writer.Allocating = .init(arena);
+            defer rendered.deinit();
+            element.getInnerText(&rendered.writer, frame) catch return false;
+            const trimmed = std.mem.trim(u8, rendered.writer.buffered(), &std.ascii.whitespace);
+            return if (strategy == .link_text)
+                std.mem.eql(u8, trimmed, text)
+            else
+                std.mem.indexOf(u8, trimmed, text) != null;
+        },
+        else => unreachable,
+    }
+}
+
 fn parseCssSelectors(arena: Allocator, value: []const u8) ![]const Selector.Selector {
     return Selector.parseLeaky(arena, value) catch |err| return Selector.mapErrorToDOM(err);
 }
@@ -769,8 +842,10 @@ fn parseCssSelectors(arena: Allocator, value: []const u8) ![]const Selector.Sele
 fn sendSelectorError(out: *std.Io.Writer, err: anyerror) !std.http.Status {
     return switch (err) {
         error.SyntaxError => sendError(out, .bad_request, "invalid selector", "Invalid CSS selector"),
+        error.UnsupportedStrategy => sendError(out, .bad_request, "invalid argument", "Unsupported locator strategy"),
         error.OutOfMemory => sendError(out, .internal_server_error, "unknown error", "Could not parse selector"),
-        else => sendError(out, .internal_server_error, "unknown error", @errorName(err)),
+        // Every remaining Parser/Evaluator error is an XPath the client wrote.
+        else => sendError(out, .bad_request, "invalid selector", @errorName(err)),
     };
 }
 
@@ -2070,6 +2145,7 @@ fn testFindWebDriverElement(
     parent_id: ?[]const u8,
     selector: []const u8,
     out: *std.Io.Writer.Allocating,
+    using: []const u8,
 ) ![]u8 {
     const testing = @import("../testing.zig");
     const path = if (parent_id) |id|
@@ -2079,8 +2155,8 @@ fn testFindWebDriverElement(
     defer testing.allocator.free(path);
     const body = try std.fmt.allocPrint(
         testing.allocator,
-        "{{\"using\":\"css selector\",\"value\":\"{s}\"}}",
-        .{selector},
+        "{{\"using\":\"{s}\",\"value\":\"{s}\"}}",
+        .{ using, selector },
     );
     defer testing.allocator.free(body);
 
@@ -2188,6 +2264,7 @@ test "WebDriver: element retrieval returns stable references and W3C state" {
         "<fieldset disabled><legend><input id='legend_input'></legend>" ++
         "<input id='fieldset_input'></fieldset>" ++
         "<fieldset disabled><fieldset disabled><legend><input id='nested_legend_input'></legend></fieldset></fieldset>" ++
+        "<a id='link' href='#'> click me </a>" ++
         "<p id='remove'>remove</p><p id='adopt'>adopt</p>";
     const navigate_body = try std.fmt.allocPrint(testing.allocator, "{{\"url\":\"{s}\"}}", .{page_url});
     defer testing.allocator.free(navigate_body);
@@ -2197,7 +2274,7 @@ test "WebDriver: element retrieval returns stable references and W3C state" {
 
     const default_active_id = try testGetActiveWebDriverElement(server, request_allocator, session_id, &out);
     defer testing.allocator.free(default_active_id);
-    const body_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "body", &out);
+    const body_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "body", &out, "css selector");
     defer testing.allocator.free(body_id);
     try std.testing.expectEqualStrings(body_id, default_active_id);
 
@@ -2211,13 +2288,13 @@ test "WebDriver: element retrieval returns stable references and W3C state" {
     }
     const focused_active_id = try testGetActiveWebDriverElement(server, request_allocator, session_id, &out);
     defer testing.allocator.free(focused_active_id);
-    const unchecked_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#unchecked", &out);
+    const unchecked_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#unchecked", &out, "css selector");
     defer testing.allocator.free(unchecked_id);
     try std.testing.expectEqualStrings(unchecked_id, focused_active_id);
 
-    const parent_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#parent", &out);
+    const parent_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#parent", &out, "css selector");
     defer testing.allocator.free(parent_id);
-    const parent_again = try testFindWebDriverElement(server, request_allocator, session_id, null, "#parent", &out);
+    const parent_again = try testFindWebDriverElement(server, request_allocator, session_id, null, "#parent", &out, "css selector");
     defer testing.allocator.free(parent_again);
     try std.testing.expectEqualStrings(parent_id, parent_again);
     try expectWebDriverElementValue(
@@ -2257,18 +2334,18 @@ test "WebDriver: element retrieval returns stable references and W3C state" {
     out.clearRetainingCapacity();
     try testing.expectEqual(.method_not_allowed, try handle(server, request_allocator, .POST, rect_path, "", &out.writer));
     try testing.expectJson(.{ .value = .{ .@"error" = "unknown method" } }, out.writer.buffered());
-    const selector_list_id = try testFindWebDriverElement(server, request_allocator, session_id, null, ".item, #parent", &out);
+    const selector_list_id = try testFindWebDriverElement(server, request_allocator, session_id, null, ".item, #parent", &out, "css selector");
     defer testing.allocator.free(selector_list_id);
     try std.testing.expectEqualStrings(parent_id, selector_list_id);
-    const root_id = try testFindWebDriverElement(server, request_allocator, session_id, null, ":root", &out);
+    const root_id = try testFindWebDriverElement(server, request_allocator, session_id, null, ":root", &out, "css selector");
     defer testing.allocator.free(root_id);
     try expectWebDriverElementValue(server, request_allocator, session_id, root_id, "/name", &out, "html");
 
-    const child_id = try testFindWebDriverElement(server, request_allocator, session_id, parent_id, ".item", &out);
+    const child_id = try testFindWebDriverElement(server, request_allocator, session_id, parent_id, ".item", &out, "css selector");
     defer testing.allocator.free(child_id);
-    const scope_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#scope", &out);
+    const scope_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#scope", &out, "css selector");
     defer testing.allocator.free(scope_id);
-    const target_id = try testFindWebDriverElement(server, request_allocator, session_id, scope_id, "#ancestor .target", &out);
+    const target_id = try testFindWebDriverElement(server, request_allocator, session_id, scope_id, "#ancestor .target", &out, "css selector");
     defer testing.allocator.free(target_id);
     try expectWebDriverElementValue(server, request_allocator, session_id, parent_id, "/name", &out, "div");
     try expectWebDriverElementValue(server, request_allocator, session_id, parent_id, "/attribute/data-kind", &out, "group");
@@ -2363,7 +2440,7 @@ test "WebDriver: element retrieval returns stable references and W3C state" {
     defer duplicates.deinit();
     try testing.expectEqual(@as(usize, 2), duplicates.value.object.get("value").?.array.items.len);
 
-    const hidden_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#hidden", &out);
+    const hidden_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#hidden", &out, "css selector");
     defer testing.allocator.free(hidden_id);
     try expectWebDriverElementValue(server, request_allocator, session_id, hidden_id, "/attribute/hidden", &out, "true");
     try expectWebDriverElementValue(server, request_allocator, session_id, hidden_id, "/attribute/HIDDEN", &out, "true");
@@ -2377,7 +2454,7 @@ test "WebDriver: element retrieval returns stable references and W3C state" {
         .{ .x = 0.0, .y = 0.0, .width = 0.0, .height = 0.0 },
     );
 
-    const checked_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#checked", &out);
+    const checked_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#checked", &out, "css selector");
     defer testing.allocator.free(checked_id);
     try expectWebDriverElementValue(server, request_allocator, session_id, checked_id, "/selected", &out, true);
     try expectWebDriverElementValue(server, request_allocator, session_id, checked_id, "/enabled", &out, false);
@@ -2385,31 +2462,31 @@ test "WebDriver: element retrieval returns stable references and W3C state" {
     try expectWebDriverElementValue(server, request_allocator, session_id, unchecked_id, "/selected", &out, false);
     try expectWebDriverElementValue(server, request_allocator, session_id, unchecked_id, "/attribute/alpha", &out, "true");
 
-    const selected_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#selected", &out);
+    const selected_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#selected", &out, "css selector");
     defer testing.allocator.free(selected_id);
     try expectWebDriverElementValue(server, request_allocator, session_id, selected_id, "/selected", &out, true);
 
-    const implicit_selected_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#implicit_selected", &out);
+    const implicit_selected_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#implicit_selected", &out, "css selector");
     defer testing.allocator.free(implicit_selected_id);
     try expectWebDriverElementValue(server, request_allocator, session_id, implicit_selected_id, "/selected", &out, true);
 
-    const disabled_group_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#disabled_group", &out);
+    const disabled_group_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#disabled_group", &out, "css selector");
     defer testing.allocator.free(disabled_group_id);
     try expectWebDriverElementValue(server, request_allocator, session_id, disabled_group_id, "/enabled", &out, false);
 
-    const disabled_option_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#disabled_option", &out);
+    const disabled_option_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#disabled_option", &out, "css selector");
     defer testing.allocator.free(disabled_option_id);
     try expectWebDriverElementValue(server, request_allocator, session_id, disabled_option_id, "/enabled", &out, false);
 
-    const legend_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#legend_input", &out);
+    const legend_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#legend_input", &out, "css selector");
     defer testing.allocator.free(legend_id);
     try expectWebDriverElementValue(server, request_allocator, session_id, legend_id, "/enabled", &out, true);
 
-    const fieldset_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#fieldset_input", &out);
+    const fieldset_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#fieldset_input", &out, "css selector");
     defer testing.allocator.free(fieldset_id);
     try expectWebDriverElementValue(server, request_allocator, session_id, fieldset_id, "/enabled", &out, false);
 
-    const nested_legend_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#nested_legend_input", &out);
+    const nested_legend_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#nested_legend_input", &out, "css selector");
     defer testing.allocator.free(nested_legend_id);
     try expectWebDriverElementValue(server, request_allocator, session_id, nested_legend_id, "/enabled", &out, false);
 
@@ -2442,11 +2519,46 @@ test "WebDriver: element retrieval returns stable references and W3C state" {
             request_allocator,
             .POST,
             all_path,
-            "{\"using\":\"tag name\",\"value\":\"div\"}",
+            "{\"using\":\"name\",\"value\":\"div\"}",
             &out.writer,
         ),
     );
     try testing.expectJson(.{ .value = .{ .@"error" = "invalid argument" } }, out.writer.buffered());
+
+    // Non-CSS locator strategies resolve against the same reference scheme.
+    const tag_name_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "div", &out, "tag name");
+    defer testing.allocator.free(tag_name_id);
+    try std.testing.expectEqualStrings(parent_id, tag_name_id);
+
+    const xpath_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "//*[@id='scope']", &out, "xpath");
+    defer testing.allocator.free(xpath_id);
+    try std.testing.expectEqualStrings(scope_id, xpath_id);
+
+    const scoped_xpath_id = try testFindWebDriverElement(server, request_allocator, session_id, scope_id, ".//span", &out, "xpath");
+    defer testing.allocator.free(scoped_xpath_id);
+    try std.testing.expectEqualStrings(target_id, scoped_xpath_id);
+
+    const link_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "click me", &out, "link text");
+    defer testing.allocator.free(link_id);
+    try expectWebDriverElementValue(server, request_allocator, session_id, link_id, "/attribute/id", &out, "link");
+
+    const partial_link_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "lick m", &out, "partial link text");
+    defer testing.allocator.free(partial_link_id);
+    try std.testing.expectEqualStrings(link_id, partial_link_id);
+
+    out.clearRetainingCapacity();
+    try testing.expectEqual(
+        .bad_request,
+        try handle(
+            server,
+            request_allocator,
+            .POST,
+            all_path,
+            "{\"using\":\"xpath\",\"value\":\"//[\"}",
+            &out.writer,
+        ),
+    );
+    try testing.expectJson(.{ .value = .{ .@"error" = "invalid selector" } }, out.writer.buffered());
 
     out.clearRetainingCapacity();
     try testing.expectEqual(
@@ -2476,10 +2588,10 @@ test "WebDriver: element retrieval returns stable references and W3C state" {
     }
     out.clearRetainingCapacity();
     try testing.expectEqual(.ok, try handle(server, request_allocator, .POST, timeouts_path, "{\"implicit\":250}", &out.writer));
-    const later_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#later", &out);
+    const later_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#later", &out, "css selector");
     defer testing.allocator.free(later_id);
 
-    const remove_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#remove", &out);
+    const remove_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#remove", &out, "css selector");
     defer testing.allocator.free(remove_id);
     {
         server.enterIsolate(active);
@@ -2540,7 +2652,7 @@ test "WebDriver: element retrieval returns stable references and W3C state" {
     try testing.expectEqual(.not_found, try handle(server, request_allocator, .GET, noncanonical_path, "", &out.writer));
     try testing.expectJson(.{ .value = .{ .@"error" = "no such element" } }, out.writer.buffered());
 
-    const adopt_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#adopt", &out);
+    const adopt_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#adopt", &out, "css selector");
     defer testing.allocator.free(adopt_id);
     {
         server.enterIsolate(active);

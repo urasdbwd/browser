@@ -275,17 +275,23 @@ Once the CDP server started, you can run a Puppeteer script by configuring the
 ./lightpanda serve --webdriver --host 127.0.0.1 --port 9515
 ```
 
-This initial W3C WebDriver slice supports `GET /status`, session creation and
+This W3C WebDriver slice supports `GET /status`, session creation and
 deletion, navigation, current URL, title, serialized page source, current
-window handle(s), closing the sole window, timeouts, CSS element lookup from
-the document or an element, active element, and element tag name, attribute,
-selected, and enabled state. Element lookup honors the session's implicit
-timeout. It accepts one active session with one top-level browsing context and
-loopback binds only; closing that context closes the session. Use
-`browserName: "lightpanda"`;
-unsupported capabilities fail session creation instead of being silently
-ignored. Non-CSS locator strategies, element interaction, and script execution
-are not yet implemented.
+window handle(s), closing the sole window, timeouts, element lookup from the
+document or an element, active element, element tag name, attribute, text, CSS
+value, selected, and enabled state, element click, clear and send keys, and
+`POST /session/{id}/execute/sync` and `/execute/async`. Element lookup honors
+the session's implicit timeout and accepts the `css selector`, `link text`,
+`partial link text`, `tag name` and `xpath` strategies. Scripts run in the
+top-level browsing context; element references round-trip through `args` and
+results, a thrown exception maps to `javascript error`, and the session's
+`script` timeout maps to `script timeout`. It accepts one active session with
+one top-level browsing context and loopback binds only; closing that context
+closes the session. Use `browserName: "lightpanda"`; unsupported capabilities
+fail session creation instead of being silently ignored. Element
+interactability is "the engine considers it displayed", not the spec's full
+pointer hit test, and the WebDriver private-use key codes are mapped only for
+Backspace, Tab, Enter and Escape.
 
 Unlike Chrome, pages in a WebDriver session report `navigator.webdriver ===
 false`. Lightpanda deliberately never advertises that it is being automated —
