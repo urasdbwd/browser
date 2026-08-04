@@ -39,6 +39,12 @@ _timing: PerformanceTiming = .{},
 _navigation: PerformanceNavigation = .{},
 _event_counts: EventCounts = .{},
 
+// Navigation milestones, in ms since `_time_origin`. 0 until they fire.
+// Consumed by chrome.csi()/chrome.loadTimes(), which scanners compare against
+// performance.now().
+_dom_content_loaded: f64 = 0,
+_load_event_end: f64 = 0,
+
 // PerformanceObserver infrastructure. Lives here (rather than on the owning
 // Frame/WorkerGlobalScope) so that both contexts get observers for free.
 _observers: std.ArrayList(*PerformanceObserver) = .empty,
@@ -68,6 +74,18 @@ pub fn now(self: *const Performance) f64 {
     const elapsed = current - self._time_origin;
     // Return as milliseconds with microsecond precision
     return @as(f64, @floatFromInt(elapsed)) / 1000.0;
+}
+
+pub fn markDomContentLoaded(self: *Performance) void {
+    if (self._dom_content_loaded == 0) {
+        self._dom_content_loaded = self.now();
+    }
+}
+
+pub fn markLoadEventEnd(self: *Performance) void {
+    if (self._load_event_end == 0) {
+        self._load_event_end = self.now();
+    }
 }
 
 pub fn getTimeOrigin(self: *const Performance) f64 {

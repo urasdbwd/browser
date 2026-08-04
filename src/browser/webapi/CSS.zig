@@ -173,6 +173,9 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "Css";
+        // `window.CSS` is exposed by the Window accessor; there is no
+        // `window.Css` interface object in a real browser.
+        pub const no_interface_object = true;
 
         // Per the CSSOM spec, CSS is a namespace object — members are own
         // properties so Object.entries(CSS) returns them.

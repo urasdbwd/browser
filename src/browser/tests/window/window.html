@@ -187,7 +187,11 @@
   testing.expectEqual(1920, screen.width);
   testing.expectEqual(1080, screen.height);
   testing.expectEqual(1920, screen.availWidth);
-  testing.expectEqual(1040, screen.availHeight);
+  // avail* is inset by the seeded platform's system chrome (taskbar / menu
+  // bar + dock), so assert the shape rather than one platform's number.
+  testing.expectEqual(true, screen.availHeight < screen.height);
+  testing.expectEqual(true, screen.availTop + screen.availHeight <= screen.height);
+  testing.expectEqual(0, screen.availLeft);
   testing.expectEqual(24, screen.colorDepth);
   testing.expectEqual(24, screen.pixelDepth);
   testing.expectEqual(screen, window.screen);

@@ -1080,6 +1080,7 @@ pub fn documentIsLoaded(self: *Frame) void {
 }
 
 pub fn _documentIsLoaded(self: *Frame) !void {
+    self.window._performance.markDomContentLoaded();
     try self.dispatchReadyStateChange();
 
     const event = try Event.initTrusted(.wrap("DOMContentLoaded"), .{ .bubbles = true }, self._page);
@@ -1197,6 +1198,8 @@ fn _documentIsComplete(self: *Frame) !void {
         event._target = self.document.asEventTarget();
         try self._event_manager.dispatchDirect(window_target, event, self.window._on_load, .{ .inject_target = false, .context = "page load" });
     }
+
+    self.window._performance.markLoadEventEnd();
 
     self._session.notification.dispatch(.frame_loaded, &.{
         .req_id = self._req_id,

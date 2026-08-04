@@ -180,9 +180,15 @@
 </script>
 
 <script id=getBattery type=module>
-  // Like Firefox, we don't expose navigator.getBattery. Sites already
-  // have to handle it being undefined, so this is a real-browser shape
-  // rather than a stub that always rejects.
-  testing.expectEqual('undefined', typeof navigator.getBattery);
+  // Chrome exposes navigator.getBattery, and headless-detection heuristics
+  // treat its absence as a signal. Values come from the fingerprint seed.
+  const state = await testing.async();
+  const battery = await navigator.getBattery();
+  state.resolve();
+  await state.done(() => {
+    testing.expectEqual('function', typeof navigator.getBattery);
+    testing.expectEqual('boolean', typeof battery.charging);
+    testing.expectEqual(true, battery.level > 0 && battery.level <= 1);
+  });
 </script>
 

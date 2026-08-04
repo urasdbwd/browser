@@ -313,7 +313,11 @@ fn createSnapshotContext(
         @setEvalBranchQuota(10_000);
         const template_index = comptime bridge.JsApiLookup.getId(JsApi);
         const func = v8.v8__FunctionTemplate__GetFunction(templates[template_index], context);
-        if (@hasDecl(JsApi.Meta, "name")) {
+        // `no_interface_object` types exist only as instances (window.chrome,
+        // navigator.modelContext, ...). Real Chrome exposes no matching global
+        // constructor, and bot scanners diff Object.getOwnPropertyNames(window)
+        // against a reference list, so installing one is a fingerprint tell.
+        if (@hasDecl(JsApi.Meta, "name") and !@hasDecl(JsApi.Meta, "no_interface_object")) {
             if (@hasDecl(JsApi.Meta, "constructor_alias")) {
                 const alias = JsApi.Meta.constructor_alias;
                 const v8_class_name = v8.v8__String__NewFromUtf8(isolate, alias.ptr, v8.kNormal, @intCast(alias.len));

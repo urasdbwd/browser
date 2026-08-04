@@ -46,6 +46,9 @@ arena_pool: ArenaPool,
 app_dir_path: ?[]const u8,
 
 pub fn init(allocator: Allocator, config: *const Config) !*App {
+    // Must run before V8/ICU caches the default timezone.
+    config.applyTimezone();
+
     const platform = try Platform.initWithOptions(config.v8Flags(), .{
         .thread_pool_size = config.v8ThreadPoolSize(),
         .idle_task_support = config.v8IdleTasks(),

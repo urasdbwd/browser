@@ -51,6 +51,7 @@ const StorageEstimate = struct {
         pub const bridge = js.Bridge(StorageEstimate);
         pub const Meta = struct {
             pub const name = "StorageEstimate";
+            pub const no_interface_object = true;
             pub const prototype_chain = bridge.prototypeChain();
             pub var class_id: bridge.ClassId = undefined;
         };
