@@ -454,7 +454,10 @@ test "MCP.Server - Integration: synchronous smoke test" {
 }
 
 test "MCP.Server - WebDriver initialization leaves a disabled watchdog thread-free" {
+    // Only the watchdog is exercised here, but `initWebDriver` reads
+    // `app.config` for the session cap, so it has to be a real pointer.
     var app: App = undefined;
+    app.config = testing.test_app.config;
     app.watchdog = .init(null);
     defer app.watchdog.deinit();
 
