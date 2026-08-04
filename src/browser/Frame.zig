@@ -46,6 +46,7 @@ const Window = @import("webapi/Window.zig");
 const Location = @import("webapi/Location.zig");
 const Document = @import("webapi/Document.zig");
 const ShadowRoot = @import("webapi/ShadowRoot.zig");
+const Console = @import("webapi/Console.zig");
 const Performance = @import("webapi/Performance.zig");
 const Screen = @import("webapi/Screen.zig");
 const VisualViewport = @import("webapi/VisualViewport.zig");
@@ -2127,6 +2128,10 @@ pub fn getElementByIdFromNode(self: *Frame, node: *Node, id: []const u8) ?*Eleme
 
 pub fn performance(self: *Frame) *Performance {
     return &self.window._performance;
+}
+
+pub fn console(self: *Frame) *Console {
+    return &self.window._console;
 }
 
 // Tracks a file input's FileList so its File refs are released at teardown.
