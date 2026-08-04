@@ -48,7 +48,7 @@ pub fn collect(
     allocator: std.mem.Allocator,
     root: *Node,
     selector: Selector.Selector,
-    nodes: *std.AutoArrayHashMapUnmanaged(*Node, void),
+    nodes: *std.ArrayListUnmanaged(*Node),
     frame: *Frame,
 ) !void {
     if (optimizeSelector(root, &selector, frame)) |result| {
@@ -59,7 +59,7 @@ pub fn collect(
 
         while (tw.next()) |node| {
             if (matches(node, result.selector, root, frame)) {
-                try nodes.put(allocator, node, {});
+                try nodes.append(allocator, node);
             }
         }
     }

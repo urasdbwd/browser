@@ -441,6 +441,19 @@
 }
 </script>
 
+<script id=selector_list_no_duplicates>
+  // collectAll appends matches straight into a list instead of a hash set, on
+  // the grounds that one TreeWalker pass offers each node exactly once. A
+  // selector list where several selectors match the same element is where that
+  // would show up: each element must still appear once, in tree order.
+  {
+    assertList(['div1', 'span1'], document.querySelectorAll('.test-class, .test-class'));
+    assertList(['div1', 'span1'], document.querySelectorAll('div.test-class, span.test-class, .test-class'));
+    assertList(['multi1', 'multi2'], document.querySelectorAll('.classes, .here'));
+    assertList(['div1', 'multi1', 'multi2'], document.querySelectorAll('div.test-class, .classes'));
+  }
+</script>
+
 <script id=iterator_list_lifetime>
   // This test is intended to ensure that a list remains alive as long as it
   // must, i.e. as long as any iterator referencing the list is alive.
