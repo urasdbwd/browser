@@ -25,7 +25,6 @@ const build_config = @import("build_config");
 const cli = @import("cli.zig");
 const dump = @import("browser/dump.zig");
 
-const Storage = @import("storage/Storage.zig");
 const WebBotAuthConfig = @import("network/WebBotAuth.zig").Config;
 
 const log = lp.log;
@@ -263,8 +262,6 @@ const CommonOptions = .{
     .{ .name = "block_urls", .type = ?[]const u8 },
     .{ .name = "cookie", .type = ?[]const u8 },
     .{ .name = "cookie_jar", .type = ?[]const u8 },
-    .{ .name = "storage_engine", .type = ?Storage.EngineType },
-    .{ .name = "storage_sqlite_path", .type = ?[:0]const u8 },
     .{ .name = "disable_subframes", .type = bool },
     .{ .name = "disable_workers", .type = bool },
     .{ .name = "enable_external_stylesheets", .type = bool },
@@ -1138,20 +1135,6 @@ pub fn cdpMaxHTTPMessageSize(self: *const Config) u14 {
     };
 }
 
-pub fn storageEngine(self: *const Config) ?Storage.EngineType {
-    return switch (self.mode) {
-        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.storage_engine,
-        else => unreachable,
-    };
-}
-
-pub fn storageSqlitePath(self: *const Config) ?[:0]const u8 {
-    return switch (self.mode) {
-        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.storage_sqlite_path,
-        else => unreachable,
-    };
-}
-
 /// Returns the user-supplied certificate store (`--ca-cert`/`--ca-path`),
 /// if any was loaded during argument parsing. The caller takes ownership.
 pub fn customCertStore(self: *const Config) ?*crypto.X509_STORE {
@@ -1182,7 +1165,7 @@ pub const WaitUntil = enum {
     done,
 };
 
-/// Pre-formatted HTTP headers for reuse across Http and Client.
+/// HTTP header values shared across Http and Client.
 /// Must be initialized with an allocator that outlives all HTTP connections.
 pub const HttpHeaders = struct {
     pub const product_version: [:0]const u8 = "1.0";
@@ -1228,9 +1211,9 @@ pub const HttpHeaders = struct {
 
     fn secChUa(comptime brand_list: []const Brand) [:0]const u8 {
         comptime {
-            var out: [:0]const u8 = "Sec-Ch-Ua:";
+            var out: [:0]const u8 = "";
             for (brand_list, 0..) |b, i| {
-                const sep = if (i == 0) " " else ", ";
+                const sep = if (i == 0) "" else ", ";
                 out = out ++ sep ++ "\"" ++ b.brand ++ "\";v=\"" ++ b.version ++ "\"";
             }
             return out;
@@ -1244,14 +1227,13 @@ pub const HttpHeaders = struct {
     // stream when a client sends Accept-Encoding without Accept-Language,
     // treating it as a bot signal. Ship a neutral default so we look like a
     // normal client.
-    pub const accept_language: [:0]const u8 = "Accept-Language: en-US,en;q=0.9";
+    pub const accept_language: [:0]const u8 = "en-US,en;q=0.9";
 
     // Document-navigation Accept value Chrome sends.
-    pub const navigation_accept: [:0]const u8 = "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+    pub const navigation_accept: [:0]const u8 = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
 
     user_agent: [:0]const u8, // User agent value (e.g. "Lightpanda/1.0")
-    user_agent_header: [:0]const u8,
-    /// Sec-Ch-Ua header line (includes "Sec-Ch-Ua: " prefix).
+    /// Sec-Ch-Ua header value (brand list), stealth-aware.
     sec_ch_ua_header: [:0]const u8,
     /// Brand list for navigator.userAgentData (same source as Sec-Ch-Ua).
     brand_list: []const Brand,
@@ -1276,9 +1258,6 @@ pub const HttpHeaders = struct {
             user_agent_base;
         errdefer if (owned) allocator.free(user_agent);
 
-        const user_agent_header = try std.fmt.allocPrintSentinel(allocator, "User-Agent: {s}", .{user_agent}, 0);
-        errdefer allocator.free(user_agent_header);
-
         const proxy_bearer_header: ?[:0]const u8 = if (config.proxyBearerToken()) |token|
             try std.fmt.allocPrintSentinel(allocator, "Proxy-Authorization: Bearer {s}", .{token}, 0)
         else
@@ -1286,7 +1265,6 @@ pub const HttpHeaders = struct {
 
         return .{
             .user_agent = user_agent,
-            .user_agent_header = user_agent_header,
             .sec_ch_ua_header = if (is_stealth) sec_ch_ua_stealth else sec_ch_ua,
             .brand_list = if (is_stealth) &brands_stealth else &brands,
             .stealth = is_stealth,
@@ -1299,7 +1277,6 @@ pub const HttpHeaders = struct {
         if (self.proxy_bearer_header) |hdr| {
             allocator.free(hdr);
         }
-        allocator.free(self.user_agent_header);
         if (self.user_agent_owned) {
             allocator.free(self.user_agent);
         }

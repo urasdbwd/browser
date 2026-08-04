@@ -24,7 +24,6 @@ const Snapshot = @import("browser/js/Snapshot.zig");
 const Platform = @import("browser/js/Platform.zig");
 const Telemetry = @import("telemetry/telemetry.zig").Telemetry;
 
-const Storage = @import("storage/Storage.zig");
 const Network = @import("network/Network.zig");
 const Watchdog = @import("Watchdog.zig");
 pub const ArenaPool = @import("ArenaPool.zig");
@@ -36,7 +35,6 @@ const App = @This();
 
 network: Network,
 config: *const Config,
-storage: Storage,
 platform: Platform,
 snapshot: Snapshot,
 telemetry: Telemetry,
@@ -66,9 +64,6 @@ pub fn init(allocator: Allocator, config: *const Config) !*App {
     const snapshot = try Snapshot.load();
     errdefer snapshot.deinit();
 
-    var storage = try Storage.init(allocator, config);
-    errdefer storage.deinit(allocator);
-
     const app = try allocator.create(App);
     errdefer allocator.destroy(app);
 
@@ -77,7 +72,6 @@ pub fn init(allocator: Allocator, config: *const Config) !*App {
         .allocator = allocator,
         .platform = platform,
         .snapshot = snapshot,
-        .storage = storage,
         .network = undefined,
         .app_dir_path = undefined,
         .telemetry = undefined,
@@ -127,7 +121,6 @@ pub fn deinit(self: *App) void {
     self.snapshot.deinit();
     self.platform.deinit();
     self.arena_pool.deinit();
-    self.storage.deinit(allocator);
 
     allocator.destroy(self);
 }

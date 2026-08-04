@@ -562,8 +562,8 @@ fn matchNameTest(node: *Node, name: []const u8, axis: ast.Axis, lowered_name: ?[
     // replaces the per-call `eqlIgnoreCase`.
     if (axis == .attribute) {
         if (std.mem.eql(u8, name, "*")) return node._type == .attribute;
-        const attr = switch (node.typed()) {
-            .attribute => |a| a,
+        const attr = switch (node._type) {
+            .attribute => node.subtype(Element.Attribute),
             else => return false,
         };
         return std.mem.eql(u8, attr._name.str(), lowered_name.?);

@@ -31,7 +31,6 @@ const Option = Element.Html.Option;
 const Select = Element.Html.Select;
 const TextArea = Element.Html.TextArea;
 
-const IS_DEBUG = @import("builtin").mode == .Debug;
 pub const MAX_LIVE_TARGETS = std.math.maxInt(u16);
 const LIVE_INDETERMINATE_ATTR = "data-lightpanda-live-indeterminate";
 const LIVE_SELECTED_NONE_ATTR = "data-lightpanda-live-selected-none";
@@ -149,8 +148,9 @@ fn _deep(
     frame: *Frame,
     root_state: ?*RootState,
 ) error{ WriteFailed, OutOfMemory }!void {
-    switch (node.typed()) {
-        .cdata => |cd| {
+    switch (node._type) {
+        .cdata => {
+            const cd = node.subtype(Node.CData);
             if (node.is(Node.CData.Comment)) |_| {
                 try writer.writeAll("<!--");
                 try writer.writeAll(cd.getData().str());
@@ -169,7 +169,8 @@ fn _deep(
                 }
             }
         },
-        .element => |el| {
+        .element => {
+            const el = node.subtype(Node.Element);
             if (shouldStripElement(el, opts, frame)) {
                 return;
             }
@@ -294,7 +295,8 @@ fn _deep(
             }
         },
         .document => try _children(node, opts, writer, frame, root_state),
-        .document_type => |dt| {
+        .document_type => {
+            const dt = node.subtype(Node.DocumentType);
             try writer.writeAll("<!DOCTYPE ");
             try writer.writeAll(dt.getName());
 
@@ -341,7 +343,7 @@ pub fn toJSON(node: *Node, writer: *std.json.Stringify) !void {
     try writer.beginObject();
 
     try writer.objectField("type");
-    switch (node.type) {
+    switch (node._type) {
         .cdata => {
             try writer.write("cdata");
         },
@@ -351,7 +353,8 @@ pub fn toJSON(node: *Node, writer: *std.json.Stringify) !void {
         .document_type => {
             try writer.write("document_type");
         },
-        .element => |*el| {
+        .element => {
+            const el = node.subtype(Node.Element);
             try writer.write("element");
             try writer.objectField("tag");
             try writer.write(el.tagName());

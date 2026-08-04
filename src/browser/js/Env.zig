@@ -519,7 +519,7 @@ pub fn hasMacrotasks(self: *Env) bool {
         if (ctx.active == false) {
             continue;
         }
-        if (ctx.scheduler.high_priority.count() > 0) {
+        if (ctx.scheduler.blocksCompletion()) {
             return true;
         }
     }

@@ -615,20 +615,33 @@ pub fn typedOf(value: anytype) reflect.Struct(@TypeOf(value)).Typed {
     }
 }
 
-// The `_type` value for a chain member pointing at `value`. Handles both the
-// tagged-union and the bare-tag (see `typedOf`) representation.
-fn typeInit(comptime S: type, value: anytype) @FieldType(S, "_type") {
-    const F = @FieldType(S, "_type");
-    if (comptime @typeInfo(F) == .@"enum") {
-        return @field(F, unionFieldName(S.Typed, @TypeOf(value)));
-    }
-    return unionInit(F, value);
-}
-
 fn unionInit(comptime T: type, value: anytype) T {
     const V = @TypeOf(value);
     const field_name = comptime unionFieldName(T, V);
     return @unionInit(T, field_name, value);
+}
+
+// Initializes Parent._type for the chain member laid out after Parent. For a
+// tagged-union _type the member's pointer is the payload; for a bare-tag _type
+// (e.g. Node, CData) the member is reached by arithmetic and only its tag is
+// stored. Bare-tag chains expose their subtypes either as a `Typed` union
+// (see `typedOf`) or as a `Subtype(tag)` mapping; both are supported.
+fn typeInit(comptime Parent: type, value: anytype) Parent.Type {
+    if (comptime @typeInfo(Parent.Type) != .@"enum") {
+        return unionInit(Parent.Type, value);
+    }
+    if (comptime @hasDecl(Parent, "Subtype")) {
+        return comptime subtypeTag(Parent, reflect.Struct(@TypeOf(value)));
+    }
+    return @field(Parent.Type, unionFieldName(Parent.Typed, @TypeOf(value)));
+}
+
+fn subtypeTag(comptime Parent: type, comptime V: type) Parent.Type {
+    for (@typeInfo(Parent.Type).@"enum".fields) |f| {
+        const tag: Parent.Type = @enumFromInt(f.value);
+        if (Parent.Subtype(tag) == V) return tag;
+    }
+    @compileError(@typeName(V) ++ " is not a subtype of " ++ @typeName(Parent));
 }
 
 // There can be friction between comptime and runtime. Comptime has to

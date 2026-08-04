@@ -31,6 +31,11 @@ const log = lp.log;
 const CLAMP_MS = 4;
 const CLAMP_NESTING = 5;
 
+// Once we hit this depth, tasks are scheduled with blocks_done = false. This
+// prevents, for example, a setTimeout that sets itself, from blocking the Runner
+// from considering the page "done" forever (more commonly seen with requestAnimationFrame)
+const BLOCKING_NESTING = 10;
+
 // airbnb has 600+ timers
 const MAX_CALLBACKS = 2048;
 
@@ -46,10 +51,10 @@ _callbacks: CallbackHashMap = .{},
 _stopped: bool = false,
 
 // We keep the depth of the timers (a setTimeout calling a setTimeout). When
-// the depth reaches CLAMP_NESTING, the minimum timeout is 4ms. This is per-
-// spec and it's necessary to prevent some sites from virtually breaking because
-// they repeatedly do heavy work in endlessly looping setTimeout with a short
-// timeout (often of 0ms)
+// the timer depth reaches CLAMP_NESTING, the minimum timeout is 4ms. This is
+// per-spec and it's necessary to prevent some sites from virtually breaking
+// because they repeatedly do heavy work in endlessly looping setTimeout with
+// a short timeout (often of 0ms).
 _nesting_level: u8 = 0,
 
 const Key = u32;
@@ -78,7 +83,7 @@ pub const ScheduleOpts = struct {
     repeat: bool,
     params: []js.Value.Global,
     name: []const u8,
-    low_priority: bool = false,
+    blocks_done: bool = true,
     mode: Mode = .normal,
 };
 
@@ -119,7 +124,7 @@ pub fn schedule(
     const arena = try exec.getArena(.tiny, "Timers.schedule");
     errdefer arena.release();
 
-    const nesting = @min(self._nesting_level + 1, CLAMP_NESTING + 1);
+    const nesting = @min(self._nesting_level + 1, BLOCKING_NESTING + 1);
     const delay = if (nesting > CLAMP_NESTING and delay_ms < CLAMP_MS) CLAMP_MS else delay_ms;
 
     var persisted_params: []js.Value.Global = &.{};
@@ -151,7 +156,7 @@ pub fn schedule(
 
     try exec.js.scheduler.add(callback, ScheduleCallback.run, delay, .{
         .name = opts.name,
-        .low_priority = opts.low_priority,
+        .blocks_done = opts.blocks_done and nesting <= BLOCKING_NESTING,
         .finalizer = ScheduleCallback.cancelled,
     });
     owns_globals = false;
@@ -297,7 +302,7 @@ const ScheduleCallback = struct {
         if (self.repeat_ms) |ms| {
             // each repeat re-enters the timer initialization steps, so the
             // nesting level keeps growing and sub-4ms intervals get clamped.
-            self.nesting = @min(self.nesting + 1, CLAMP_NESTING + 1);
+            self.nesting = @min(self.nesting + 1, BLOCKING_NESTING + 1);
             if (self.nesting > CLAMP_NESTING and ms < CLAMP_MS) {
                 return CLAMP_MS;
             }
