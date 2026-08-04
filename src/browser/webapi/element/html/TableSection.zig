@@ -6,6 +6,7 @@ const Frame = @import("../../../Frame.zig");
 const Element = @import("../../Element.zig");
 const HtmlElement = @import("../Html.zig");
 const collections = @import("../../collections.zig");
+const Table = @import("Table.zig");
 
 const String = lp.String;
 
@@ -28,6 +29,14 @@ pub fn getRows(self: *TableSection, frame: *Frame) collections.NodeLive(.child_t
     return collections.NodeLive(.child_tag).init(self.asNode(), .tr, frame);
 }
 
+pub fn insertRow(self: *TableSection, index: ?i32, frame: *Frame) !*Element {
+    return Table.insertChildAt(self.asNode(), .row, index, frame);
+}
+
+pub fn deleteRow(self: *TableSection, index: i32, frame: *Frame) !void {
+    return Table.deleteChildAt(self.asNode(), .row, index, frame);
+}
+
 pub const JsApi = struct {
     pub const bridge = js.Bridge(TableSection);
 
@@ -38,4 +47,6 @@ pub const JsApi = struct {
     };
 
     pub const rows = bridge.accessor(TableSection.getRows, null, .{});
+    pub const insertRow = bridge.function(TableSection.insertRow, .{ .ce_reactions = true });
+    pub const deleteRow = bridge.function(TableSection.deleteRow, .{ .ce_reactions = true });
 };

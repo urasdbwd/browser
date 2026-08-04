@@ -4,6 +4,7 @@ const Frame = @import("../../../Frame.zig");
 const Element = @import("../../Element.zig");
 const HtmlElement = @import("../Html.zig");
 const collections = @import("../../collections.zig");
+const Table = @import("Table.zig");
 
 const TableRow = @This();
 
@@ -22,6 +23,14 @@ pub fn getCells(self: *TableRow, frame: *Frame) collections.NodeLive(.cells) {
     return collections.NodeLive(.cells).init(self.asNode(), {}, frame);
 }
 
+pub fn insertCell(self: *TableRow, index: ?i32, frame: *Frame) !*Element {
+    return Table.insertChildAt(self.asNode(), .cell, index, frame);
+}
+
+pub fn deleteCell(self: *TableRow, index: i32, frame: *Frame) !void {
+    return Table.deleteChildAt(self.asNode(), .cell, index, frame);
+}
+
 pub const JsApi = struct {
     pub const bridge = js.Bridge(TableRow);
 
@@ -32,4 +41,6 @@ pub const JsApi = struct {
     };
 
     pub const cells = bridge.accessor(TableRow.getCells, null, .{});
+    pub const insertCell = bridge.function(TableRow.insertCell, .{ .ce_reactions = true });
+    pub const deleteCell = bridge.function(TableRow.deleteCell, .{ .ce_reactions = true });
 };

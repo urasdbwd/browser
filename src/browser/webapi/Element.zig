@@ -756,8 +756,17 @@ pub fn setAttributeNS(
         if (std.mem.eql(u8, namespace, "http://www.w3.org/2000/xmlns/")) {
             break :blk qualified_name;
         }
-        if (!std.mem.eql(u8, namespace, "http://www.w3.org/1999/xhtml")) {
-            log.warn(.not_implemented, "Element.setAttributeNS", .{ .namespace = namespace });
+        // Dropping the prefix is the correct result for these: `xlink:href`
+        // becomes `href` (what SVG <use> reads) and SVG-namespaced attributes
+        // are already stored unprefixed.
+        // ponytail: attributes have no per-namespace storage, so an unlisted
+        // namespace can collide with a same-local-name attribute. Give
+        // _attributes a namespace key if a real page ever depends on it.
+        const known = std.mem.eql(u8, namespace, "http://www.w3.org/1999/xhtml") or
+            std.mem.eql(u8, namespace, "http://www.w3.org/1999/xlink") or
+            std.mem.eql(u8, namespace, "http://www.w3.org/2000/svg");
+        if (!known) {
+            log.warn(.not_implemented, "Element.setAttributeNS namespace is dropped", .{ .namespace = namespace });
         }
         break :blk if (std.mem.indexOfScalarPos(u8, qualified_name, 0, ':')) |idx|
             qualified_name[idx + 1 ..]

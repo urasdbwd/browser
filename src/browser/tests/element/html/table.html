@@ -58,6 +58,54 @@
   }
 </script>
 
+<script id="insertRow_insertCell">
+  {
+    // The rebrowser detector builds its results table with exactly this:
+    // createElement('tbody') -> insertRow(-1) -> insertCell(i) where i is a
+    // string index from a for..in loop.
+    const tbody = document.createElement('tbody');
+    const row = tbody.insertRow(-1);
+    testing.expectEqual('TR', row.tagName);
+    testing.expectEqual(1, tbody.rows.length);
+
+    const cell = row.insertCell('0');
+    testing.expectEqual('TD', cell.tagName);
+    testing.expectEqual(1, row.cells.length);
+    row.insertCell(1);
+    row.insertCell();
+    testing.expectEqual(3, row.cells.length);
+
+    // inserting at an index shifts the rest along
+    const first = row.insertCell(0);
+    testing.expectEqual(true, row.cells[0] === first);
+    testing.expectEqual(4, row.cells.length);
+
+    row.deleteCell(0);
+    testing.expectEqual(3, row.cells.length);
+    row.deleteCell(-1);
+    testing.expectEqual(2, row.cells.length);
+
+    testing.expectError('IndexSizeError', () => row.insertCell(99));
+    testing.expectError('IndexSizeError', () => row.insertCell(-2));
+    testing.expectError('IndexSizeError', () => row.deleteCell(99));
+
+    // a rowless <table> grows a <tbody> for the new row
+    const table = document.createElement('table');
+    const r0 = table.insertRow();
+    testing.expectEqual('TBODY', r0.parentNode.tagName);
+    testing.expectEqual(1, table.tBodies.length);
+    const r1 = table.insertRow(0);
+    testing.expectEqual(true, table.tBodies[0].rows[0] === r1);
+    testing.expectEqual(2, table.tBodies[0].rows.length);
+    testing.expectError('IndexSizeError', () => table.insertRow(9));
+
+    tbody.deleteRow(-1);
+    testing.expectEqual(0, tbody.rows.length);
+    tbody.deleteRow(-1); // no-op on an empty section
+    testing.expectError('IndexSizeError', () => tbody.deleteRow(0));
+  }
+</script>
+
 <table id="tbodies">
   <thead><tr></tr></thead>
   <tbody id="b1"><tr></tr></tbody>

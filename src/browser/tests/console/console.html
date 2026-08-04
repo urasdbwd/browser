@@ -51,6 +51,31 @@
     testing.expectEqual(true, true);
 </script>
 
+<script id="static_no_this_binding">
+    // console members are static namespace operations, so a detached or
+    // rebound reference must work instead of throwing Illegal invocation.
+    // Sentry, Nuxt and every "const { log } = console" in the wild rely on it,
+    // and a brand check here is a trivial headless tell.
+    {
+        const log = console.log;
+        log("detached");
+        log.call(null, "call-null");
+        log.call(undefined, "call-undefined");
+        log.apply({}, ["apply-obj"]);
+        console.log.bind({})("bound-obj");
+
+        // stateful members reach their state through the execution scope
+        const time = console.time, timeEnd = console.timeEnd;
+        const count = console.count, countReset = console.countReset;
+        time.call(null, "detached-timer");
+        timeEnd.call(null, "detached-timer");
+        count.call(null, "detached-count");
+        countReset.call(null, "detached-count");
+
+        testing.expectEqual(true, true);
+    }
+</script>
+
 <script id="group">
     // should not crash
     console.group();

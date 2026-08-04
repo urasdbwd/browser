@@ -318,6 +318,10 @@ pub fn performance(self: *WorkerGlobalScope) *Performance {
     return &self._performance;
 }
 
+pub fn console(self: *WorkerGlobalScope) *Console {
+    return &self._console;
+}
+
 pub fn getLocation(self: *WorkerGlobalScope) *WorkerLocation {
     return &self._location;
 }
