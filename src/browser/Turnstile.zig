@@ -33,12 +33,8 @@ pub fn interact(session: *Session, aggressive: bool) void {
 fn walkFrame(frame: *Frame, aggressive: bool) void {
     if (isChallengeFrame(frame)) {
         clickChallengeFrame(frame);
-    } else {
-        // Promote any existing token into document.title for wait helpers.
-        promoteTokenTitle(frame);
-        if (aggressive) {
-            clickHostWidget(frame);
-        }
+    } else if (aggressive) {
+        clickHostWidget(frame);
     }
     for (frame.child_frames.items) |child| {
         walkFrame(child, aggressive);
@@ -112,71 +108,74 @@ fn queryOne(frame: *Frame, sel: []const u8) ?*Node.Element {
     return null;
 }
 
-fn promoteTokenTitle(frame: *Frame) void {
-    const src =
-        \\(() => {
-        \\  try {
-        \\    var i = document.querySelector('[name=cf-turnstile-response], textarea[name=cf-turnstile-response], input[name=cf-turnstile-response]');
-        \\    if (i && i.value && i.value.length > 10 && document.title.indexOf('TOKEN:') !== 0) {
-        \\      document.title = 'TOKEN:' + i.value.slice(0, 80);
-        \\    }
-        \\  } catch (e) {}
-        \\  return true;
-        \\})()
-    ;
-    var ls: js.Local.Scope = undefined;
-    frame.js.localScope(&ls);
-    defer ls.deinit();
-    _ = ls.local.exec(src, "turnstile_promote") catch {};
-}
+/// Outcome of a solve attempt.
+// ponytail: no `.failed` variant — nothing downstream can tell a widget that
+// errored from one that is merely slow, so both land in `.timeout`. Split it
+// if we ever read Turnstile's own error callback.
+pub const Result = union(enum) {
+    /// No Turnstile widget anywhere in the session.
+    no_widget,
+    /// Token acquired. Lives in the frame arena.
+    solved: []const u8,
+    /// Widget present but no token before the deadline.
+    timeout,
+};
 
-/// Wait-script body: true once a Turnstile token is present.
+/// Wait-script body: true once a Turnstile token is present. Read-only — it
+/// must not leave anything the page can observe.
 pub const token_wait_script =
     \\(() => {
     \\  try {
-    \\    if (document.title && document.title.indexOf('TOKEN:') === 0) return true;
-    \\    var i = document.querySelector('[name=cf-turnstile-response], textarea[name=cf-turnstile-response], input[name=cf-turnstile-response]');
-    \\    if (i && i.value && i.value.length > 10) {
-    \\      document.title = 'TOKEN:' + i.value.slice(0, 80);
-    \\      return true;
-    \\    }
+    \\    var i = document.querySelector('[name=cf-turnstile-response]');
+    \\    return !!(i && i.value && i.value.length > 10);
     \\  } catch (e) {}
     \\  return false;
     \\})()
 ;
 
-pub fn hasToken(session: *Session) bool {
+const token_script =
+    \\(() => {
+    \\  try {
+    \\    var i = document.querySelector('[name=cf-turnstile-response]');
+    \\    if (i && i.value) return i.value;
+    \\  } catch (e) {}
+    \\  return '';
+    \\})()
+;
+
+/// First Turnstile token in the session, or null.
+pub fn token(session: *Session) ?[]const u8 {
     for (session.pages.items) |page| {
         if (page.replacement != null) continue;
-        if (frameHasToken(&page.frame)) return true;
+        if (frameToken(&page.frame)) |t| return t;
     }
-    return false;
+    return null;
 }
 
-fn frameHasToken(frame: *Frame) bool {
-    promoteTokenTitle(frame);
-    const src =
-        \\(() => {
-        \\  if (document.title && document.title.indexOf('TOKEN:') === 0) return true;
-        \\  var i = document.querySelector('[name=cf-turnstile-response], textarea[name=cf-turnstile-response], input[name=cf-turnstile-response]');
-        \\  return !!(i && i.value && i.value.length > 10);
-        \\})()
-    ;
+pub fn hasToken(session: *Session) bool {
+    return token(session) != null;
+}
+
+fn frameToken(frame: *Frame) ?[]const u8 {
+    if (ownToken(frame)) |t| return t;
+    for (frame.child_frames.items) |child| {
+        if (frameToken(child)) |t| return t;
+    }
+    return null;
+}
+
+// The script's return value comes straight back to Zig — nothing is written to
+// the DOM, so the page cannot see that we looked.
+fn ownToken(frame: *Frame) ?[]const u8 {
     var ls: js.Local.Scope = undefined;
     frame.js.localScope(&ls);
     defer ls.deinit();
-    const v = ls.local.exec(src, "turnstile_has_token") catch {
-        // Fall through to children.
-        for (frame.child_frames.items) |child| {
-            if (frameHasToken(child)) return true;
-        }
-        return false;
-    };
-    if (v.toBool()) return true;
-    for (frame.child_frames.items) |child| {
-        if (frameHasToken(child)) return true;
-    }
-    return false;
+
+    const v = ls.local.exec(token_script, "turnstile_token") catch return null;
+    const value = v.toStringSlice() catch return null;
+    if (value.len <= 10) return null;
+    // Escape the local scope's arena; the caller outlives it.
+    return frame.arena.dupe(u8, value) catch null;
 }
 
 /// True if any frame looks like a Turnstile challenge/widget host.
@@ -238,7 +237,7 @@ pub const AutoSolve = struct {
         const self: *AutoSolve = @ptrCast(@alignCast(ctx));
         const frame = self.frame;
 
-        if (frameHasToken(frame)) {
+        if (frameToken(frame) != null) {
             log.info(.browser, "turnstile token ready", .{ .clicks = self.clicks });
             return null;
         }
@@ -250,7 +249,10 @@ pub const AutoSolve = struct {
             return self.spend(idle_poll_ms);
         }
 
-        if (self.clicks >= max_clicks) return null;
+        if (self.clicks >= max_clicks) {
+            log.info(.browser, "turnstile unsolved", .{ .clicks = self.clicks });
+            return null;
+        }
         // First clicks stay inside challenge iframes; later ones also tap the
         // host widget (same escalation as Runner.solveTurnstile).
         walkFrame(frame, self.clicks >= 3);

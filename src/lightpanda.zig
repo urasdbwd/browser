@@ -249,7 +249,9 @@ pub fn fetch(app: *App, browser: *Browser, urls: []const [:0]const u8, opts: Fet
     // solveTurnstile returns early once an ordinary page is idle with no
     // widget, so enabling this does not consume the full wait budget there.
     if (opts.solve_captchas or app.config.solveCaptchas()) {
-        try runner.solveTurnstile(opts.wait_ms);
+        // Outcome is logged by solveTurnstile; a challenge we could not solve
+        // is not fatal here — the caller still gets whatever the page rendered.
+        _ = try runner.solveTurnstile(opts.wait_ms);
     }
 
     if (opts.wait_until) |wu| {

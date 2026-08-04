@@ -1761,7 +1761,7 @@ fn execSolveCaptchas(arena: std.mem.Allocator, session: *lp.Session, arguments: 
     _ = try requireFrame(session);
 
     var r = session.runner(.{});
-    r.solveTurnstile(args.timeout orelse Turnstile.AutoSolve.default_timeout_ms) catch |err| switch (err) {
+    const result = r.solveTurnstile(args.timeout orelse Turnstile.AutoSolve.default_timeout_ms) catch |err| switch (err) {
         error.Cancelled => return ToolError.Cancelled,
         else => {
             log.debug(.browser, "solveCaptchas error", .{ .err = @errorName(err) });
@@ -1769,10 +1769,11 @@ fn execSolveCaptchas(arena: std.mem.Allocator, session: *lp.Session, arguments: 
         },
     };
 
-    return if (Turnstile.hasToken(session))
-        "Captcha solved: token acquired."
-    else
-        "No captcha token. The page may have no challenge, or it needs a visual puzzle this browser cannot solve.";
+    return switch (result) {
+        .solved => "Captcha solved: token acquired.",
+        .no_widget => "No captcha on this page: nothing to solve.",
+        .timeout => "Captcha not solved before the timeout. The widget may need a visual puzzle this browser cannot solve, or a longer timeout.",
+    };
 }
 
 fn execHover(arena: std.mem.Allocator, session: *lp.Session, registry: *CDPNode.Registry, arguments: ?std.json.Value) ToolError![]const u8 {

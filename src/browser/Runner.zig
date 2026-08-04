@@ -463,7 +463,7 @@ fn firstConditionError(conditions: []const WaitCondition) !void {
 /// Blocking — for the one-shot `fetch`/`render` paths that must hold the token
 /// before dumping. Long-lived paths (CDP, MCP, agent) use `Turnstile.AutoSolve`
 /// instead, which never parks the event loop.
-pub fn solveTurnstile(self: *Runner, timeout_ms: u32) !void {
+pub fn solveTurnstile(self: *Runner, timeout_ms: u32) !Turnstile.Result {
     const session = self.session;
     const timer: std.Io.Timestamp = .now(lp.io, .boot);
     var last_click_ms: u32 = 0;
@@ -481,13 +481,14 @@ pub fn solveTurnstile(self: *Runner, timeout_ms: u32) !void {
 
         const elapsed: u32 = @intCast(timer.untilNow(lp.io, .boot).toMilliseconds());
         if (elapsed >= timeout_ms) {
-            return;
+            if (widget_seen == false) return .no_widget;
+            log.info(.browser, "turnstile unsolved", .{ .elapsed_ms = elapsed, .clicks = click_count });
+            return .timeout;
         }
 
-        // Always promote any existing response into title / detect token.
-        if (Turnstile.hasToken(session)) {
+        if (Turnstile.token(session)) |tok| {
             log.info(.browser, "turnstile token ready", .{ .elapsed_ms = elapsed });
-            return;
+            return .{ .solved = tok };
         }
 
         const has_widget = Turnstile.hasWidget(session);
@@ -518,7 +519,7 @@ pub fn solveTurnstile(self: *Runner, timeout_ms: u32) !void {
             switch (try self.tickForFrame(p.frame._frame_id, @min(remaining, 250), .{ .until = .done })) {
                 .done => {
                     if (!widget_seen) {
-                        return;
+                        return .no_widget;
                     }
                     lp.io.sleep(.fromMilliseconds(@intCast(@min(remaining, 100))), .awake) catch {};
                 },
@@ -638,7 +639,7 @@ test "Runner: lazy iframe does not delay the load event" {
     try testing.expectEqual(true, lazy_child._parent_notified);
 }
 
-test "Runner: solveTurnstile finds widget and detects token" {
+test "Runner: solveTurnstile reports the solved token" {
     const page = try testing.pageTest("turnstile/widget.html", .{});
     defer page.close();
 
@@ -646,19 +647,39 @@ test "Runner: solveTurnstile finds widget and detects token" {
     try testing.expectEqual(false, Turnstile.hasToken(page.session));
 
     var runner = page.session.runner(.{});
-    try runner.solveTurnstile(3000);
+    const result = try runner.solveTurnstile(3000);
 
-    try testing.expectEqual(true, Turnstile.hasToken(page.session));
+    // The exact token the challenge iframe wrote — not just "some token".
+    try testing.expectString("FAKE-TURNSTILE-TOKEN-0123456789", result.solved);
+
+    // Nothing the page can see was touched on the way (no title smuggling).
+    try runner.waitForScript(page.frame_id, "document.title === 'turnstile fixture'", 10);
 }
 
-test "Runner: solveTurnstile returns promptly with no widget" {
+test "Runner: solveTurnstile times out on a widget that never resolves" {
+    const page = try testing.pageTest("turnstile/stuck.html", .{});
+    defer page.close();
+
+    try testing.expectEqual(true, Turnstile.hasWidget(page.session));
+
+    var runner = page.session.runner(.{});
+    const started: std.Io.Timestamp = .now(lp.io, .boot);
+    try testing.expectString("timeout", @tagName(try runner.solveTurnstile(1_500)));
+    const elapsed = started.untilNow(lp.io, .boot).toMilliseconds();
+
+    // Bounded: it must give up near the budget, not hang or return instantly.
+    try testing.expectEqual(true, elapsed >= 1_500 and elapsed < 6_000);
+    try testing.expectEqual(false, Turnstile.hasToken(page.session));
+}
+
+test "Runner: solveTurnstile returns no_widget promptly" {
     const page = try testing.pageTest("runner/runner1.html", .{});
     defer page.close();
 
     var runner = page.session.runner(.{});
     const started: std.Io.Timestamp = .now(lp.io, .boot);
     // A 30s budget must not be spent on a page that has no challenge.
-    try runner.solveTurnstile(30_000);
+    try testing.expectString("no_widget", @tagName(try runner.solveTurnstile(30_000)));
     const elapsed = started.untilNow(lp.io, .boot).toMilliseconds();
 
     try testing.expectEqual(false, Turnstile.hasWidget(page.session));
