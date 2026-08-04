@@ -672,6 +672,21 @@ test "Runner: solveTurnstile times out on a widget that never resolves" {
     try testing.expectEqual(false, Turnstile.hasToken(page.session));
 }
 
+test "Runner: solveTurnstile does not report a challenge frame's own token" {
+    const page = try testing.pageTest("turnstile/frame_only.html", .{});
+    defer page.close();
+
+    try testing.expectEqual(true, Turnstile.hasWidget(page.session));
+
+    // The challenge frame holds a response value from the first tick, but the
+    // host document has no cf-turnstile-response input — there is nothing a
+    // real site could submit, so this is a timeout, not a solve.
+    try testing.expectEqual(false, Turnstile.hasToken(page.session));
+
+    var runner = page.session.runner(.{});
+    try testing.expectString("timeout", @tagName(try runner.solveTurnstile(1_500)));
+}
+
 test "Runner: solveTurnstile returns no_widget promptly" {
     const page = try testing.pageTest("runner/runner1.html", .{});
     defer page.close();

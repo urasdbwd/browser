@@ -1,0 +1,7 @@
+<!DOCTYPE html>
+<!-- Turnstile-shaped page whose challenge frame holds a response value it never
+     hands to the host document — the host has no cf-turnstile-response input at
+     all. A real site would submit nothing, so this must NOT report .solved. -->
+<title>turnstile frame-only fixture</title>
+<div class="cf-turnstile" data-sitekey="0x0000000000000000000000"></div>
+<iframe id="cf" src="frame_only.challenges.cloudflare.com.html" width="300" height="65"></iframe>
