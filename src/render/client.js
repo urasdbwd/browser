@@ -333,6 +333,83 @@ function snapshotDocuments(root) {
   return documents;
 }
 
+// Lightpanda has no rasterizer, so a <canvas> can never arrive as pixels. The
+// server records the 2D op stream instead and we replay it here, onto the real
+// canvas in the viewer's browser. Ops are cumulative: each snapshot carries only
+// what was drawn since the last one, so an animation costs a constant number of
+// bytes per frame.
+const CANVAS_OPS_ATTR = "data-lp-canvas";
+
+const CANVAS_OP_METHODS = {
+  sv: "save", rs: "restore",
+  sc: "scale", ro: "rotate", tr: "translate",
+  tf: "transform", st: "setTransform", rt: "resetTransform",
+  cr: "clearRect", fr: "fillRect", sr: "strokeRect",
+  bp: "beginPath", cp: "closePath", mv: "moveTo", ln: "lineTo",
+  qc: "quadraticCurveTo", bc: "bezierCurveTo", ar: "arc", at: "arcTo", re: "rect",
+  fl: "fill", sk: "stroke", cl: "clip",
+  ft: "fillText", sx: "strokeText",
+};
+
+const CANVAS_OP_PROPERTIES = {
+  FS: "fillStyle", SS: "strokeStyle", LW: "lineWidth", GA: "globalAlpha", FO: "font",
+};
+
+// A leading "!" means the server's bounded log overflowed and dropped ops, so
+// the replay is knowingly incomplete.
+export function parseCanvasOps(value) {
+  const truncated = value.startsWith("!");
+  const body = truncated ? value.slice(1) : value;
+  if (body.trim() === "") return { truncated, ops: [] };
+  const ops = JSON.parse(`[${body}]`);
+  if (!Array.isArray(ops)) throw new TypeError("Lightpanda canvas ops are not an array");
+  return { truncated, ops };
+}
+
+export function applyCanvasOps(ctx, ops, imageFor) {
+  for (const op of ops) {
+    if (!Array.isArray(op) || op.length === 0) continue;
+    const [name, ...args] = op;
+    try {
+      if (name === "z") {
+        // Full-canvas clear: the server collapsed its log here, so the client
+        // must start from an empty canvas to stay in step.
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+        ctx.beginPath();
+        continue;
+      }
+      if (name === "di") {
+        const [src, ...rest] = args;
+        if (typeof src !== "string" || typeof imageFor !== "function") continue;
+        const image = imageFor(src);
+        if (!image) continue;
+        if (image.complete && image.naturalWidth > 0) {
+          ctx.drawImage(image, ...rest);
+        } else {
+          // First paint of a sprite races its download. Redrawing on load keeps
+          // the pixel there; later frames hit the cache and draw synchronously.
+          image.addEventListener("load", () => {
+            try {
+              ctx.drawImage(image, ...rest);
+            } catch {}
+          }, { once: true });
+        }
+        continue;
+      }
+      const property = CANVAS_OP_PROPERTIES[name];
+      if (property) {
+        ctx[property] = args[0];
+        continue;
+      }
+      const method = CANVAS_OP_METHODS[name];
+      if (method) ctx[method](...args);
+    } catch {
+      // One bad op must not abandon the rest of the frame.
+    }
+  }
+}
+
 function sameSnapshotElement(current, fresh, currentKeys, keyMarker) {
   if (current?.nodeType !== 1 || fresh?.nodeType !== 1) return false;
   if (current.namespaceURI !== fresh.namespaceURI ||
@@ -558,6 +635,7 @@ export class LightpandaVirtualBrowser extends EventTarget {
   #continuityTargets = new Map();
   #authoritativeValues = new Map();
   #animationSignatures = new Map();
+  #canvasImages = new Map();
   #url = null;
   #title = "";
   #canGoBack = false;
@@ -1241,6 +1319,45 @@ export class LightpandaVirtualBrowser extends EventTarget {
     for (const key of this.#animationSignatures.keys()) {
       if (!continuityTargets.has(key)) this.#animationSignatures.delete(key);
     }
+    this.#replayCanvasOps(documents);
+  }
+
+  // ponytail: a canvas only replays the ops recorded since the previous
+  // snapshot, so if a whole-document swap replaces the element the strokes drawn
+  // before the swap are lost. The next full-canvas clear resynchronises, which
+  // for anything animating is the very next frame. Upgrade path if a static
+  // canvas ever shows the seam: have the client ack applied snapshots and let
+  // the server resend the whole log when an ack is missed.
+  #replayCanvasOps(documents) {
+    for (const doc of documents) {
+      for (const canvas of doc.querySelectorAll(`canvas[${CANVAS_OPS_ATTR}]`)) {
+        const value = canvas.getAttribute(CANVAS_OPS_ATTR);
+        canvas.removeAttribute(CANVAS_OPS_ATTR);
+        let parsed;
+        try {
+          parsed = parseCanvasOps(value ?? "");
+        } catch {
+          continue;
+        }
+        if (parsed.ops.length === 0) continue;
+        const ctx = canvas.getContext?.("2d");
+        if (!ctx) continue;
+        applyCanvasOps(ctx, parsed.ops, (src) => this.#canvasImage(src));
+      }
+    }
+  }
+
+  // Sprites are named by URL and fetched by the viewer's browser straight from
+  // origin, so the bitmap never crosses the Lightpanda wire.
+  #canvasImage(src) {
+    let image = this.#canvasImages.get(src);
+    if (!image) {
+      image = new Image();
+      image.decoding = "async";
+      image.src = src;
+      this.#canvasImages.set(src, image);
+    }
+    return image;
   }
 
   #installNavigationBlocker(doc) {
@@ -1486,26 +1603,48 @@ export class LightpandaVirtualBrowser extends EventTarget {
       ? {}
       : { target: this.#wireTarget(this.#targetForKey(key)) });
 
+    const mousePayload = (event, extra) => ({
+      x: Math.round(event.clientX),
+      y: Math.round(event.clientY),
+      button: event.button ?? 0,
+      buttons: event.buttons ?? 0,
+      detail: event.detail ?? 0,
+      alt_key: event.altKey,
+      ctrl_key: event.ctrlKey,
+      meta_key: event.metaKey,
+      shift_key: event.shiftKey,
+      ...extra,
+    });
+
     const sendMouse = (type, key, event, extra = {}) => {
       if (key == null) return;
-      const shared = {
-        x: Math.round(event.clientX),
-        y: Math.round(event.clientY),
-        button: event.button ?? 0,
-        buttons: event.buttons ?? 0,
-        detail: event.detail ?? 0,
-        alt_key: event.altKey,
-        ctrl_key: event.ctrlKey,
-        meta_key: event.metaKey,
-        shift_key: event.shiftKey,
-        ...extra,
-      };
+      const shared = mousePayload(event, extra);
       this.#wakePolling();
       return this.#enqueueCoalesced(
         type === "mousemove" ? "mousemove" : `${type}:${key}`,
         type,
         () => ({ ...wireTargetFor(key), ...shared }),
       ).catch(() => {});
+    };
+
+    // Button transitions must never coalesce. Dropping one half of a down/up
+    // pair leaves the far side with a stuck button, and press-and-hold, drag,
+    // drag-and-drop and sliders are all defined by the exact sequence arriving
+    // in order.
+    const sendMouseOrdered = (type, key, event, extra = {}) => {
+      if (key == null) return;
+      const shared = mousePayload(event, extra);
+      this.#wakePolling();
+      return this.#enqueue(type, () => ({ ...wireTargetFor(key), ...shared })).catch(() => {});
+    };
+
+    const captureMouseDown = (event) => {
+      sendMouseOrdered("mousedown", targetKeyFor(event.target), event);
+    };
+    // The press may start on one element and finish on another (a drag off a
+    // slider thumb), so the release is addressed to wherever it actually landed.
+    const captureMouseUp = (event) => {
+      sendMouseOrdered("mouseup", targetKeyFor(event.target), event);
     };
 
     let lastMoveAt = 0;
@@ -1668,6 +1807,8 @@ export class LightpandaVirtualBrowser extends EventTarget {
       this.#listen(current, "animationend", captureAnimationEnd, true);
       this.#listen(current, "keydown", captureKeydown, true);
       this.#listen(current, "keyup", captureKeyup, true);
+      this.#listen(current, "mousedown", captureMouseDown, true);
+      this.#listen(current, "mouseup", captureMouseUp, true);
       this.#listen(current, "mousemove", capturePointerMove, true);
       this.#listen(current, "contextmenu", captureContextMenu, true);
       this.#listen(current, "dblclick", captureDoubleClick, true);

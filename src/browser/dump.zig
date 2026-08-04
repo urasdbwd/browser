@@ -24,6 +24,7 @@ const Element = @import("webapi/Element.zig");
 const Slot = @import("webapi/element/html/Slot.zig");
 const IFrame = @import("webapi/element/html/IFrame.zig");
 const Link = @import("webapi/element/html/Link.zig");
+const Canvas = @import("webapi/element/html/Canvas.zig");
 
 const Input = Element.Html.Input;
 const Option = Element.Html.Option;
@@ -37,6 +38,7 @@ const LIVE_SELECTED_NONE_ATTR = "data-lightpanda-live-selected-none";
 const LIVE_FRAME_ATTR = "data-lightpanda-live-frame";
 const LIVE_TARGET_ATTR_PREFIX = "data-lp-t-";
 const LIVE_TARGET_KEY_ATTR_PREFIX = "data-lp-k-";
+pub const LIVE_CANVAS_ATTR = "data-lp-canvas";
 // CSP3 has no generic anchor-navigation directive. Render clients must also
 // sandbox the snapshot frame and cancel captured link navigation.
 const RENDER_CSP_META =
@@ -489,6 +491,9 @@ fn writeSnapshotStartTag(
         try writer.writeAll(&key_hex);
         try writer.writeByte('"');
     }
+    if (opts.live_targets != null) {
+        if (el.is(Canvas)) |canvas| try writeCanvasOps(canvas, writer);
+    }
     if (child_frame) |child| {
         try writer.writeByte(' ');
         try writer.writeAll(LIVE_FRAME_ATTR);
@@ -498,6 +503,24 @@ fn writeSnapshotStartTag(
         try writer.writeByte('"');
     }
     try writer.writeByte('>');
+}
+
+/// Canvas pixels never leave the server — Lightpanda has no rasterizer. The 2D
+/// op log rides along on the element instead and the client replays it onto a
+/// real canvas. Only ops recorded since the previous snapshot are emitted, so a
+/// long-running animation costs a constant number of bytes per frame rather than
+/// resending its whole history. A leading '!' marks a log that overflowed and is
+/// therefore missing ops.
+fn writeCanvasOps(canvas: *Canvas, writer: *std.Io.Writer) !void {
+    const ctx = canvas.context2d() orelse return;
+    const ops = ctx.pendingOps();
+    if (ops.len == 0) return;
+
+    try writer.writeAll(" " ++ LIVE_CANVAS_ATTR ++ "=\"");
+    if (ctx.opsDropped()) try writer.writeByte('!');
+    try writeEscapedAttributeValue(ops, writer);
+    try writer.writeByte('"');
+    ctx.markOpsSent();
 }
 
 const EscapedAttributeWriter = struct {

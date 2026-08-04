@@ -450,3 +450,175 @@ test("keydown and keyup are forwarded separately with full key state", async () 
     globalThis.fetch = original.fetch;
   }
 });
+
+test("canvas ops replay onto the viewer's real 2D context", async () => {
+  const { parseCanvasOps, applyCanvasOps } = await loadRenderer();
+
+  // The server ships JSON array elements without the enclosing brackets so it
+  // can splice them straight into an attribute.
+  const parsed = parseCanvasOps('["FS","#ff0000"],["fr",1,2,3,4],["ft","hi",5,6]');
+  assert.equal(parsed.truncated, false);
+  assert.equal(parsed.ops.length, 3);
+
+  const calls = [];
+  const ctx = {
+    canvas: { width: 300, height: 150 },
+    set fillStyle(value) { calls.push(["fillStyle", value]); },
+    fillRect: (...args) => calls.push(["fillRect", ...args]),
+    fillText: (...args) => calls.push(["fillText", ...args]),
+    setTransform: (...args) => calls.push(["setTransform", ...args]),
+    clearRect: (...args) => calls.push(["clearRect", ...args]),
+    beginPath: () => calls.push(["beginPath"]),
+    drawImage: (image, ...args) => calls.push(["drawImage", image.src, ...args]),
+  };
+
+  applyCanvasOps(ctx, parsed.ops, () => null);
+  assert.deepEqual(calls, [
+    ["fillStyle", "#ff0000"],
+    ["fillRect", 1, 2, 3, 4],
+    ["fillText", "hi", 5, 6],
+  ]);
+
+  // "z" is the server collapsing its log after a full-canvas clear; the client
+  // has to wipe its canvas too or the two sides drift apart.
+  calls.length = 0;
+  applyCanvasOps(ctx, parseCanvasOps('["z"],["fr",0,0,1,1]').ops, () => null);
+  assert.deepEqual(calls, [
+    ["setTransform", 1, 0, 0, 1, 0, 0],
+    ["clearRect", 0, 0, 300, 150],
+    ["beginPath"],
+    ["fillRect", 0, 0, 1, 1],
+  ]);
+
+  // A leading "!" flags a log that overflowed its cap server-side.
+  const truncated = parseCanvasOps('!["sk"]');
+  assert.equal(truncated.truncated, true);
+  assert.deepEqual(truncated.ops, [["sk"]]);
+
+  // Sprites are named by URL and drawn from the viewer's own cache, so the
+  // bitmap never crosses the wire.
+  calls.length = 0;
+  const image = { complete: true, naturalWidth: 8, src: "https://cdn.test/s.png" };
+  applyCanvasOps(ctx, parseCanvasOps('["di","https://cdn.test/s.png",4,5]').ops, () => image);
+  assert.deepEqual(calls, [["drawImage", "https://cdn.test/s.png", 4, 5]]);
+
+  // An image that has not finished downloading is drawn once it lands, rather
+  // than dropped.
+  calls.length = 0;
+  let onLoad = null;
+  const pending = {
+    complete: false,
+    naturalWidth: 0,
+    src: "https://cdn.test/late.png",
+    addEventListener: (type, listener) => { if (type === "load") onLoad = listener; },
+  };
+  applyCanvasOps(ctx, parseCanvasOps('["di","https://cdn.test/late.png",1,2]').ops, () => pending);
+  assert.deepEqual(calls, []);
+  onLoad();
+  assert.deepEqual(calls, [["drawImage", "https://cdn.test/late.png", 1, 2]]);
+
+  // One unknown or malformed op must not abandon the rest of the frame.
+  calls.length = 0;
+  applyCanvasOps(ctx, parseCanvasOps('["nope"],"junk",["fr",9,9,9,9]').ops, () => null);
+  assert.deepEqual(calls, [["fillRect", 9, 9, 9, 9]]);
+});
+
+test("mousedown and mouseup are forwarded without coalescing", async () => {
+  const original = {
+    CustomEvent: globalThis.CustomEvent,
+    Element: globalThis.Element,
+    WebSocket: globalThis.WebSocket,
+    document: globalThis.document,
+    fetch: globalThis.fetch,
+  };
+  FakeWebSocket.instances = [];
+  globalThis.CustomEvent ??= class CustomEvent extends Event {
+    constructor(type, options = {}) {
+      super(type);
+      this.detail = options.detail;
+    }
+  };
+  globalThis.Element = FakeElement;
+  globalThis.WebSocket = FakeWebSocket;
+  globalThis.document = {
+    baseURI: "https://client.test/",
+    createElement: () => new FakeIframe(),
+    querySelector: () => null,
+  };
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ ticket: "t" }) });
+
+  const sent = [];
+  FakeWebSocket.onSend = (socket, command) => {
+    sent.push(command);
+    if (command.type === "open") return successfulSnapshot(socket, command, "Mouse");
+    queueMicrotask(() => socket.message(JSON.stringify({
+      id: command.id,
+      ok: true,
+      snapshot: false,
+      closed: false,
+      can_go_back: false,
+      can_go_forward: false,
+      target_version: null,
+      snapshot_encoding: null,
+      snapshot_bytes: 0,
+    })));
+  };
+
+  let browser = null;
+  try {
+    const { LightpandaVirtualBrowser } = await loadRenderer();
+    browser = new LightpandaVirtualBrowser(new FakeElement(), {
+      endpoint: "wss://renderer.test/v1/live",
+      pollInterval: 60_000,
+    });
+    await browser.open("https://example.com/");
+
+    const doc = browser.iframe.contentDocument;
+    const mouseEvent = (overrides) => ({
+      target: doc.target(),
+      clientX: 12,
+      clientY: 34,
+      button: 0,
+      buttons: 1,
+      detail: 1,
+      altKey: false,
+      ctrlKey: false,
+      metaKey: false,
+      shiftKey: false,
+      preventDefault: () => {},
+      ...overrides,
+    });
+
+    // Without these the far side never sees a press at all: no press-and-hold,
+    // no drag, no slider.
+    doc.dispatch("mousedown", mouseEvent({}));
+    doc.dispatch("mouseup", mouseEvent({ buttons: 0 }));
+    await waitFor(() => sent.some((command) => command.type === "mouseup"));
+
+    const down = sent.find((command) => command.type === "mousedown");
+    const up = sent.find((command) => command.type === "mouseup");
+    assert.equal(down.x, 12);
+    assert.equal(down.y, 34);
+    assert.equal(down.buttons, 1);
+    assert.equal(down.button, 0);
+    assert.deepEqual(down.target, { version: "0000000000000001", id: 1 });
+    assert.equal(up.buttons, 0);
+
+    // A burst must not collapse: dropping half a pair leaves a stuck button.
+    const before = sent.filter((command) => command.type === "mousedown").length;
+    for (let i = 0; i < 5; i++) {
+      doc.dispatch("mousedown", mouseEvent({}));
+      doc.dispatch("mouseup", mouseEvent({ buttons: 0 }));
+    }
+    await waitFor(() => sent.filter((command) => command.type === "mouseup").length === 6);
+    assert.equal(sent.filter((command) => command.type === "mousedown").length, before + 5);
+  } finally {
+    browser?.destroy();
+    FakeWebSocket.onSend = null;
+    globalThis.CustomEvent = original.CustomEvent;
+    globalThis.Element = original.Element;
+    globalThis.WebSocket = original.WebSocket;
+    globalThis.document = original.document;
+    globalThis.fetch = original.fetch;
+  }
+});
