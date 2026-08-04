@@ -50,12 +50,25 @@ pub const ResourceProfile = enum {
     pi,
 };
 
-/// A session owns a V8 isolate, its arena and a live DOM: roughly 22 MiB before
-/// the page does anything. Deriving the *default* concurrency cap from physical
-/// memory makes a small board refuse the session up front rather than OOM
-/// half-way through one. An explicit --cdp-max-connections / --max-connections
-/// / --max-sessions bypasses this entirely.
-const session_memory_floor = 22 * 1024 * 1024;
+/// Marginal RSS a concurrent `serve` session adds to the process. Deriving the
+/// *default* concurrency cap from physical memory makes a small board refuse
+/// the session up front rather than OOM half-way through one. An explicit
+/// --cdp-max-connections / --max-connections / --max-sessions bypasses this
+/// entirely.
+///
+/// Measured with `bench/sessions.sh` (least-squares slope over N = 1,2,4,8,16
+/// simultaneous CDP sessions in one process, each holding a 12k-node DOM), pi
+/// profile: 6.3 MiB/session, on a 23.8 MiB fixed intercept. The split by stage
+/// is 1.3 MiB for the isolate itself, +0.5 for an attached about:blank page,
+/// +4.5 for the DOM — V8 costs little per session because all isolates in the
+/// process share one IsolateGroup (read-only heap, pointer-compression cage
+/// and code range), so only the DOM scales.
+///
+/// The old 22 MiB here was the *whole-process* floor of a single `fetch`
+/// (bench/run.sh), which charges every session for fixed overhead that
+/// `reserved_system_memory` already holds back. 12 MiB keeps a ~2x margin over
+/// the measurement for pages heavier than the fixture.
+const session_memory_floor = 12 * 1024 * 1024;
 
 /// Held back for the OS, the shared snapshot mapping and everything that is not
 /// a session.
