@@ -107,6 +107,16 @@ pub fn getContext(self: *Canvas, context_type: []const u8, frame: *Frame) !?Draw
     return drawing_context;
 }
 
+/// The bound 2D context, if the page ever asked for one. Used by the snapshot
+/// writer to pick up the replay op log.
+pub fn context2d(self: *Canvas) ?*CanvasRenderingContext2D {
+    const cached = self._cached orelse return null;
+    return switch (cached) {
+        .@"2d" => |ctx| ctx,
+        .webgl => null,
+    };
+}
+
 /// Transfers control of the canvas to an OffscreenCanvas.
 /// Returns an OffscreenCanvas with the same dimensions.
 pub fn transferControlToOffscreen(self: *Canvas, exec: *Execution) !*OffscreenCanvas {
