@@ -54,6 +54,7 @@ const DOMNodeIterator = @import("webapi/DOMNodeIterator.zig");
 const Worker = @import("webapi/Worker.zig");
 const MessagePort = @import("webapi/MessagePort.zig");
 const CSSStyleSheet = @import("webapi/css/CSSStyleSheet.zig");
+const MediaQueryList = @import("webapi/css/MediaQueryList.zig");
 const CustomElementDefinition = @import("webapi/CustomElementDefinition.zig");
 const PageTransitionEvent = @import("webapi/event/PageTransitionEvent.zig");
 const SubmitEvent = @import("webapi/event/SubmitEvent.zig");
@@ -224,6 +225,10 @@ _broadcast_channels: std.DoublyLinkedList = .{},
 
 // List of MessagePorts living in this frame's context.
 _message_ports: std.DoublyLinkedList = .{},
+
+// Every matchMedia() result still reachable from script. Re-evaluated when the
+// viewport changes so `change` can fire. Frame-lifetime, like the lists above.
+_media_query_lists: std.ArrayList(*MediaQueryList) = .empty,
 
 // See frame/observers.zig.
 _resize: observers.Resize = .{},

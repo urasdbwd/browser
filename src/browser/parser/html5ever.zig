@@ -16,6 +16,8 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+const std = @import("std");
+
 const ParsedNode = @import("Parser.zig").ParsedNode;
 
 pub extern "c" fn html5ever_parse_document(
@@ -291,6 +293,34 @@ pub extern "c" fn encoding_decoder_decode(
 ) DecodeResult;
 
 pub extern "c" fn encoding_decoder_free(decoder: *anyopaque) void;
+
+/// One-shot WHATWG decode of `input` into UTF-8, using the encoding named by
+/// `label`. An unknown label, or one that already names UTF-8, returns `input`
+/// unchanged rather than copying it — the overwhelmingly common case.
+pub fn decodeToUtf8(allocator: std.mem.Allocator, label: []const u8, input: []const u8) ![]const u8 {
+    if (input.len == 0) {
+        return input;
+    }
+
+    const info = encoding_for_label(label.ptr, label.len);
+    if (!info.isValid()) {
+        return input;
+    }
+    const name = info.name();
+    if (std.mem.eql(u8, name, "UTF-8") or std.mem.eql(u8, name, "replacement")) {
+        return input;
+    }
+
+    const handle = info.handle.?;
+    const max_out = encoding_max_utf8_buffer_length(handle, input.len);
+    if (max_out == 0) {
+        return input;
+    }
+
+    const output = try allocator.alloc(u8, max_out);
+    const result = encoding_decode(handle, input.ptr, input.len, output.ptr, output.len, 1);
+    return output[0..result.bytes_written];
+}
 
 // Encoding API (UTF-8 to legacy encoding with NCR fallback)
 pub const EncodeResult = extern struct {

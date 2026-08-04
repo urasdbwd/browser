@@ -796,6 +796,26 @@ fn testHTTPHandler(req: *std.http.Server.Request) !void {
         });
     }
 
+    // "Café €5" in windows-1252: 0xE9 is é and 0x80 is the euro sign. Both
+    // are invalid UTF-8, so the bytes have to go through the charset decoder.
+    const latin1_body = "Caf\xe9 \x805";
+
+    if (std.mem.eql(u8, path, "/charset/windows-1252")) {
+        return req.respond(latin1_body, .{
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/plain; charset=windows-1252" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/charset/none")) {
+        return req.respond("Caf\xc3\xa9", .{
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/plain" },
+            },
+        });
+    }
+
     if (std.mem.eql(u8, path, "/xhr/binary")) {
         return req.respond(&.{ 0, 0, 1, 2, 0, 0, 9 }, .{
             .extra_headers = &.{

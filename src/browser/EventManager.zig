@@ -86,6 +86,7 @@ pub fn dispatch(self: *EventManager, target: *EventTarget, event: *Event) Dispat
         .node => |node| try self.dispatchNode(node, event),
         .xhr => |xhr| try self.dispatchDirect(target, event, xhr.inlineHandler(event._type_string), .{ .context = "dispatch" }),
         .window => |w| try self.dispatchDirect(target, event, windowInlineHandler(w, event._type_string), .{ .context = "dispatch" }),
+        .media_query_list => |mql| try self.dispatchDirect(target, event, if (event._type_string.eql(comptime .wrap("change"))) mql._on_change else null, .{ .context = "dispatch" }),
         else => try self.dispatchDirect(target, event, null, .{ .context = "dispatch" }),
     }
 }

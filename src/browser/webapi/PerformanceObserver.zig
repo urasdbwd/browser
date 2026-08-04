@@ -73,7 +73,6 @@ const ObserveOptions = struct {
     type: ?[]const u8 = null,
 };
 
-/// TODO: Support `buffered` option.
 pub fn observe(self: *PerformanceObserver, maybe_options: ?ObserveOptions, exec: *const Execution) !void {
     const options: ObserveOptions = maybe_options orelse .{};
     // Update threshold.

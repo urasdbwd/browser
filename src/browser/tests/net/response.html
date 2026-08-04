@@ -203,6 +203,78 @@
   });
 </script>
 
+<script id=clone_stream type=module>
+{
+  // clone() tees a stream body: both halves must see every chunk.
+  const state = await testing.async();
+  const got = {};
+
+  (async () => {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('one '));
+        controller.enqueue(encoder.encode('two'));
+        controller.close();
+      }
+    });
+
+    const original = new Response(stream);
+    const copy = original.clone();
+
+    const read = async (response) => {
+      const decoder = new TextDecoder();
+      let out = '';
+      for await (const chunk of response.body) {
+        out += decoder.decode(chunk);
+      }
+      return out;
+    };
+
+    got.original = await read(original);
+    got.copy = await read(copy);
+    state.resolve();
+  })();
+
+  await state.done(() => {
+    testing.expectEqual('one two', got.original);
+    testing.expectEqual('one two', got.copy);
+  });
+}
+</script>
+
+<script id=clone_used_body>
+{
+  // A body that has already been read cannot be cloned.
+  const response = new Response('body');
+  response.text();
+  let threw = false;
+  try { response.clone(); } catch (e) { threw = e instanceof TypeError; }
+  testing.expectTrue(threw);
+}
+</script>
+
+<script id=text_charset type=module>
+{
+  // The Content-Type charset decides how the bytes become a string; without
+  // the conversion the windows-1252 bytes come back as replacement chars.
+  const state = await testing.async();
+  const got = {};
+
+  (async () => {
+    got.latin1 = await (await fetch('http://127.0.0.1:9582/charset/windows-1252')).text();
+    // No charset parameter: the document's encoding (UTF-8 here) is used.
+    got.utf8 = await (await fetch('http://127.0.0.1:9582/charset/none')).text();
+    state.resolve();
+  })();
+
+  await state.done(() => {
+    testing.expectEqual('Café €5', got.latin1);
+    testing.expectEqual('Café', got.utf8);
+  });
+}
+</script>
+
 <script id=body_types type=module>
   const state = await testing.async();
 

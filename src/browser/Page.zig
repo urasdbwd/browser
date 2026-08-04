@@ -28,6 +28,7 @@ const Viewport = @import("Viewport.zig");
 
 const Blob = @import("webapi/Blob.zig");
 const SharedWorkerGlobalScope = @import("webapi/SharedWorkerGlobalScope.zig");
+const MediaQueryList = @import("webapi/css/MediaQueryList.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -426,6 +427,22 @@ pub fn findFrameByLoaderId(self: *Page, loader_id: u32) ?*Frame {
         return found;
     }
     return self.findPopupBy("_loader_id", loader_id);
+}
+
+// Re-evaluates the media queries of every frame in this page. Called once the
+// viewport changed; see Browser.deliverViewportChange.
+pub fn deliverMediaQueryChanges(self: *Page) void {
+    deliverFrameMediaQueryChanges(&self.frame);
+    for (self.popups.items) |popup| {
+        deliverFrameMediaQueryChanges(popup);
+    }
+}
+
+fn deliverFrameMediaQueryChanges(frame: *Frame) void {
+    MediaQueryList.deliverChanges(frame);
+    for (frame.child_frames.items) |child| {
+        deliverFrameMediaQueryChanges(child);
+    }
 }
 
 fn findFrameBy(frame: *Frame, comptime field: []const u8, id: u32) ?*Frame {

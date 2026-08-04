@@ -20,6 +20,7 @@ const std = @import("std");
 const js = @import("../../js/js.zig");
 
 const Blob = @import("../Blob.zig");
+const ImageBitmap = @import("ImageBitmap.zig");
 const OffscreenCanvasRenderingContext2D = @import("OffscreenCanvasRenderingContext2D.zig");
 
 const Execution = js.Execution;
@@ -77,10 +78,10 @@ pub fn convertToBlob(_: *OffscreenCanvas, exec: *Execution) !js.Promise {
     return exec.js.local.?.resolvePromise(blob);
 }
 
-/// Returns an ImageBitmap with the rendered content (stub).
-pub fn transferToImageBitmap(_: *OffscreenCanvas) ?void {
-    // ImageBitmap not implemented yet, return null
-    return null;
+/// Returns an ImageBitmap sized like the canvas. There are no pixels to carry
+/// over, but consumers throw on a null return.
+pub fn transferToImageBitmap(self: *OffscreenCanvas, exec: *Execution) !*ImageBitmap {
+    return ImageBitmap.init(self._width, self._height, exec);
 }
 
 pub const JsApi = struct {

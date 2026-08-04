@@ -97,6 +97,7 @@ pub const Type = union(enum) {
     idb_version_change_event: *@import("storage/idb/IDBVersionChangeEvent.zig"),
     toggle_event: *@import("event/ToggleEvent.zig"),
     task_priority_change_event: *@import("event/TaskPriorityChangeEvent.zig"),
+    media_query_list_event: *@import("event/MediaQueryListEvent.zig"),
 };
 
 pub const Options = struct {
@@ -211,6 +212,7 @@ pub fn is(self: *Event, comptime T: type) ?*T {
         .idb_version_change_event => |e| return if (T == @import("storage/idb/IDBVersionChangeEvent.zig")) e else null,
         .toggle_event => |e| return if (T == @import("event/ToggleEvent.zig")) e else null,
         .task_priority_change_event => |e| return if (T == @import("event/TaskPriorityChangeEvent.zig")) e else null,
+        .media_query_list_event => |e| return if (T == @import("event/MediaQueryListEvent.zig")) e else null,
         .ui_event => |e| {
             if (T == @import("event/UIEvent.zig")) {
                 return e;

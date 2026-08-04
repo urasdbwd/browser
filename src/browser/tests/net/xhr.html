@@ -537,6 +537,45 @@
   }
 </script>
 
+<script id=xhr_charset type=module>
+  const state = await testing.async();
+  const got = {};
+
+  function load(url, overrideMime) {
+    return new Promise((resolve) => {
+      const req = new XMLHttpRequest();
+      req.onload = () => resolve(req);
+      req.open('GET', url);
+      if (overrideMime) {
+        req.overrideMimeType(overrideMime);
+      }
+      req.send();
+    });
+  }
+
+  (async () => {
+    got.latin1 = await load('http://127.0.0.1:9582/charset/windows-1252');
+    got.overridden = await load('http://127.0.0.1:9582/charset/windows-1252', 'text/plain; charset=iso-8859-1');
+    got.utf8 = await load('http://127.0.0.1:9582/charset/none');
+    state.resolve();
+  })();
+
+  await state.done(() => {
+    // responseText is decoded with the final MIME type's charset. Without the
+    // conversion the windows-1252 bytes come back as replacement characters.
+    testing.expectEqual('Café €5', got.latin1.responseText);
+    testing.expectEqual('Café €5', got.latin1.response);
+
+    // overrideMimeType wins over the response's own Content-Type. iso-8859-1
+    // is decoded as windows-1252 per WHATWG, so the é survives either way; the
+    // point is that the override is what gets consulted.
+    testing.expectEqual(true, got.overridden.responseText.startsWith('Café'));
+
+    // No charset parameter: the document's encoding (UTF-8) is used.
+    testing.expectEqual('Café', got.utf8.responseText);
+  });
+</script>
+
 <script id=xhr_send_flag type=module>
   {
     // Per spec, calling send() while a request is already in flight throws

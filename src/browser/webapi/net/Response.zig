@@ -31,7 +31,9 @@ const FormData = @import("FormData.zig");
 const Headers = @import("Headers.zig");
 const body_init = @import("body_init.zig");
 
-const ContentTypeIterator = @import("../../Mime.zig").ContentTypeIterator;
+const Mime = @import("../../Mime.zig");
+const ContentTypeIterator = Mime.ContentTypeIterator;
+const html5ever = @import("../../parser/html5ever.zig");
 
 const Execution = js.Execution;
 const Allocator = std.mem.Allocator;
@@ -314,7 +316,23 @@ pub fn getText(self: *Response, exec: *const Execution) !js.Promise {
         .empty => "",
         .stream => return local.rejectPromise(.{ .type_error = "Cannot read text from stream body" }),
     };
-    return local.resolvePromise(body);
+    // V8 reads the slice as UTF-8, so a legacy-encoded body has to be converted
+    // first or it comes back as mojibake.
+    return local.resolvePromise(try html5ever.decodeToUtf8(exec.call_arena, try self.charset(exec), body));
+}
+
+/// The encoding the body should be decoded with: the Content-Type's charset
+/// parameter, then the document's encoding, then UTF-8.
+fn charset(self: *const Response, exec: *const Execution) ![]const u8 {
+    if (try self._headers.get("content-type", exec)) |content_type| {
+        if (Mime.parse(content_type)) |mime| {
+            if (!mime.is_default_charset) {
+                return mime.charsetString();
+            }
+        } else |_| {}
+    }
+    const document_charset = exec.charset.*;
+    return if (document_charset.len == 0) "UTF-8" else document_charset;
 }
 
 pub fn getJson(self: *Response, exec: *const Execution) !js.Promise {
@@ -526,7 +544,15 @@ pub fn formData(self: *Response, exec: *const Execution) !js.Promise {
     return local.rejectPromise(.{ .type_error = "Failed to parse body as FormData" });
 }
 
-pub fn clone(self: *const Response, exec: *const Execution) !*Response {
+pub fn clone(self: *Response, exec: *const Execution) !*Response {
+    // Per spec a disturbed or locked body cannot be cloned.
+    if (self._body_used) {
+        return error.TypeError;
+    }
+    if (self._body == .stream and self._body.stream.getLocked()) {
+        return error.TypeError;
+    }
+
     const session = exec.session;
     const body_len = switch (self._body) {
         .bytes => |b| b.len,
@@ -539,7 +565,13 @@ pub fn clone(self: *const Response, exec: *const Execution) !*Response {
     const body: Body = switch (self._body) {
         .bytes => |b| .{ .bytes = try arena.dupe(u8, b) },
         .empty => .empty,
-        .stream => .empty, // TODO: implement stream tee for proper cloning
+        // Both responses must see every chunk, so the original stream is
+        // replaced by one half of a tee and the clone takes the other.
+        .stream => |stream| blk: {
+            const branches = try stream.tee(exec);
+            self._body = .{ .stream = branches[0] };
+            break :blk .{ .stream = branches[1] };
+        },
     };
     const status_text = try arena.dupe(u8, self._status_text);
     const url = try arena.dupeZ(u8, self._url);

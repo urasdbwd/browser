@@ -72,6 +72,11 @@ permissions: std.StringHashMapUnmanaged(PermissionState) = .empty,
 // observe the same (possibly overridden) value.
 viewport_override: ?Viewport = null,
 
+// The viewport page script has already been told about. The override above is
+// written directly by CDP/render, with no notification, so a change is noticed
+// here once per event loop tick instead of being pushed from the setter.
+viewport_delivered: ?Viewport = null,
+
 // used by sessions to allocate pages.
 page_pool: std.heap.MemoryPool(Page),
 
@@ -253,11 +258,34 @@ pub fn runMicrotasks(self: *Browser) void {
 pub fn runMacrotasks(self: *Browser) !void {
     const env = &self.env;
 
+    self.deliverViewportChange();
+
     try self.env.runMacrotasks();
     env.pumpMessageLoop();
 
     // either of the above could have queued more microtasks
     env.runMicrotasks();
+}
+
+// Fires `change` on every matchMedia() result whose answer the new viewport
+// flipped. No-op on the common path where the viewport never changes.
+fn deliverViewportChange(self: *Browser) void {
+    const viewport = self.getViewport();
+    const delivered = self.viewport_delivered orelse {
+        self.viewport_delivered = viewport;
+        return;
+    };
+    if (delivered.width == viewport.width and delivered.height == viewport.height) {
+        return;
+    }
+    self.viewport_delivered = viewport;
+
+    if (self.session == null) {
+        return;
+    }
+    for (self.session.?.pages.items) |page| {
+        Page.deliverMediaQueryChanges(page);
+    }
 }
 
 pub fn hasBackgroundTasks(self: *Browser) bool {
