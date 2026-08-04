@@ -207,7 +207,7 @@ fn newSession(server: *Server, arena: Allocator, body: []const u8, out: *std.Io.
             out,
             .internal_server_error,
             "session not created",
-            "No firstMatch entry is supported; this endpoint supports browserName=lightpanda, direct networking, acceptInsecureCerts=false, and standard strict file and prompt capabilities",
+            "No firstMatch entry is supported; this endpoint supports browserName=lightpanda (or the chrome/chromium aliases), direct networking, acceptInsecureCerts=false, and standard strict file and prompt capabilities",
         );
     };
 
@@ -317,7 +317,7 @@ fn capabilityObjectMatches(effective: *EffectiveCapabilities, capabilities: ?Jso
         if (value == .null) continue;
 
         if (std.mem.eql(u8, name, "browserName")) {
-            if (!std.mem.eql(u8, value.string, "lightpanda")) return false;
+            if (!isSupportedBrowserName(value.string)) return false;
         } else if (std.mem.eql(u8, name, "browserVersion")) {
             if (!browserVersionMatches(value.string, lp.build_config.version)) return false;
         } else if (std.mem.eql(u8, name, "platformName")) {
@@ -350,6 +350,17 @@ fn capabilityObjectMatches(effective: *EffectiveCapabilities, capabilities: ?Jso
         }
     }
     return true;
+}
+
+// Stock WebDriver clients (Selenium, WebdriverIO, …) hard-code
+// browserName=chrome. We already present as Chrome to pages, so treat the
+// Chrome names as aliases rather than turning those clients away. The returned
+// capabilities still report the real browserName.
+fn isSupportedBrowserName(requested: []const u8) bool {
+    for ([_][]const u8{ "lightpanda", "chrome", "chromium" }) |name| {
+        if (std.ascii.eqlIgnoreCase(requested, name)) return true;
+    }
+    return false;
 }
 
 fn browserVersionMatches(requested: []const u8, actual: []const u8) bool {
@@ -1431,7 +1442,9 @@ test "WebDriver: protocol session validates capabilities and preserves navigatio
         var scope: lp.js.Local.Scope = undefined;
         frame.js.localScope(&scope);
         defer scope.deinit();
-        try testing.expect((try scope.local.compileAndRun("navigator.webdriver === true", null)).isTrue());
+        // Deliberately false even under an active WebDriver session; see the
+        // comment on Navigator.getWebdriver.
+        try testing.expect((try scope.local.compileAndRun("navigator.webdriver === false", null)).isTrue());
     }
     const frame_id_before = active.session.primaryPage().?.frame_id;
     const navigate_path = try std.fmt.allocPrint(testing.allocator, "/session/{s}/url", .{session_id});
@@ -2249,6 +2262,11 @@ test "WebDriver: capabilities support version constraints and valid prompt handl
         "accept and notify",
         "ignore",
     }) |handler| try std.testing.expect(isPromptHandler(handler));
+
+    inline for (.{ "lightpanda", "chrome", "chromium", "Chrome" }) |name| {
+        try std.testing.expect(isSupportedBrowserName(name));
+    }
+    try std.testing.expect(!isSupportedBrowserName("firefox"));
 }
 
 test "WebDriver: proxy endpoints reject invalid hosts and ports" {
