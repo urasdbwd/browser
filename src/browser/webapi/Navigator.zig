@@ -123,9 +123,9 @@ pub fn getProduct(_: *const Navigator) []const u8 {
     return "Gecko";
 }
 
-// Chrome only sets this when a WebDriver client is attached. Lightpanda is not
-// driven by WebDriver, and reporting true is the single loudest automation
-// signal a page can read.
+// Chrome only sets this when a WebDriver client is attached. We deliberately
+// always report false, even while a WebDriver session is driving the browser:
+// reporting true is the single loudest automation signal a page can read.
 pub fn getWebdriver(_: *const Navigator) bool {
     return false;
 }
@@ -281,7 +281,7 @@ pub const JsApi = struct {
     pub const maxTouchPoints = bridge.accessor(Navigator.getMaxTouchPoints, null, .{});
     pub const vendor = bridge.accessor(Navigator.getVendor, null, .{ .exposed = .window });
     pub const product = bridge.accessor(Navigator.getProduct, null, .{});
-    pub const webdriver = bridge.accessor(Navigator.getWebdriver, null, .{});
+    pub const webdriver = bridge.accessor(Navigator.getWebdriver, null, .{ .exposed = .window });
     pub const doNotTrack = bridge.accessor(Navigator.getDoNotTrack, null, .{});
     pub const globalPrivacyControl = bridge.accessor(Navigator.getGlobalPrivacyControl, null, .{});
 

@@ -18,7 +18,6 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
-const builtin = @import("builtin");
 
 const JS = @import("js/js.zig");
 const Mime = @import("Mime.zig");
@@ -87,7 +86,6 @@ const log = lp.log;
 const String = lp.String;
 const IFrame = Element.Html.IFrame;
 const Allocator = std.mem.Allocator;
-const IS_DEBUG = builtin.mode == .Debug;
 
 pub const BUF_SIZE = 1024;
 
@@ -371,7 +369,7 @@ pub const InitOpts = struct {
 };
 
 pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.frame, "frame.init", .{});
     }
 
@@ -475,7 +473,7 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
 
     document._frame = self;
 
-    if (comptime builtin.is_test == false) {
+    if (comptime lp.IS_TEST == false) {
         if (parent == null and browser.env.platform.idle_tasks_enabled) {
             // HTML test runner manually calls these as necessary
             try self.js.scheduler.add(session.browser, struct {
@@ -494,7 +492,7 @@ pub fn deinit(self: *Frame) void {
         frame.deinit();
     }
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.frame, "frame.deinit", .{ .url = self.url, .type = self._type });
     }
 
@@ -954,39 +952,7 @@ fn scheduleNavigationWithArena(originator: *Frame, arena: *lp.Arena, request_url
 
     const session = target._session;
 
-    // Re-navigating to the exact current URL is only a reload when the URL
-    // has no fragment. With a fragment it's a fragment navigation per the
-    // HTML "navigate" steps (url equals the document's URL excluding
-    // fragments and url's fragment is non-null): no reload, and since the
-    // fragment didn't change, no hashchange and no new history entry either.
-    if (!opts.force and
-        opts.kind != .reload and
-        std.mem.eql(u8, target.url, resolved_url) and
-        std.mem.indexOfScalar(u8, resolved_url, '#') != null)
-    {
-        arena.release();
-        return;
-    }
-
-    // Short-circuit only true fragment-only navigations (same path/query, different
-    // fragment). Identical URLs fall through and trigger a real reload.
-    const is_fragment_navigation = !std.mem.eql(u8, target.url, resolved_url) and URL.eqlDocument(target.url, resolved_url);
-    if (!opts.force and is_fragment_navigation) {
-        const old_url = target.url;
-        target.url = try target.arena.dupeZ(u8, resolved_url);
-
-        const location = try Location.init(target.url, target);
-        location.acquireRef();
-        target.window._location.releaseRef(target._page);
-        target.window._location = location;
-
-        if (target.parent == null) {
-            try session.navigation.updateEntries(target.url, opts.kind, target, true);
-        }
-
-        try target.queueHashChange(old_url, target.url);
-
-        // don't defer this, the caller is responsible for freeing it on error
+    if (try target.navigateSameDocument(resolved_url, opts)) {
         arena.release();
         return;
     }
@@ -1040,6 +1006,41 @@ fn scheduleNavigationWithArena(originator: *Frame, arena: *lp.Arena, request_url
 
     target._queued_navigation = qn;
     return session.scheduleNavigation(target);
+}
+
+/// Apply a fragment-only navigation without replacing the active document.
+/// Returns true when the URL was handled as a same-document navigation.
+pub fn navigateSameDocument(self: *Frame, resolved_url: [:0]const u8, opts: NavigateOpts) !bool {
+    if (opts.force) return false;
+
+    // Re-navigating to the exact current URL is only a reload when the URL
+    // has no fragment. With a fragment, no hashchange or history entry occurs.
+    if (opts.kind != .reload and
+        std.mem.eql(u8, self.url, resolved_url) and
+        std.mem.indexOfScalar(u8, resolved_url, '#') != null)
+    {
+        return true;
+    }
+
+    // Only a changed fragment with an otherwise-equal URL is same-document.
+    if (std.mem.eql(u8, self.url, resolved_url) or !URL.eqlDocument(self.url, resolved_url)) {
+        return false;
+    }
+
+    const old_url = self.url;
+    self.url = try self.arena.dupeZ(u8, resolved_url);
+
+    const location = try Location.init(self.url, self);
+    location.acquireRef();
+    self.window._location.releaseRef(self._page);
+    self.window._location = location;
+
+    if (self.parent == null) {
+        try self._session.navigation.updateEntries(self.url, opts.kind, self, true);
+    }
+
+    try self.queueHashChange(old_url, self.url);
+    return true;
 }
 
 // A script can have multiple competing navigation events, say it starts off
@@ -1251,7 +1252,7 @@ fn _documentIsComplete(self: *Frame) !void {
         try self._event_manager.dispatchDirect(window_target, pageshow_event, self.window._on_pageshow, .{ .context = "page show" });
     }
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.frame, "load", .{ .url = self.url, .type = self._type });
     }
 
@@ -1262,7 +1263,7 @@ fn notifyParentLoadComplete(self: *Frame) void {
     const parent = self.parent orelse return;
 
     if (self._parent_notified == true) {
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             std.debug.assert(false);
         }
         // shouldn't happen, don't want to crash a release build over it
@@ -1312,7 +1313,7 @@ fn frameHeaderDoneCallback(transfer: *HttpClient.Transfer) !HttpClient.Transfer.
     self.window._location.releaseRef(self._page);
     self.window._location = location;
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.frame, "navigate header", .{
             .url = self.url,
             .status = transfer.responseStatus(),
@@ -1528,7 +1529,7 @@ fn frameDataCallback(transfer: *HttpClient.Transfer, data: []const u8) !void {
             }
         }
 
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             log.debug(.frame, "navigate first chunk", .{
                 .content_type = mime.content_type,
                 .len = data.len,
@@ -1617,7 +1618,7 @@ fn frameDataCallback(transfer: *HttpClient.Transfer, data: []const u8) !void {
 fn frameDoneCallback(ctx: *anyopaque) !void {
     var self: *Frame = @ptrCast(@alignCast(ctx));
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.frame, "navigate done", .{ .type = self._type, .url = self.url });
     }
 
@@ -1629,7 +1630,7 @@ fn frameDoneCallback(ctx: *anyopaque) !void {
         self._pending_content_type = null;
     }
 
-    defer if (comptime IS_DEBUG) {
+    defer if (comptime lp.IS_DEBUG) {
         log.debug(.frame, "frame load complete", .{
             .url = self.url,
             .type = self._type,
@@ -2063,7 +2064,7 @@ fn getElementIdMap(frame: *Frame, node: *Node) ElementIdMaps {
                 };
             }
             // Detached nodes should not have IDs registered
-            if (IS_DEBUG) {
+            if (lp.IS_DEBUG) {
                 std.debug.assert(false);
             }
             return .{

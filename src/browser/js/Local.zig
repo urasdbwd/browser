@@ -36,7 +36,6 @@ const v8 = js.v8;
 const log = lp.log;
 const CallOpts = Caller.CallOpts;
 const FinalizerCallback = js.FinalizerCallback;
-const IS_DEBUG = @import("builtin").mode == .Debug;
 
 // Where js.Context has a lifetime tied to the frame, and holds the
 // v8::Global<v8::Context>, this has a much shorter lifetime and holds a
@@ -1322,7 +1321,7 @@ pub fn resolveValue(value: anytype) Resolved {
 }
 
 fn resolveT(comptime T: type, value: *T) Resolved {
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         assertChainContiguity(T, value);
     }
     const Meta = T.JsApi.Meta;
@@ -1388,7 +1387,7 @@ fn resolveT(comptime T: type, value: *T) Resolved {
                             prev = n;
                             node = n.next;
                         } else {
-                            if (comptime IS_DEBUG) {
+                            if (comptime lp.IS_DEBUG) {
                                 std.debug.assert(false);
                             }
                         }

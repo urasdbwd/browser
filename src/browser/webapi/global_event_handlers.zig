@@ -23,8 +23,6 @@ const js = @import("../js/js.zig");
 
 const EventTarget = @import("EventTarget.zig");
 
-const IS_DEBUG = @import("builtin").mode == .Debug;
-
 const Key = struct {
     target: *EventTarget,
     handler: Handler,
@@ -36,7 +34,7 @@ const Key = struct {
     /// shift out: the handler is xor'd into the high bits instead.
     fn fuse(self: *const Key) u64 {
         const ptr = @intFromPtr(self.target);
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             lp.assert(ptr < (1 << 57), "Key.fuse: pointer overflow", .{ .ptr = ptr });
         }
         return ptr ^ (@as(u64, @intFromEnum(self.handler)) << 57);

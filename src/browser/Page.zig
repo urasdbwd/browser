@@ -18,7 +18,6 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
-const builtin = @import("builtin");
 
 const js = @import("js/js.zig");
 
@@ -31,7 +30,6 @@ const Blob = @import("webapi/Blob.zig");
 const SharedWorkerGlobalScope = @import("webapi/SharedWorkerGlobalScope.zig");
 
 const Allocator = std.mem.Allocator;
-const IS_DEBUG = builtin.mode == .Debug;
 
 const MutableFormValues = struct {
     values: std.AutoHashMapUnmanaged(usize, []const u8) = .empty,
@@ -199,6 +197,13 @@ replaces: ?*Page = null,
 // code. The two are kept in sync.
 replacement: ?*Page = null,
 
+// Prevents double entry in session._page_destruction_queue. Can happen since
+// various paths can enter this, and there isn't always a single clear owner
+// of who should errdefer, e.g. if this happens before a navigation's
+// transfer.submit(), then the caller needs to handle the failure. If it happens
+// after, then frameErrorCallback does.
+destroying: bool = false,
+
 // The viewport every consumer should read. The runtime override (set via
 // Emulation.setDeviceMetricsOverride) is stored on the Browser so it persists
 // across page navigations; delegate to it here, keeping a single read path for
@@ -247,7 +252,7 @@ pub fn deinit(self: *Page) void {
     self.shared_workers = .empty;
 
     {
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             std.debug.assert(self.blob_urls.count() == 0);
         }
 
@@ -277,7 +282,7 @@ pub fn deinit(self: *Page) void {
 
     self.globals.deinit();
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         std.debug.assert(self.origins.count() == 0);
     }
     // Defensive cleanup in case origins leaked.

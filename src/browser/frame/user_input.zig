@@ -24,7 +24,6 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
-const builtin = @import("builtin");
 
 const Frame = @import("../Frame.zig");
 const js = @import("../js/js.zig");
@@ -39,7 +38,6 @@ const WheelEvent = @import("../webapi/event/WheelEvent.zig");
 const KeyboardEvent = @import("../webapi/event/KeyboardEvent.zig");
 
 const log = lp.log;
-const IS_DEBUG = builtin.mode == .Debug;
 
 // DOM MouseEvent.button values.
 // https://developer.mozilla.org/en-US/docs/Web/API/MouseEvent/button
@@ -373,7 +371,7 @@ pub fn triggerMousePressWithState(
     modifiers: MouseModifiers,
 ) !?MouseDown {
     const target = (try frame.window._document.elementFromPoint(x, y, frame)) orelse return null;
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.frame, "frame mouse press", .{
             .url = frame.url,
             .node = target,
@@ -390,7 +388,7 @@ pub fn triggerMousePressWithState(
 
 pub fn triggerMouseMoveWithOptions(frame: *Frame, x: f64, y: f64, buttons: u16, modifiers: MouseModifiers) !void {
     const target = (try frame.window._document.elementFromPoint(x, y, frame)) orelse return;
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.frame, "frame mouse move", .{
             .url = frame.url,
             .node = target,
@@ -415,7 +413,7 @@ pub fn triggerMouseReleaseWithState(
     down: ?MouseDown,
 ) !void {
     const target = (try frame.window._document.elementFromPoint(x, y, frame)) orelse return;
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.frame, "frame mouse release", .{
             .url = frame.url,
             .node = target,
@@ -440,7 +438,7 @@ pub fn triggerMouseWheelWithOptions(
     modifiers: MouseModifiers,
 ) !void {
     const target = (try frame.window._document.elementFromPoint(x, y, frame)) orelse return;
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.frame, "frame mouse wheel", .{
             .url = frame.url,
             .node = target,
@@ -760,7 +758,7 @@ pub fn triggerKeyboard(frame: *Frame, keyboard_event: *KeyboardEvent) !bool {
         return false;
     };
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.frame, "frame keydown", .{
             .url = frame.url,
             .node = element,

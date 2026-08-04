@@ -18,7 +18,6 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
-const builtin = @import("builtin");
 
 const js = @import("../js/js.zig");
 const URL = @import("../URL.zig");
@@ -55,7 +54,6 @@ const Notification = @import("../../Notification.zig");
 const Chrome = @import("Chrome.zig");
 
 const log = lp.log;
-const IS_DEBUG = builtin.mode == .Debug;
 
 const Execution = js.Execution;
 
@@ -603,7 +601,7 @@ pub fn reportError(self: *Window, err: js.Value, frame: *Frame) !void {
 
     const target = self.asEventTarget();
     if (!frame._event_manager.hasDirectListeners(target, "error", self._on_error)) {
-        if (comptime builtin.is_test == false) {
+        if (comptime lp.IS_TEST == false) {
             log.warn(.js, "window.reportError", .{
                 .message = err.toStringSlice() catch "Unknown error",
             });
@@ -656,7 +654,7 @@ pub fn reportError(self: *Window, err: js.Value, frame: *Frame) !void {
         .context = "window.reportError",
     });
 
-    if (comptime builtin.is_test == false) {
+    if (comptime lp.IS_TEST == false) {
         if (!event._prevent_default) {
             log.warn(.js, "window.reportError", .{
                 .message = error_event._message,
@@ -1060,7 +1058,7 @@ pub fn getWebDriver(_: *const Window) @import("WebDriver.zig") {
 }
 
 pub fn unhandledPromiseRejection(self: *Window, no_handler: bool, rejection: js.PromiseRejection, frame: *Frame) !void {
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.js, "unhandled rejection", .{
             .target = "window",
             .value = rejection.reason(),

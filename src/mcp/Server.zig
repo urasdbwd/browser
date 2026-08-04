@@ -10,6 +10,7 @@ const router = @import("router.zig");
 const tools = @import("tools.zig");
 const Transport = @import("Transport.zig");
 const CDPNode = @import("../cdp/Node.zig");
+const Id = @import("../id.zig");
 
 const Self = @This();
 
@@ -28,9 +29,26 @@ pub const Session = struct {
     session: *lp.Session,
     notification: *lp.Notification,
     node_registry: CDPNode.Registry,
+    webdriver_elements: WebDriverElementRegistry,
 
     fn isDefault(self: *const Session) bool {
         return std.mem.eql(u8, self.id, default_session_id);
+    }
+};
+
+/// Tracks element IDs already returned to the WebDriver client. The CDP node
+/// registry owns live DOM pointers and clears them before document teardown;
+/// the monotonic high-water mark distinguishes a stale past reference from an
+/// unknown ID without retaining one entry per historical element.
+pub const WebDriverElementRegistry = struct {
+    last_issued: CDPNode.Id = 0,
+
+    pub fn register(self: *WebDriverElementRegistry, node_id: CDPNode.Id) void {
+        self.last_issued = @max(self.last_issued, node_id);
+    }
+
+    pub fn isIssued(self: *const WebDriverElementRegistry, node_id: CDPNode.Id) bool {
+        return node_id <= self.last_issued;
     }
 };
 
@@ -42,6 +60,13 @@ sessions: std.StringHashMapUnmanaged(*Session) = .empty,
 max_sessions: usize,
 /// Monotonic counter backing auto-generated session ids (`s1`, `s2`, …).
 session_seq: u32 = 0,
+/// Endpoint nodes may have only one active HTTP WebDriver session.
+webdriver_session: ?*Session = null,
+webdriver_session_id: ?[36]u8 = null,
+webdriver_page_load_wait: ?lp.Config.WaitUntil = .load,
+webdriver_page_load_timeout_ms: ?u64 = 300_000,
+webdriver_script_timeout_ms: ?u64 = 30_000,
+webdriver_implicit_timeout_ms: ?u64 = 0,
 /// When several sessions (each its own V8 isolate) share one thread, V8's
 /// "current isolate" is a per-thread stack, so an isolate must be *entered*
 /// around any use of it and left un-entered otherwise. The HTTP transport
@@ -56,6 +81,24 @@ active_session: *Session = undefined,
 transport: Transport,
 
 pub fn init(allocator: std.mem.Allocator, app: *App, writer: *std.Io.Writer) !*Self {
+    const self = try initEmpty(allocator, app, writer);
+    errdefer {
+        self.transport.deinit();
+        allocator.destroy(self);
+    }
+
+    self.active_session = try self.createSession(default_session_id);
+    return self;
+}
+
+/// Initialize the WebDriver endpoint without an otherwise-unused default
+/// browser. The first New Session command creates the sole browser and starts
+/// deadline enforcement lazily.
+pub fn initWebDriver(allocator: std.mem.Allocator, app: *App, writer: *std.Io.Writer) !*Self {
+    return initEmpty(allocator, app, writer);
+}
+
+fn initEmpty(allocator: std.mem.Allocator, app: *App, writer: *std.Io.Writer) !*Self {
     const self = try allocator.create(Self);
     errdefer allocator.destroy(self);
 
@@ -67,7 +110,6 @@ pub fn init(allocator: std.mem.Allocator, app: *App, writer: *std.Io.Writer) !*S
     };
     errdefer self.transport.deinit();
 
-    self.active_session = try self.createSession(default_session_id);
     return self;
 }
 
@@ -83,6 +125,10 @@ pub fn deinit(self: *Self) void {
 /// Create the session named `id`, or return the existing one. The `id` is
 /// duped, so the caller keeps ownership of its slice.
 pub fn createSession(self: *Self, id: []const u8) !*Session {
+    return self.createSessionWithConsoleCapture(id, true);
+}
+
+fn createSessionWithConsoleCapture(self: *Self, id: []const u8, capture_console: bool) !*Session {
     if (self.sessions.get(id)) |existing| return existing;
     if (self.sessions.count() >= self.max_sessions) return error.SessionLimitReached;
 
@@ -101,6 +147,7 @@ pub fn createSession(self: *Self, id: []const u8) !*Session {
         .session = undefined,
         .notification = notification,
         .node_registry = CDPNode.Registry.init(self.allocator),
+        .webdriver_elements = .{},
     };
     errdefer entry.node_registry.deinit();
 
@@ -108,7 +155,7 @@ pub fn createSession(self: *Self, id: []const u8) !*Session {
     errdefer entry.browser.deinit();
 
     entry.session = try entry.browser.newSession(notification);
-    try entry.session.enableConsoleCapture();
+    if (capture_console) try entry.session.enableConsoleCapture();
 
     // Only the default session is backed by the on-disk cookie file; named
     // sessions start clean so agents stay isolated by default.
@@ -129,7 +176,7 @@ pub fn createSession(self: *Self, id: []const u8) !*Session {
 /// transport calls this on its worker thread before serving anyone.
 pub fn enableIsolateParking(self: *Self) void {
     self.park_isolates = true;
-    self.exitIsolate(self.defaultSession());
+    if (self.sessions.get(default_session_id)) |entry| self.exitIsolate(entry);
 }
 
 /// Make `entry`'s isolate the current one for this thread. Must bracket any
@@ -163,6 +210,7 @@ fn destroySession(self: *Self, entry: *Session) void {
     // Re-enter so `Browser.deinit`'s `Env.deinit` exit stays balanced against
     // a parked isolate (and operates on the current one).
     self.enterIsolate(entry);
+    entry.notification.unregisterAll(entry);
     entry.node_registry.deinit();
     entry.browser.deinit();
     entry.notification.deinit();
@@ -181,6 +229,137 @@ pub fn useSession(self: *Self, id: ?[]const u8) !*Session {
     const wanted = id orelse "";
     self.active_session = if (wanted.len == 0) self.defaultSession() else try self.createSession(wanted);
     return self.active_session;
+}
+
+/// Create a W3C WebDriver session with its initial about:blank document.
+/// The browser state is marked before the page is created so navigator.webdriver
+/// is true from the first script execution in that browsing context.
+pub fn createWebDriverSession(
+    self: *Self,
+    id: []const u8,
+    page_load_wait: ?lp.Config.WaitUntil,
+    page_load_timeout_ms: ?u64,
+    script_timeout_ms: ?u64,
+    implicit_timeout_ms: ?u64,
+) !*Session {
+    if (self.webdriver_session != null) {
+        return error.SessionAlreadyExists;
+    }
+    if (id.len != 36) return error.InvalidSessionId;
+
+    // A disabled global watchdog normally means no checker thread. WebDriver
+    // still needs its per-command execution deadlines, but only after a
+    // client actually asks us to create a browser.
+    try self.app.watchdog.enableExecutionDeadlines();
+    const entry = try self.createSessionWithConsoleCapture(id, false);
+    errdefer {
+        const removed = self.sessions.fetchRemove(id).?;
+        self.destroySession(removed.value);
+    }
+    try entry.notification.register(.frame_remove, entry, onWebDriverFrameRemove);
+
+    self.enterIsolate(entry);
+    defer self.exitIsolate(entry);
+
+    entry.browser.webdriver_active = true;
+    errdefer entry.browser.webdriver_active = false;
+
+    _ = try entry.session.createPage();
+
+    var owned_id: [36]u8 = undefined;
+    @memcpy(&owned_id, id);
+    self.webdriver_page_load_wait = page_load_wait;
+    self.webdriver_page_load_timeout_ms = page_load_timeout_ms;
+    self.webdriver_script_timeout_ms = script_timeout_ms;
+    self.webdriver_implicit_timeout_ms = implicit_timeout_ms;
+    self.webdriver_session = entry;
+    self.webdriver_session_id = owned_id;
+    return entry;
+}
+
+fn onWebDriverFrameRemove(ctx: *anyopaque, _: lp.Notification.FrameRemove) !void {
+    const entry: *Session = @ptrCast(@alignCast(ctx));
+    entry.node_registry.resetAndFree();
+}
+
+/// Return an existing W3C WebDriver session. This never creates a session for
+/// an unknown id, unlike useSession which is intentionally MCP-friendly.
+pub fn getWebDriverSession(self: *Self, id: []const u8) ?*Session {
+    const entry = self.webdriver_session orelse return null;
+    const active_id = self.webdriver_session_id orelse return null;
+    return if (std.mem.eql(u8, &active_id, id)) entry else null;
+}
+
+pub fn closeWebDriverSession(self: *Self, id: []const u8) bool {
+    const entry = self.getWebDriverSession(id) orelse return false;
+    self.cancelWebDriverTermination();
+    entry.browser.webdriver_active = false;
+
+    self.webdriver_session = null;
+    self.webdriver_session_id = null;
+    self.webdriver_page_load_wait = .load;
+    self.webdriver_page_load_timeout_ms = 300_000;
+    self.webdriver_script_timeout_ms = 30_000;
+    self.webdriver_implicit_timeout_ms = 0;
+    const removed = self.sessions.fetchRemove(id) orelse unreachable;
+    std.debug.assert(removed.value == entry);
+    self.destroySession(entry);
+    return true;
+}
+
+pub fn webdriverReady(self: *const Self) bool {
+    return self.webdriver_session == null;
+}
+
+pub fn webdriverEnvironment(self: *Self) ?*lp.js.Env {
+    const entry = self.webdriver_session orelse return null;
+    return &entry.browser.env;
+}
+
+/// Cancel a transport-requested V8 termination while its isolate is current.
+/// The HTTP worker calls this after idle work and just before teardown.
+pub fn cancelWebDriverTermination(self: *Self) void {
+    const entry = self.webdriver_session orelse return;
+    self.enterIsolate(entry);
+    defer self.exitIsolate(entry);
+    if (entry.browser.env.terminatePending()) entry.browser.env.cancelTerminate();
+}
+
+pub fn webdriverPageLoadWait(self: *const Self) ?lp.Config.WaitUntil {
+    return self.webdriver_page_load_wait;
+}
+
+pub fn webdriverPageLoadTimeout(self: *const Self) ?u64 {
+    return self.webdriver_page_load_timeout_ms;
+}
+
+pub fn webdriverScriptTimeout(self: *const Self) ?u64 {
+    return self.webdriver_script_timeout_ms;
+}
+
+pub fn webdriverImplicitTimeout(self: *const Self) ?u64 {
+    return self.webdriver_implicit_timeout_ms;
+}
+
+pub fn setWebDriverScriptTimeout(self: *Self, timeout_ms: ?u64) void {
+    self.webdriver_script_timeout_ms = timeout_ms;
+}
+
+pub fn setWebDriverPageLoadTimeout(self: *Self, timeout_ms: ?u64) void {
+    self.webdriver_page_load_timeout_ms = timeout_ms;
+}
+
+pub fn setWebDriverImplicitTimeout(self: *Self, timeout_ms: ?u64) void {
+    self.webdriver_implicit_timeout_ms = timeout_ms;
+}
+
+/// Generate the UUID required for a WebDriver session id.
+pub fn nextWebDriverSessionId(self: *Self, arena: std.mem.Allocator) ![]const u8 {
+    while (true) {
+        var uuid: [36]u8 = undefined;
+        Id.uuidv4(&uuid);
+        if (!self.sessions.contains(&uuid)) return arena.dupe(u8, &uuid);
+    }
 }
 
 /// A session id that is not currently in use, formatted into `arena`.
@@ -272,4 +451,46 @@ test "MCP.Server - Integration: synchronous smoke test" {
     try testing.expectError(error.SessionLimitReached, server.createSession("second"));
 
     try testing.expectJson(.{ .jsonrpc = "2.0", .id = 1, .result = .{ .protocolVersion = "2024-11-05" } }, out_alloc.writer.buffered());
+}
+
+test "MCP.Server - WebDriver initialization leaves a disabled watchdog thread-free" {
+    var app: App = undefined;
+    app.watchdog = .init(null);
+    defer app.watchdog.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const server = try Self.initWebDriver(testing.allocator, &app, &out.writer);
+    defer server.deinit();
+
+    try testing.expect(app.watchdog.thread == null);
+}
+
+test "MCP.Server - MCP sessions keep console capture" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const server = try Self.init(testing.allocator, testing.test_app, &out.writer);
+    defer server.deinit();
+    server.enableIsolateParking();
+
+    try testing.expect(server.defaultSession().session._console_capture);
+    const named = try server.createSession("named");
+    try testing.expect(named.session._console_capture);
+}
+
+test "MCP.Server - WebDriver skips unused console capture" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const server = try Self.initWebDriver(testing.allocator, testing.test_app, &out.writer);
+    defer server.deinit();
+    server.enableIsolateParking();
+
+    const session = try server.createWebDriverSession(
+        "11111111-1111-4111-8111-111111111111",
+        .load,
+        300_000,
+        30_000,
+        0,
+    );
+    try testing.expect(!session.session._console_capture);
 }

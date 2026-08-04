@@ -17,6 +17,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
 const Frame = @import("Frame.zig");
 const Node = @import("webapi/Node.zig");
 const Element = @import("webapi/Element.zig");
@@ -241,7 +242,7 @@ fn _deep(
                 if (iframe.getContentDocument()) |doc| {
                     // A frame's document should always ahave a frame, but
                     // I'm not willing to crash a release build on that assertion.
-                    if (comptime IS_DEBUG) {
+                    if (comptime lp.IS_DEBUG) {
                         std.debug.assert(doc._frame != null);
                     }
                     if (doc._frame) |f| {

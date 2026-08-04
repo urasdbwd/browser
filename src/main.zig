@@ -18,7 +18,6 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const log = lp.log;
@@ -36,9 +35,9 @@ pub fn main(init: std.process.Init) !void {
     // - in Debug mode we use the General Purpose Allocator to detect memory leaks
     // - in Release mode we use the c allocator
     var gpa_instance: std.heap.DebugAllocator(.{ .stack_trace_frames = 10 }) = .init;
-    const gpa = if (builtin.mode == .Debug) gpa_instance.allocator() else std.heap.c_allocator;
+    const gpa = if (lp.IS_DEBUG) gpa_instance.allocator() else std.heap.c_allocator;
 
-    defer if (builtin.mode == .Debug) {
+    defer if (lp.IS_DEBUG) {
         if (gpa_instance.detectLeaks() != 0) std.process.exit(1);
     };
 
@@ -116,6 +115,23 @@ fn run(allocator: Allocator, main_arena: Allocator, proc_args: std.process.Args)
                 log.fatal(.app, "invalid server address", .{ .err = err, .host = opts.host, .port = opts.port });
                 return args.printUsageAndExit(main_arena, .serve, false);
             };
+
+            if (opts.webdriver) {
+                if (!lp.mcp.HttpServer.webdriverNetworkSettingsSupported(
+                    opts.http_proxy,
+                    !opts.insecure_disable_tls_host_verification,
+                )) {
+                    log.fatal(.app, "webdriver requires direct networking and TLS host verification", .{});
+                    return args.printUsageAndExit(main_arena, .serve, false);
+                }
+                if (!lp.mcp.HttpServer.isLoopbackAddress(address)) {
+                    log.fatal(.app, "webdriver requires a loopback host", .{ .host = opts.host });
+                    return args.printUsageAndExit(main_arena, .serve, false);
+                }
+                const http_server = try lp.mcp.HttpServer.init(allocator, app, .webdriver);
+                defer http_server.deinit();
+                return http_server.run(address);
+            }
 
             var server = lp.Server.init(app, address) catch |err| {
                 if (err == error.AddressInUse) {
@@ -237,7 +253,7 @@ fn run(allocator: Allocator, main_arena: Allocator, proc_args: std.process.Args)
                     log.fatal(.mcp, "invalid address", .{ .err = err, .host = opts.host, .port = port });
                     return;
                 };
-                const http_server = try lp.mcp.HttpServer.init(allocator, app);
+                const http_server = try lp.mcp.HttpServer.init(allocator, app, .mcp);
                 defer http_server.deinit();
                 // Shutdown rides the already-registered Network.stop handler:
                 // a signal stops the accept loop, run() returns, deinit joins.

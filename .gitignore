@@ -11,3 +11,4 @@ src/snapshot.bin
 
 .codex-worktrees/
 *.log
+.claude/worktrees/

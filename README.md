@@ -269,6 +269,31 @@ broker that this server does not yet provide.
 Once the CDP server started, you can run a Puppeteer script by configuring the
 `browserWSEndpoint`.
 
+### Start a WebDriver server
+
+```console
+./lightpanda serve --webdriver --host 127.0.0.1 --port 9515
+```
+
+This initial W3C WebDriver slice supports `GET /status`, session creation and
+deletion, navigation, current URL, title, serialized page source, current
+window handle(s), closing the sole window, timeouts, CSS element lookup from
+the document or an element, active element, and element tag name, attribute,
+selected, and enabled state. Element lookup honors the session's implicit
+timeout. It accepts one active session with one top-level browsing context and
+loopback binds only; closing that context closes the session. Use
+`browserName: "lightpanda"`;
+unsupported capabilities fail session creation instead of being silently
+ignored. Non-CSS locator strategies, element interaction, and script execution
+are not yet implemented.
+
+Unlike Chrome, pages in a WebDriver session report `navigator.webdriver ===
+false`. Lightpanda deliberately never advertises that it is being automated —
+that flag is the single loudest automation signal a page can read, and the
+whole point of driving Lightpanda is to be indistinguishable from a human
+session. If you need the standards-compliant `true`, you will have to patch
+`Navigator.getWebdriver`.
+
 <details>
 <summary>Example Puppeteer script</summary>
 

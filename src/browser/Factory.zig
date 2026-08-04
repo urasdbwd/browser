@@ -18,7 +18,6 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
-const builtin = @import("builtin");
 
 const reflect = @import("reflect.zig");
 
@@ -43,7 +42,6 @@ const log = lp.log;
 const String = lp.String;
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
-const IS_DEBUG = builtin.mode == .Debug;
 
 // Shared across all frames of a Page.
 const Factory = @This();
@@ -375,7 +373,7 @@ pub fn protoOffset(comptime T: type) usize {
 pub fn protoOf(value: anytype) *reflect.Proto(reflect.Struct(@TypeOf(value))).? {
     const T = reflect.Struct(@TypeOf(value));
     const proto: *reflect.Proto(T).? = @ptrFromInt(@intFromPtr(value) - comptime protoOffset(T));
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         // In debug, we'll assert that our offset and the _proto field agree.
         std.debug.assert(proto == if (comptime hasStoredProto(T)) value._proto else value._proto_canary);
     }
@@ -387,7 +385,7 @@ fn setProto(ptr: anytype, proto: anytype) void {
     const T = reflect.Struct(@TypeOf(ptr));
     if (comptime hasStoredProto(T)) {
         ptr._proto = proto;
-    } else if (comptime IS_DEBUG and @hasField(T, "_proto_canary")) {
+    } else if (comptime lp.IS_DEBUG and @hasField(T, "_proto_canary")) {
         ptr._proto_canary = proto;
     }
 }
@@ -525,7 +523,7 @@ pub fn textTrackCue(self: *Factory, child: anytype) !*@TypeOf(child) {
 pub fn destroy(self: *Factory, value: anytype) void {
     const S = reflect.Struct(@TypeOf(value));
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         // We should always destroy from the leaf down.
         if (comptime @hasDecl(S, "_prototype_root")) {
             const is_leaf = if (comptime @hasField(S, "_type")) value._type == .generic else false;
@@ -595,7 +593,7 @@ pub fn childOf(value: anytype, comptime T: type) *T {
     comptime assert(reflect.Proto(T).? == S);
 
     const child: *T = @ptrFromInt(@intFromPtr(value) + comptime protoOffset(T));
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         // protoOf does its own canary check, so this asserts both directions
         assert(@intFromPtr(protoOf(child)) == @intFromPtr(value));
     }

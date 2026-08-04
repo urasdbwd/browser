@@ -18,10 +18,8 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
-const builtin = @import("builtin");
 
 const log = lp.log;
-const IS_DEBUG = builtin.mode == .Debug;
 
 const Queue = std.PriorityQueue(Task, void, struct {
     fn compare(_: void, a: Task, b: Task) std.math.Order {
@@ -93,7 +91,7 @@ pub fn add(self: *Scheduler, ctx: *anyopaque, cb: Callback, run_in_ms: u32, opts
         return;
     }
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.scheduler, "scheduler.add", .{ .name = opts.name, .run_in_ms = run_in_ms, .low_priority = opts.low_priority });
     }
     var queue = if (opts.low_priority) &self.low_priority else &self.high_priority;
@@ -162,7 +160,7 @@ fn runQueue(self: *Scheduler, queue: *Queue) !void {
             return;
         }
         var task = queue.pop().?;
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             log.debug(.scheduler, "scheduler.runTask", .{ .name = task.name });
         }
 
@@ -182,7 +180,7 @@ fn runQueue(self: *Scheduler, queue: *Queue) !void {
             }
 
             // Task cannot be repeated immediately, and they should know that
-            if (comptime IS_DEBUG) {
+            if (comptime lp.IS_DEBUG) {
                 std.debug.assert(ms != 0);
             }
             task.run_at = now + ms;

@@ -46,6 +46,7 @@ onmessage = async function(event) {
       no_pdf_viewer: navigator.pdfViewerEnabled === undefined,
       no_java_enabled: navigator.javaEnabled === undefined,
       no_taint_enabled: navigator.taintEnabled === undefined,
+      no_webdriver: navigator.webdriver === undefined,
       no_register_protocol_handler: navigator.registerProtocolHandler === undefined,
       no_model_context: navigator.modelContext === undefined,
     };

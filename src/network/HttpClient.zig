@@ -18,7 +18,6 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
-const builtin = @import("builtin");
 
 const Inbox = @import("../Inbox.zig");
 const ArenaPool = @import("../ArenaPool.zig");
@@ -39,7 +38,6 @@ pub const BlockPattern = UrlBlocklist.Pattern;
 
 const log = lp.log;
 const Allocator = std.mem.Allocator;
-const IS_DEBUG = builtin.mode == .Debug;
 
 pub const Method = http.Method;
 pub const Header = http.Header;
@@ -235,7 +233,7 @@ pub fn deinit(self: *Client) void {
     self.abort();
     self.processGraveyard();
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         lp.assert(
             self.dispatch_count == 0,
             "dispatch_count must be 0",
@@ -422,7 +420,7 @@ pub fn abort(self: *Client) void {
     // catch the regression rather than silently leaking on next use.
     // ws_dispatch_queue drains through owner teardown (abortOwner -> kill),
     // which precedes Client.deinit.
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         std.debug.assert(self.transfers.size == 0);
         std.debug.assert(self.pending_queue.first == null);
         std.debug.assert(self.dispatch_queue.first == null);
@@ -459,7 +457,7 @@ pub fn abortOwner(self: *Client, owner: *Owner) void {
         const ws: *WebSocket = @fieldParentPtr("_owner_node", node);
         ws.kill();
     }
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         std.debug.assert(owner.websockets.first == null);
     }
 }
@@ -683,7 +681,7 @@ pub fn _tick(self: *Client, timeout_ms: u32, mode: DrainMode) !bool {
     // dispatch CDP commands
     try self.drainInbox(mode);
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         if (waited == false) {
             // we're about to tell our caller not to call us again without it
             // doing some work (e.g. running tasks). Let's assert that we were
@@ -709,7 +707,7 @@ pub fn _tick(self: *Client, timeout_ms: u32, mode: DrainMode) !bool {
 // over.
 fn dispatchCompleted(self: *Client, mode: DrainMode) bool {
     if (mode == .all) {
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             // .all never inside a syncRequest, so nothing can be gating requests.
             std.debug.assert(self.blocking_requests.count() == 0);
         }
@@ -855,7 +853,7 @@ fn pipeline(self: *Client, transfer: *Transfer, from: SubmitFrom) !void {
                     // / abortParked.
                     self.intercepted += 1;
                     transfer.park(.intercept_request);
-                    if (comptime IS_DEBUG) {
+                    if (comptime lp.IS_DEBUG) {
                         log.debug(.http, "wait for interception", .{ .intercepted = self.intercepted });
                     }
                     return;
@@ -1061,7 +1059,7 @@ fn cacheStore(self: *Client, transfer: *Transfer) void {
     metadata.headers = headers;
     metadata.vary_headers = vary_headers.items;
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.browser, "http cache", .{ .key = transfer._cache_key, .metadata = metadata });
     }
     cache.put(metadata, transfer.res.buffer.items) catch |err| {
@@ -1430,7 +1428,7 @@ fn processOneMessage(self: *Client, msg: http.Handles.MultiMessage, transfer: *T
         );
         if (wait_for_interception) {
             self.intercepted += 1;
-            if (comptime IS_DEBUG) {
+            if (comptime lp.IS_DEBUG) {
                 log.debug(.http, "wait for auth interception", .{ .intercepted = self.intercepted });
             }
 
@@ -1721,7 +1719,7 @@ pub const SyncResponse = struct {
 // challenge. The auth retry goes straight back to the network — it already
 // passed the request-side pipeline on its first attempt.
 pub fn continueTransfer(self: *Client, transfer: *Transfer) !void {
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.http, "continue transfer", .{ .intercepted = self.intercepted });
     }
 
@@ -1736,7 +1734,7 @@ pub fn continueTransfer(self: *Client, transfer: *Transfer) !void {
 // gate, re-entering the pipeline at the step after interception. The CDP
 // command may have mutated req (url / method / headers / body) first.
 pub fn continueIntercepted(self: *Client, transfer: *Transfer) !void {
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         lp.assert(self.intercepted > 0, "Client.continueIntercepted", .{ .value = self.intercepted });
     }
 
@@ -1758,7 +1756,7 @@ pub fn fulfillIntercepted(
     headers: []const http.Header,
     body: ?[]const u8,
 ) !void {
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         lp.assert(self.intercepted > 0, "Client.fulfillIntercepted", .{ .value = self.intercepted });
     }
 
@@ -2083,7 +2081,7 @@ pub const Transfer = struct {
         if (self._retired) {
             // transfer.deinit should be called once. But _retired and the graveyard
             // are a safety net born out of UAFs.
-            if (comptime IS_DEBUG) {
+            if (comptime lp.IS_DEBUG) {
                 lp.assert(false, "Transfer.deinit on retired transfer", .{ .id = self.id });
             }
             return;
@@ -2136,7 +2134,7 @@ pub const Transfer = struct {
             o.removeTransfer(self);
         }
 
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             // Any callback on a corpse is a bug — fail loudly instead of
             // silently running user code from a retired transfer.
             self.req.start_callback = null;
@@ -2306,7 +2304,7 @@ pub const Transfer = struct {
         if (self.state == .delivering) {
             return;
         }
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             lp.assert(
                 self.state == .created or self.state == .inflight,
                 "Transfer.scheduleDispatch",
@@ -2525,7 +2523,7 @@ pub const Transfer = struct {
     }
 
     fn buildResponseHeader(self: *Transfer, conn: *const http.Connection) !void {
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             std.debug.assert(self.res.header == null);
         }
 
@@ -2672,7 +2670,7 @@ pub const Transfer = struct {
     // abort. We don't call self.releaseConn here b/c it has been done
     // before interception process.
     pub fn abortAuthChallenge(self: *Transfer) void {
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             log.debug(.http, "abort auth transfer", .{ .intercepted = self.client.intercepted });
         }
 
@@ -2686,7 +2684,7 @@ pub const Transfer = struct {
 
     fn dataCallback(buffer: [*]const u8, chunk_count: usize, chunk_len: usize, data: *anyopaque) callconv(.c) usize {
         // libcurl should only ever emit 1 chunk at a time
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             std.debug.assert(chunk_count == 1);
         }
 
@@ -2785,7 +2783,7 @@ pub const Transfer = struct {
             // deliver() is mid-batch on this transfer; its loop consumes
             // events appended behind its cursor.
             .delivering => {},
-            else => if (comptime IS_DEBUG) {
+            else => if (comptime lp.IS_DEBUG) {
                 lp.assert(false, "Transfer.scheduleStreamDispatch", .{ .state = self.state });
             },
         }

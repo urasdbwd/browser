@@ -43,7 +43,6 @@ pub const Attribute = @import("element/Attribute.zig");
 const DOMStringMap = @import("element/DOMStringMap.zig");
 
 const log = lp.log;
-const IS_DEBUG = @import("builtin").mode == .Debug;
 const String = lp.String;
 
 const Element = @This();
@@ -116,7 +115,7 @@ _attributes: Attribute.List = .{},
 // In debug, set so that we can check that we have a proper contiguous block
 // of memory for the entire chain (and thus, simple pointer arithmetics will
 // work to resolve the proto).
-_proto_canary: if (IS_DEBUG) *Node else void = undefined,
+_proto_canary: if (lp.IS_DEBUG) *Node else void = undefined,
 
 pub const Type = enum(u8) {
     html,
@@ -715,14 +714,16 @@ pub fn isDisabled(self: *Element) bool {
         const ancestor = node.is(Element) orelse continue;
 
         if (ancestor.getTag() == .fieldset and ancestor.getAttributeSafe(comptime .wrap("disabled")) != null) {
+            var inside_first_legend = false;
             var child = ancestor.firstElementChild();
             while (child) |c| {
                 if (c.getTag() == .legend) {
-                    if (c.asNode().contains(element_node)) return false;
+                    inside_first_legend = c.asNode().contains(element_node);
                     break;
                 }
                 child = c.nextElementSibling();
             }
+            if (inside_first_legend) continue;
             return true;
         }
     }

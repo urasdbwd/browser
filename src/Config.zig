@@ -358,6 +358,7 @@ const Commands = cli.Builder(.{
             // Don't widen this without growing the reader buffer in the HTTP path.
             .{ .name = "cdp_max_http_message_size", .type = u14, .default = 4096 },
             .{ .name = "disable_metrics", .type = bool },
+            .{ .name = "webdriver", .type = bool },
         },
         .shared_options = CommonOptions,
     },
@@ -662,7 +663,13 @@ pub fn v8IdleTasks(self: *const Config) bool {
 
 pub fn httpProxy(self: *const Config) ?[:0]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.http_proxy,
+        .serve => |opts| if (opts.webdriver)
+            // A null CURLOPT_PROXY consults ambient proxy environment vars.
+            // The explicit empty value disables that lookup for WebDriver.
+            ""
+        else
+            opts.http_proxy,
+        inline .fetch, .render, .mcp, .agent => |opts| opts.http_proxy,
         .version => null,
         else => unreachable,
     };
@@ -1221,9 +1228,8 @@ pub const HttpHeaders = struct {
 pub fn printUsageAndExit(self: *const Config, allocator: Allocator, help_for: RunMode, success: bool) !void {
     const exec_name = self.exec_name;
     const Help = @import("help.zon");
-    const is_debug = builtin.mode == .Debug;
-    const info_or_warn = if (comptime is_debug) "info" else "warn";
-    const pretty_or_logfmt = if (comptime is_debug) "pretty" else "logfmt";
+    const info_or_warn = if (comptime lp.IS_DEBUG) "info" else "warn";
+    const pretty_or_logfmt = if (comptime lp.IS_DEBUG) "pretty" else "logfmt";
     const comptimePrint = std.fmt.comptimePrint;
 
     const text = switch (help_for) {
