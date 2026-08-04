@@ -32,13 +32,14 @@ const Allocator = std.mem.Allocator;
 
 const Server = @This();
 
+app: *App,
+max_connections: usize,
 // Zig reserves 16 MiB for every thread by default. A CDP worker does run V8,
 // so keep considerably more headroom than a plain socket thread while still
 // avoiding 256 MiB of virtual address space at the default 16 connections.
-const worker_stack_size = 4 * 1024 * 1024;
-
-app: *App,
-max_connections: usize,
+// See Config.cdpWorkerStackSize for the floor and the --cdp-worker-stack-size
+// override.
+worker_stack_size: usize,
 json_version_response: []const u8,
 
 active_threads: std.atomic.Value(u32) = .init(0),
@@ -56,6 +57,7 @@ pub fn init(app: *App, address: sys_net.IpAddress) !*Server {
         .cdp_pool = .empty,
         .json_version_response = "",
         .max_connections = app.config.maxConnections(),
+        .worker_stack_size = app.config.cdpWorkerStackSize(),
     };
     errdefer self.cdp_pool.deinit(app.allocator);
     errdefer self.cdps.deinit(app.allocator);
@@ -180,7 +182,7 @@ fn spawnWorker(self: *Server, socket: posix.socket_t) !void {
     }
     errdefer _ = self.active_threads.fetchSub(1, .release);
 
-    const thread = try std.Thread.spawn(.{ .stack_size = worker_stack_size }, handleConnection, .{ self, socket });
+    const thread = try std.Thread.spawn(.{ .stack_size = self.worker_stack_size }, handleConnection, .{ self, socket });
     thread.detach();
 }
 

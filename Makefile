@@ -12,6 +12,7 @@ F=
 ZIGFLAGS ?=
 PI_OPTIMIZE ?= ReleaseSmall
 PI_JOBS ?= 1
+BENCH_ITERS ?= 5
 
 # OS and ARCH
 kernel = $(shell uname -ms)
@@ -131,6 +132,10 @@ run-debug: build-dev
 
 test:
 	TEST_FILTER="${F}" $(ZIG) build $(ZIGFLAGS) test -freference-trace
+
+## Measure cold-start time, peak RSS and binary size (BENCH_ITERS=5)
+bench:
+	@bench/run.sh zig-out/bin/lightpanda $(BENCH_ITERS)
 
 ## Run demo/runner end to end tests
 end2end:

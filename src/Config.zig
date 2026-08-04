@@ -51,6 +51,26 @@ pub const ResourceProfile = enum {
     pi,
 };
 
+/// A session owns a V8 isolate, its arena and a live DOM: roughly 22 MiB before
+/// the page does anything. Deriving the *default* concurrency cap from physical
+/// memory makes a small board refuse the session up front rather than OOM
+/// half-way through one. An explicit --cdp-max-connections / --max-connections
+/// / --max-sessions bypasses this entirely.
+const session_memory_floor = 22 * 1024 * 1024;
+
+/// Held back for the OS, the shared snapshot mapping and everything that is not
+/// a session.
+/// ponytail: physical memory, not free memory — a co-tenant process is
+/// invisible here. Read /proc/meminfo MemAvailable if that starts to matter.
+const reserved_system_memory = 256 * 1024 * 1024;
+
+fn memoryCappedSessions(default: u16) u16 {
+    const total = std.process.totalSystemMemory() catch return default;
+    const affordable = (total -| reserved_system_memory) / session_memory_floor;
+    if (affordable == 0) return 1;
+    return @min(default, std.math.lossyCast(u16, affordable));
+}
+
 fn logFilterScopesValidator(allocator: Allocator, args: *std.process.Args.Iterator, list: *std.ArrayList(log.FilterRule)) !void {
     const str = args.next() orelse return error.InvalidOption;
 
@@ -357,6 +377,7 @@ const Commands = cli.Builder(.{
             .{ .name = "cdp_max_captured_responses", .type = ?usize },
             // Don't widen this without growing the reader buffer in the HTTP path.
             .{ .name = "cdp_max_http_message_size", .type = u14, .default = 4096 },
+            .{ .name = "cdp_worker_stack_size", .type = ?usize },
             .{ .name = "disable_metrics", .type = bool },
         },
         .shared_options = CommonOptions,
@@ -862,16 +883,36 @@ pub fn blockedUrlPatterns(self: *const Config) ?std.mem.SplitIterator(u8, .scala
 
 pub fn maxConnections(self: *const Config) u16 {
     return switch (self.mode) {
-        .serve => |opts| opts.cdp_max_connections orelse if (self.resourceProfile() == .pi) 2 else 16,
+        .serve => |opts| opts.cdp_max_connections orelse
+            memoryCappedSessions(if (self.resourceProfile() == .pi) 2 else 16),
         .render => |opts| blk: {
             const default: u16 = if (self.resourceProfile() == .pi) 2 else 8;
-            break :blk @max(opts.max_connections orelse default, 1);
+            break :blk @max(opts.max_connections orelse memoryCappedSessions(default), 1);
         },
         .mcp => |opts| blk: {
             const default: u16 = if (self.resourceProfile() == .pi) 2 else 16;
-            break :blk @max(opts.max_connections orelse default, 1);
+            break :blk @max(opts.max_connections orelse memoryCappedSessions(default), 1);
         },
         .fetch, .agent => 0,
+        else => unreachable,
+    };
+}
+
+/// Stack for the per-connection CDP thread. Unlike the render/mcp servers,
+/// where one long-lived worker runs V8 and the connection threads only shuffle
+/// bytes, the CDP connection thread *is* the V8 thread, so this is paid once
+/// per connection. It has to hold V8's own JS limit (`--stack-size`, 984 KiB by
+/// default) plus the native frames beneath it, hence the 2 MiB floor: below
+/// that, deep recursion hits the guard page instead of throwing RangeError.
+///
+/// Thread stacks are lazily committed, so shrinking this buys address space
+/// rather than resident memory — it matters on 32-bit ARM builds, not on
+/// aarch64.
+pub fn cdpWorkerStackSize(self: *const Config) usize {
+    const min_stack: usize = 2 * 1024 * 1024;
+    return switch (self.mode) {
+        .serve => |opts| @max(opts.cdp_worker_stack_size orelse
+            if (self.resourceProfile() == .pi) min_stack else 4 * 1024 * 1024, min_stack),
         else => unreachable,
     };
 }
@@ -942,7 +983,7 @@ pub fn mcpMaxSessions(self: *const Config) u16 {
         else => unreachable,
     };
     const default: u16 = if (profile == .pi) 2 else 16;
-    return @max(configured orelse default, 1);
+    return @max(configured orelse memoryCappedSessions(default), 1);
 }
 
 pub fn mcpMaxResponseSize(self: *const Config) usize {
@@ -1334,6 +1375,49 @@ test "Config: pi resource profile bounds expensive defaults" {
     try std.testing.expectEqual(@as(u32, 256 * 1024), config.cdpMaxMessageSize());
     try std.testing.expectEqual(@as(?usize, 8 * 1024 * 1024), config.cdpMaxCapturedResponseSize());
     try std.testing.expectEqual(@as(?usize, 256), config.cdpMaxCapturedResponses());
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), config.cdpWorkerStackSize());
+}
+
+test "Config: cdpWorkerStackSize honours the override but keeps a floor" {
+    {
+        var config = try Config.init(std.testing.allocator, "test", .{ .serve = .{} });
+        defer config.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), config.cdpWorkerStackSize());
+    }
+
+    {
+        var config = try Config.init(std.testing.allocator, "test", .{ .serve = .{
+            .cdp_worker_stack_size = 8 * 1024 * 1024,
+        } });
+        defer config.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), config.cdpWorkerStackSize());
+    }
+
+    {
+        // Below V8's own stack limit the guard page, not RangeError, ends deep
+        // recursion, so an undersized override is clamped rather than obeyed.
+        var config = try Config.init(std.testing.allocator, "test", .{ .serve = .{
+            .cdp_worker_stack_size = 64 * 1024,
+        } });
+        defer config.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), config.cdpWorkerStackSize());
+    }
+}
+
+test "Config: session caps stay within physical memory" {
+    // The cap only bites on boards smaller than the profile assumes, so assert
+    // the invariants rather than a machine-specific number.
+    try std.testing.expectEqual(@as(u16, 1), memoryCappedSessions(1));
+    try std.testing.expect(memoryCappedSessions(16) >= 1);
+    try std.testing.expect(memoryCappedSessions(16) <= 16);
+    try std.testing.expect(memoryCappedSessions(std.math.maxInt(u16)) >= 1);
+
+    var config = try Config.init(std.testing.allocator, "test", .{ .serve = .{
+        .cdp_max_connections = 4096,
+    } });
+    defer config.deinit(std.testing.allocator);
+    // An explicit flag is an operator decision and bypasses the cap.
+    try std.testing.expectEqual(@as(u16, 4096), config.maxConnections());
 }
 
 test "Config: explicit limits override pi profile defaults" {
