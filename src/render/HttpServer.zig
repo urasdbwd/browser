@@ -902,8 +902,11 @@ fn serveLiveWebSocket(
     var owner: u64 = undefined;
     std.Io.random(lp.io, std.mem.asBytes(&owner));
     if (owner == 0) owner = 1;
-    var last_snapshot_hash: ?u64 = null;
-    var last_snapshot_len: usize = 0;
+    // The last snapshot this connection transmitted. It is the base every delta
+    // is measured against, and comparing against it gives the identical-frame
+    // check for free. Per connection, because the client's copy is too.
+    var base: std.ArrayList(u8) = .empty;
+    defer base.deinit(self.allocator);
 
     defer {
         var close_job: Job = .{
@@ -973,21 +976,28 @@ fn serveLiveWebSocket(
                 job.result = .response_too_large;
             }
         }
+        var delta: ?SnapshotDelta = null;
         if (job.result == .ok and job.live_outcome.snapshot) {
             const snapshot = out.buffered();
-            const hash = std.hash.Wyhash.hash(0, snapshot);
-            if (last_snapshot_hash == hash and last_snapshot_len == snapshot.len) {
+            if (std.mem.eql(u8, base.items, snapshot)) {
                 job.live_outcome.snapshot = false;
                 job.live_outcome.target_version = null;
             } else {
-                last_snapshot_hash = hash;
-                last_snapshot_len = snapshot.len;
+                // Measured against the base the client still holds, before the
+                // base advances to what we are about to send.
+                delta = snapshotDelta(base.items, snapshot);
+                base.clearRetainingCapacity();
+                // A base we could not keep only costs the next frame its delta:
+                // an empty base yields no delta, so a full snapshot resyncs us.
+                base.appendSlice(self.allocator, snapshot) catch
+                    base.clearRetainingCapacity();
             }
         }
         try sendLiveResult(
             websocket,
             &job,
             out.buffered(),
+            delta,
             compression_preferences,
             &encoded,
         );
@@ -1003,6 +1013,42 @@ const EncodedLiveSnapshot = struct {
     bytes: []const u8,
     encoding: Compression.Encoding,
 };
+
+const SnapshotDelta = struct {
+    prefix: usize,
+    suffix: usize,
+    base_bytes: usize,
+    body: []const u8,
+};
+
+/// Shared head, shared tail, changed middle, measured against the last snapshot
+/// this connection transmitted. A live document is re-serialized in full on
+/// every update, so without this an animating page pays its whole document size
+/// per frame for a handful of changed attributes.
+///
+/// Returns null when a full snapshot is the better wire, which also covers the
+/// first frame of every connection.
+// ponytail: one window, so edits at both ends of a document fall back to the
+// full snapshot. Upgrade path if that shows up in real traffic: a block-hash
+// rolling diff emitting several windows over the same three wire fields.
+fn snapshotDelta(base: []const u8, snapshot: []const u8) ?SnapshotDelta {
+    if (base.len == 0 or snapshot.len == 0) return null;
+    const limit = @min(base.len, snapshot.len);
+    var prefix: usize = 0;
+    while (prefix < limit and base[prefix] == snapshot[prefix]) prefix += 1;
+    var suffix: usize = 0;
+    while (suffix < limit - prefix and
+        base[base.len - 1 - suffix] == snapshot[snapshot.len - 1 - suffix]) suffix += 1;
+    const body = snapshot[prefix .. snapshot.len - suffix];
+    // Only worth the extra client step when it saves most of the document.
+    if (body.len * 2 >= snapshot.len) return null;
+    return .{
+        .prefix = prefix,
+        .suffix = suffix,
+        .base_bytes = base.len,
+        .body = body,
+    };
+}
 
 fn encodeLiveSnapshot(
     snapshot: []const u8,
@@ -1033,27 +1079,38 @@ fn sendLiveResult(
     websocket: *std.http.Server.WebSocket,
     job: *const Job,
     snapshot: []const u8,
+    delta: ?SnapshotDelta,
     compression_preferences: Compression.Preferences,
     encoded_buffer: *ResponseBuffer,
 ) !void {
+    // A delta ships only its changed middle; the client rebuilds the document
+    // from the frame it already holds.
+    const body = if (delta) |value| value.body else snapshot;
     const payload = if (job.result == .ok and job.live_outcome.snapshot)
-        encodeLiveSnapshot(snapshot, compression_preferences, encoded_buffer)
+        encodeLiveSnapshot(body, compression_preferences, encoded_buffer)
     else
         EncodedLiveSnapshot{ .bytes = &.{}, .encoding = .identity };
 
     var buffer: [512]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
-    try writeLiveMetadata(job, payload.encoding, snapshot.len, &writer);
+    try writeLiveMetadata(job, payload.encoding, body.len, delta, &writer);
     try websocket.writeMessage(writer.buffered(), .text);
     if (job.result == .ok and job.live_outcome.snapshot) {
         try websocket.writeMessage(payload.bytes, .binary);
     }
 }
 
+const LiveDeltaMetadata = struct {
+    prefix: usize,
+    suffix: usize,
+    base_bytes: usize,
+};
+
 fn writeLiveMetadata(
     job: *const Job,
     encoding: Compression.Encoding,
     snapshot_bytes: usize,
+    delta: ?SnapshotDelta,
     writer: *std.Io.Writer,
 ) !void {
     if (job.result == .ok) {
@@ -1061,6 +1118,14 @@ fn writeLiveMetadata(
         const version_storage = job.live_outcome.target_version;
         const target_version: ?[]const u8 = if (version_storage) |*version| version else null;
         const snapshot_encoding: ?[]const u8 = if (has_snapshot) @tagName(encoding) else null;
+        // `base_bytes` lets the client prove it is patching the document the
+        // server measured against; a desync becomes a loud protocol error
+        // instead of a silently corrupted page.
+        const snapshot_delta: ?LiveDeltaMetadata = if (has_snapshot) if (delta) |value| .{
+            .prefix = value.prefix,
+            .suffix = value.suffix,
+            .base_bytes = value.base_bytes,
+        } else null else null;
         try std.json.Stringify.value(.{
             .id = job.live_outcome.id,
             .ok = true,
@@ -1070,6 +1135,7 @@ fn writeLiveMetadata(
             .target_version = target_version,
             .snapshot_encoding = snapshot_encoding,
             .snapshot_bytes = if (has_snapshot) snapshot_bytes else 0,
+            .snapshot_delta = snapshot_delta,
             .can_go_back = job.live_outcome.can_go_back,
             .can_go_forward = job.live_outcome.can_go_forward,
         }, .{}, writer);
@@ -1395,24 +1461,24 @@ test "render server: live metadata carries target version and stale error" {
 
     var metadata_buffer: [512]u8 = undefined;
     var metadata: std.Io.Writer = .fixed(&metadata_buffer);
-    try writeLiveMetadata(&job, .br, 4_096, &metadata);
+    try writeLiveMetadata(&job, .br, 4_096, null, &metadata);
     try std.testing.expectEqualStrings(
-        "{\"id\":7,\"ok\":true,\"snapshot\":true,\"closed\":false,\"warning\":null,\"target_version\":\"0123456789abcdef\",\"snapshot_encoding\":\"br\",\"snapshot_bytes\":4096,\"can_go_back\":false,\"can_go_forward\":false}",
+        "{\"id\":7,\"ok\":true,\"snapshot\":true,\"closed\":false,\"warning\":null,\"target_version\":\"0123456789abcdef\",\"snapshot_encoding\":\"br\",\"snapshot_bytes\":4096,\"snapshot_delta\":null,\"can_go_back\":false,\"can_go_forward\":false}",
         metadata.buffered(),
     );
 
     job.live_outcome = .{ .id = 7 };
     metadata = .fixed(&metadata_buffer);
-    try writeLiveMetadata(&job, .identity, 0, &metadata);
+    try writeLiveMetadata(&job, .identity, 0, null, &metadata);
     try std.testing.expectEqualStrings(
-        "{\"id\":7,\"ok\":true,\"snapshot\":false,\"closed\":false,\"warning\":null,\"target_version\":null,\"snapshot_encoding\":null,\"snapshot_bytes\":0,\"can_go_back\":false,\"can_go_forward\":false}",
+        "{\"id\":7,\"ok\":true,\"snapshot\":false,\"closed\":false,\"warning\":null,\"target_version\":null,\"snapshot_encoding\":null,\"snapshot_bytes\":0,\"snapshot_delta\":null,\"can_go_back\":false,\"can_go_forward\":false}",
         metadata.buffered(),
     );
 
     job.result = .stale_target;
     job.live_outcome = .{ .id = 8 };
     metadata = .fixed(&metadata_buffer);
-    try writeLiveMetadata(&job, .identity, 0, &metadata);
+    try writeLiveMetadata(&job, .identity, 0, null, &metadata);
     try std.testing.expectEqualStrings(
         "{\"id\":8,\"ok\":false,\"error\":\"live target is stale\"}",
         metadata.buffered(),
@@ -1421,11 +1487,62 @@ test "render server: live metadata carries target version and stale error" {
     job.result = .response_too_large;
     job.live_outcome = .{ .id = 9 };
     metadata = .fixed(&metadata_buffer);
-    try writeLiveMetadata(&job, .identity, 0, &metadata);
+    try writeLiveMetadata(&job, .identity, 0, null, &metadata);
     try std.testing.expectEqualStrings(
         "{\"id\":9,\"ok\":false,\"error\":\"render snapshot too large\"}",
         metadata.buffered(),
     );
+}
+
+test "render server: a live delta ships only the region that moved" {
+    const head = "<!doctype html><html><body>" ++ ("<p>static</p>" ** 200);
+    const tail = ("<p>tail</p>" ** 200) ++ "</body></html>";
+    const first = head ++ "<b>0</b>" ++ tail;
+    const second = head ++ "<b>1</b>" ++ tail;
+
+    const delta = snapshotDelta(first, second).?;
+    try std.testing.expectEqual(first.len, delta.base_bytes);
+    try std.testing.expectEqualStrings("1", delta.body);
+    // The three wire fields must rebuild the document exactly.
+    try std.testing.expectEqualStrings(first[0..delta.prefix], second[0..delta.prefix]);
+    try std.testing.expectEqualStrings(
+        first[first.len - delta.suffix ..],
+        second[second.len - delta.suffix ..],
+    );
+    try std.testing.expectEqual(second.len, delta.prefix + delta.body.len + delta.suffix);
+
+    // No base yet (the first frame of a connection) and a document that changed
+    // too much to be worth patching both fall back to the full snapshot.
+    try std.testing.expect(snapshotDelta("", second) == null);
+    try std.testing.expect(snapshotDelta(first, "") == null);
+    try std.testing.expect(snapshotDelta("aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb") == null);
+
+    // Growth and shrinkage keep the shared head and tail, and the window is
+    // trimmed to what actually differs -- the leading "0" is shared here.
+    const longer = head ++ "<b>0123</b>" ++ tail;
+    const grown = snapshotDelta(first, longer).?;
+    try std.testing.expectEqualStrings("123", grown.body);
+    try std.testing.expectEqual(longer.len, grown.prefix + grown.body.len + grown.suffix);
+    const shrunk = snapshotDelta(longer, first).?;
+    try std.testing.expectEqualStrings("", shrunk.body);
+    try std.testing.expectEqual(first.len, shrunk.prefix + shrunk.body.len + shrunk.suffix);
+
+    var metadata_buffer: [512]u8 = undefined;
+    var metadata: std.Io.Writer = .fixed(&metadata_buffer);
+    var sink_buffer: [1]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buffer);
+    const version: [16]u8 = "0123456789abcdef".*;
+    var job: Job = .{
+        .body = "",
+        .out = &sink,
+        .live_outcome = .{ .id = 3, .snapshot = true, .target_version = version },
+    };
+    try writeLiveMetadata(&job, .identity, delta.body.len, delta, &metadata);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        metadata.buffered(),
+        "\"snapshot_bytes\":1,\"snapshot_delta\":{\"prefix\":",
+    ) != null);
 }
 
 test "render server: live snapshot compression is negotiated and bounded" {

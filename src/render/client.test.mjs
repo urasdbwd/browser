@@ -622,3 +622,48 @@ test("mousedown and mouseup are forwarded without coalescing", async () => {
     globalThis.fetch = original.fetch;
   }
 });
+
+test("a snapshot delta rebuilds the document the server measured against", async () => {
+  const { applySnapshotDelta } = await loadRenderer();
+  const encode = (text) => new TextEncoder().encode(text);
+  const decode = (bytes) => new TextDecoder().decode(bytes);
+
+  const head = "<!doctype html><html><body><p>static</p>";
+  const tail = "<p>tail</p></body></html>";
+  const base = encode(head + "<b>0</b>" + tail);
+
+  // The server ships the shared head length, the shared tail length and only
+  // the literal bytes between them.
+  const prefix = (head + "<b>").length;
+  const suffix = ("</b>" + tail).length;
+  const at = (body, over = {}) => applySnapshotDelta(base, encode(body).buffer, {
+    prefix,
+    suffix,
+    base_bytes: base.byteLength,
+    ...over,
+  });
+
+  assert.equal(decode(at("1")), head + "<b>1</b>" + tail);
+  // Growth and shrinkage of the changed region both round-trip.
+  assert.equal(decode(at("1234")), head + "<b>1234</b>" + tail);
+  assert.equal(decode(at("")), head + "<b></b>" + tail);
+
+  // Patching the wrong document would corrupt the page silently, so every way
+  // the two sides can drift apart has to throw instead.
+  assert.throws(
+    () => applySnapshotDelta(null, encode("1").buffer, {
+      prefix,
+      suffix,
+      base_bytes: base.byteLength,
+    }),
+    /does not match the held document/,
+  );
+  assert.throws(() => at("1", { base_bytes: base.byteLength + 1 }), /does not match/);
+  assert.throws(
+    () => at("1", { prefix: base.byteLength, suffix: base.byteLength }),
+    /does not match/,
+  );
+  for (const bad of [-1, 1.5, "3", null, undefined, NaN]) {
+    assert.throws(() => at("1", { prefix: bad }), /malformed|does not match/);
+  }
+});
