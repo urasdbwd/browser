@@ -8,6 +8,25 @@
   <div id=w></div>
   <button type=submit>submit</button>
 </form>
+<script>
+  // Turnstile builds its widget inside a CLOSED shadow root, so the iframe is
+  // invisible to document.querySelectorAll('iframe') — in Chrome too. Hook
+  // attachShadow before api.js loads so the probe can look inside and report
+  // the iframe that is actually there. Without this the lifecycle line reads
+  // `iframe=false` on a perfectly healthy page.
+  const shadowRoots = [];
+  const attachShadow = Element.prototype.attachShadow;
+  Element.prototype.attachShadow = function (init) {
+    const root = attachShadow.call(this, init);
+    shadowRoots.push(root);
+    return root;
+  };
+  function shadowIframes() {
+    let n = 0;
+    for (const root of shadowRoots) n += root.querySelectorAll('iframe').length;
+    return n;
+  }
+</script>
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 <script>
   const KEYS = {
@@ -31,6 +50,7 @@
       ' apiLoaded=' + (typeof window.turnstile !== 'undefined') +
       ' widget=' + !!document.querySelector('.cf-turnstile') +
       ' iframe=' + !!iframe +
+      ' shadowIframes=' + shadowIframes() +
       ' input=' + !!input +
       ' tokenLen=' + (input && input.value ? input.value.length : 0) +
       ' title=' + JSON.stringify(document.title));

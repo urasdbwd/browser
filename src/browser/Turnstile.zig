@@ -157,7 +157,13 @@ pub fn hasToken(session: *Session) bool {
 }
 
 fn frameToken(frame: *Frame) ?[]const u8 {
-    if (ownToken(frame)) |t| return t;
+    // A challenge frame carries its own copy of the response value, and it has
+    // one before the host page does. Only the host document's input is what a
+    // real site reads and submits, so a challenge frame is never the answer:
+    // reporting `.solved` off it hands the caller a token the page never got.
+    if (isChallengeFrame(frame) == false) {
+        if (ownToken(frame)) |t| return t;
+    }
     for (frame.child_frames.items) |child| {
         if (frameToken(child)) |t| return t;
     }

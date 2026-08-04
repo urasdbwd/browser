@@ -197,7 +197,10 @@ pub const FetchOpts = struct {
 /// Loads each url in `urls` in a fresh session and waits per `opts`.
 ///
 /// Errors:
-///   - `error.Timeout` if the wait deadline (`opts.wait_ms`) expires.
+///   - `error.Timeout` if a wait the caller asked for (`wait_until`,
+///     `wait_selector`, `wait_script`) does not resolve within `opts.wait_ms`.
+///     The implicit "settle the page" wait we do when the caller asked for
+///     none of those is best-effort and never fails.
 ///   - `error.Cancelled` if the embedder installed a `Session.cancel_hook`
 ///     that returned true during the wait. The hook is opt-in via
 ///     `session.cancel_hook = .{...}`; without it, this error never fires.
@@ -265,7 +268,15 @@ pub fn fetch(app: *App, browser: *Browser, urls: []const [:0]const u8, opts: Fet
         // We default to .done if both wait_selector and wait_script are null
         // This allows the caller to ONLY --wait-selector or ONLY --wait-script
         // or combine --wait-until WITH --wait-selector/script
-        try runner.waitForAll(opts.wait_ms, .{ .until = .done });
+        //
+        // Best-effort: nobody asked for this deadline, so hitting it is not a
+        // failure. Plenty of real pages never go idle — a Cloudflare challenge
+        // frame polls for the lifetime of the document — and dumping what we
+        // have beats exiting fatal with no output at all.
+        runner.waitForAll(opts.wait_ms, .{ .until = .done }) catch |err| switch (err) {
+            error.Timeout => {},
+            else => return err,
+        };
     }
 
     if (opts.wait_selector) |selector| {
