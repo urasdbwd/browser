@@ -122,7 +122,7 @@ pub fn context2d(self: *Canvas) ?*CanvasRenderingContext2D {
     const cached = self._cached orelse return null;
     return switch (cached) {
         .@"2d" => |ctx| ctx,
-        .webgl => null,
+        .webgl, .webgl2 => null,
     };
 }
 
