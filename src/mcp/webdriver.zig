@@ -74,6 +74,13 @@ const Command = enum {
     get_element_attribute,
     is_element_selected,
     is_element_enabled,
+    get_element_text,
+    get_element_css_value,
+    element_click,
+    element_clear,
+    element_send_keys,
+    execute_sync,
+    execute_async,
 };
 
 const Route = struct {
@@ -145,6 +152,13 @@ pub fn handle(
         .get_element_attribute => getElementAttribute(session, arena, route.element_id.?, route.attribute_name.?, out),
         .is_element_selected => isElementSelected(session, route.element_id.?, out),
         .is_element_enabled => isElementEnabled(session, route.element_id.?, out),
+        .get_element_text => getElementText(session, arena, route.element_id.?, out),
+        .get_element_css_value => getElementCssValue(session, arena, route.element_id.?, route.attribute_name.?, out),
+        .element_click => elementClick(session, route.element_id.?, out),
+        .element_clear => elementClear(session, route.element_id.?, out),
+        .element_send_keys => elementSendKeys(session, arena, route.element_id.?, body, out),
+        .execute_sync => executeScript(server, session, arena, body, false, out),
+        .execute_async => executeScript(server, session, arena, body, true, out),
         else => unreachable,
     };
 }
@@ -782,33 +796,36 @@ fn elementReference(session: *Server.Session, element: *Element) !ElementReferen
     return .{ .session_id = session.id, .node_id = node.id };
 }
 
-fn resolveElement(session: *Server.Session, id: []const u8, out: *std.Io.Writer) !?*Element {
-    const frame = primaryFrame(session) orelse {
-        _ = try sendError(out, .not_found, "no such window", "Current browsing context has no document");
-        return null;
-    };
-    const node_id = parseElementId(session, id) orelse {
-        _ = try sendError(out, .not_found, "no such element", "Unknown element reference");
-        return null;
-    };
-    if (!session.webdriver_elements.isIssued(node_id)) {
-        _ = try sendError(out, .not_found, "no such element", "Unknown element reference");
-        return null;
-    }
-    const node = session.node_registry.lookup_by_id.get(node_id) orelse {
-        _ = try sendError(out, .not_found, "stale element reference", "Element belongs to an inactive document");
-        return null;
-    };
-    const element = node.dom.is(Element) orelse {
-        _ = try sendError(out, .not_found, "stale element reference", "Element reference no longer identifies an element");
-        return null;
-    };
+const ElementLookup = union(enum) {
+    element: *Element,
+    no_window,
+    no_such_element,
+    stale: []const u8,
+};
+
+fn lookupElement(session: *Server.Session, id: []const u8) ElementLookup {
+    const frame = primaryFrame(session) orelse return .no_window;
+    const node_id = parseElementId(session, id) orelse return .no_such_element;
+    if (!session.webdriver_elements.isIssued(node_id)) return .no_such_element;
+    const node = session.node_registry.lookup_by_id.get(node_id) orelse
+        return .{ .stale = "Element belongs to an inactive document" };
+    const element = node.dom.is(Element) orelse
+        return .{ .stale = "Element reference no longer identifies an element" };
     const element_node = element.asNode();
     if (!element_node.isConnected() or element_node.ownerDocument(frame) != frame.document) {
-        _ = try sendError(out, .not_found, "stale element reference", "Element is no longer attached to the DOM");
-        return null;
+        return .{ .stale = "Element is no longer attached to the DOM" };
     }
-    return element;
+    return .{ .element = element };
+}
+
+fn resolveElement(session: *Server.Session, id: []const u8, out: *std.Io.Writer) !?*Element {
+    switch (lookupElement(session, id)) {
+        .element => |element| return element,
+        .no_window => _ = try sendError(out, .not_found, "no such window", "Current browsing context has no document"),
+        .no_such_element => _ = try sendError(out, .not_found, "no such element", "Unknown element reference"),
+        .stale => |message| _ = try sendError(out, .not_found, "stale element reference", message),
+    }
+    return null;
 }
 
 fn parseElementId(session: *const Server.Session, id: []const u8) ?u32 {
@@ -882,6 +899,211 @@ fn waitForImplicitPoll(session: *Server.Session, frame_id: u32, remaining_ms: ?u
                 lp.io.sleep(.fromMilliseconds(@intCast(@min(recommended_sleep_ms, poll_ms))), .awake) catch {};
             }
         },
+    }
+}
+
+// The W3C "execute script" steps, minus the parts that need a Zig-side JSON
+// walker: the result is serialized by JSON.stringify with a replacer, so
+// cycles, toJSON and nested structures follow the platform's own semantics.
+// `__lp_ref` mints an element reference from the live element, `__lp_done` is
+// the async completion callback.
+const script_harness =
+    \\const K = "element-6066-11e4-a52e-4f735466cecf";
+    \\const serialize = (value) => JSON.stringify(
+    \\  value === undefined ? null : value,
+    \\  (key, item) => (item instanceof Element) ? { [K]: __lp_ref(item) } : item,
+    \\) ?? "null";
+    \\const args = Array.prototype.slice.call(__lp_args);
+    \\if (__lp_async) args.push((value) => __lp_done(serialize(value)));
+    \\const returned = (new Function(__lp_body)).apply(this, args);
+    \\return __lp_async ? "" : serialize(returned);
+;
+
+const ScriptBridge = struct {
+    session: *Server.Session,
+    arena: Allocator,
+    completed: ?[]const u8 = null,
+
+    fn ref(self: *ScriptBridge, element: *Element) ![]const u8 {
+        const reference = try elementReference(self.session, element);
+        return std.fmt.allocPrint(self.arena, "{s}-{d}", .{ reference.session_id, reference.node_id });
+    }
+
+    fn done(self: *ScriptBridge, serialized: []const u8) !void {
+        // Only the first invocation settles the command, per W3C.
+        if (self.completed == null) self.completed = try self.arena.dupe(u8, serialized);
+    }
+};
+
+const ScriptOutcome = union(enum) {
+    /// Raw JSON, already serialized by the harness.
+    value: []const u8,
+    /// Async script started; the completion callback has not fired yet.
+    pending,
+    javascript_error: struct { message: []const u8, stacktrace: []const u8 },
+    timeout,
+    invalid_argument: []const u8,
+    no_such_element,
+    stale_element: []const u8,
+    unknown_error: []const u8,
+};
+
+fn executeScript(
+    server: *Server,
+    session: *Server.Session,
+    arena: Allocator,
+    body: []const u8,
+    is_async: bool,
+    out: *std.Io.Writer,
+) !std.http.Status {
+    const frame = primaryFrame(session) orelse
+        return sendError(out, .not_found, "no such window", "Current browsing context has no document");
+
+    var bridge: ScriptBridge = .{ .session = session, .arena = arena };
+    var wait = ImplicitWait.init(session, server.webdriverScriptTimeout());
+    defer wait.deinit(session);
+
+    var outcome = runScript(session, arena, frame, body, is_async, &bridge, &wait);
+    if (outcome == .pending) {
+        while (bridge.completed == null) {
+            if (wait.expired(session) or session.browser.env.terminatePending()) {
+                outcome = if (wait.finish(session)) .timeout else .{ .unknown_error = "Script execution was cancelled" };
+                break;
+            }
+            waitForImplicitPoll(session, frame._frame_id, wait.remaining()) catch |err| {
+                outcome = if (wait.finish(session)) .timeout else .{ .unknown_error = @errorName(err) };
+                break;
+            };
+        }
+        if (bridge.completed) |serialized| outcome = .{ .value = serialized };
+    }
+    _ = wait.finish(session);
+
+    return switch (outcome) {
+        .value => |json| sendRawValue(out, json),
+        .pending => sendError(out, .internal_server_error, "unknown error", "Script did not produce a result"),
+        .javascript_error => |failure| sendErrorWithStack(
+            out,
+            .internal_server_error,
+            "javascript error",
+            failure.message,
+            failure.stacktrace,
+        ),
+        .timeout => sendError(out, .internal_server_error, "script timeout", "Script execution exceeded the session script timeout"),
+        .invalid_argument => |message| sendError(out, .bad_request, "invalid argument", message),
+        .no_such_element => sendError(out, .not_found, "no such element", "Unknown element reference in script arguments"),
+        .stale_element => |message| sendError(out, .not_found, "stale element reference", message),
+        .unknown_error => |message| sendError(out, .internal_server_error, "unknown error", message),
+    };
+}
+
+// Everything that needs the frame's V8 context. Kept in its own function so the
+// local scope closes before the async completion loop pumps the event loop.
+fn runScript(
+    session: *Server.Session,
+    arena: Allocator,
+    frame: *lp.Frame,
+    body: []const u8,
+    is_async: bool,
+    bridge: *ScriptBridge,
+    wait: *ImplicitWait,
+) ScriptOutcome {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch
+        return .{ .invalid_argument = "Execute Script parameters must be a JSON object" };
+    if (parsed != .object) return .{ .invalid_argument = "Execute Script parameters must be a JSON object" };
+    const script = parsed.object.get("script") orelse
+        return .{ .invalid_argument = "Execute Script requires a script string" };
+    const arguments = parsed.object.get("args") orelse
+        return .{ .invalid_argument = "Execute Script requires an args array" };
+    if (script != .string) return .{ .invalid_argument = "Execute Script requires a script string" };
+    if (arguments != .array) return .{ .invalid_argument = "Execute Script requires an args array" };
+
+    var scope: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&scope);
+    defer scope.deinit();
+    const local = &scope.local;
+
+    const js_args = local.newArray(@intCast(arguments.array.items.len));
+    for (arguments.array.items, 0..) |item, i| {
+        const value = deserializeArgument(session, local, item) catch |err| return switch (err) {
+            error.NoSuchElement => .no_such_element,
+            error.StaleElement => .{ .stale_element = "Element argument is no longer attached to the DOM" },
+            error.NoWindow => .{ .stale_element = "Element argument belongs to an inactive document" },
+            else => .{ .unknown_error = @errorName(err) },
+        };
+        _ = js_args.set(@intCast(i), value, .{}) catch |err| return .{ .unknown_error = @errorName(err) };
+    }
+
+    const harness = local.compileFunction(
+        script_harness,
+        &.{ "__lp_body", "__lp_args", "__lp_async", "__lp_ref", "__lp_done" },
+        &.{},
+    ) catch |err| return .{ .unknown_error = @errorName(err) };
+
+    var caught: lp.js.TryCatch.Caught = undefined;
+    const returned = harness.tryCall(lp.js.Value, .{
+        script.string,
+        js_args.toValue(),
+        is_async,
+        local.newCallback(ScriptBridge.ref, bridge),
+        local.newCallback(ScriptBridge.done, bridge),
+    }, &caught) catch |err| {
+        if (err == error.ExecutionTerminated or wait.expired(session)) return .timeout;
+        const message = arena.dupe(u8, caught.exception orelse @errorName(err)) catch
+            return .{ .unknown_error = "Out of memory" };
+        const stacktrace = arena.dupe(u8, caught.stack orelse "") catch
+            return .{ .unknown_error = "Out of memory" };
+        return .{ .javascript_error = .{ .message = message, .stacktrace = stacktrace } };
+    };
+
+    if (is_async) return if (bridge.completed) |serialized| .{ .value = serialized } else .pending;
+
+    const serialized = returned.toStringSliceWithAlloc(arena) catch |err|
+        return .{ .unknown_error = @errorName(err) };
+    return .{ .value = serialized };
+}
+
+// W3C JSON deserialization: element references resolve to the live element,
+// everything else maps straight across.
+fn deserializeArgument(
+    session: *Server.Session,
+    local: *const lp.js.Local,
+    value: std.json.Value,
+) !lp.js.Value {
+    switch (value) {
+        .object => |object| {
+            if (object.get(element_key)) |reference| {
+                if (reference != .string) return error.NoSuchElement;
+                return switch (lookupElement(session, reference.string)) {
+                    .element => |element| local.zigValueToJs(element, .{}),
+                    .no_such_element => error.NoSuchElement,
+                    .stale => error.StaleElement,
+                    .no_window => error.NoWindow,
+                };
+            }
+            const js_object = local.newObject();
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                const child = try deserializeArgument(session, local, entry.value_ptr.*);
+                _ = try js_object.set(entry.key_ptr.*, child, .{});
+            }
+            return js_object.toValue();
+        },
+        .array => |array| {
+            const js_array = local.newArray(@intCast(array.items.len));
+            for (array.items, 0..) |item, i| {
+                _ = try js_array.set(@intCast(i), try deserializeArgument(session, local, item), .{});
+            }
+            return js_array.toValue();
+        },
+        // Scalars are unwrapped rather than handed to zigValueToJs as a
+        // std.json.Value: that instantiation closes an inferred-error-set
+        // cycle between zigJsonToJs and Array.set.
+        .null => return local.zigValueToJs(null, .{}),
+        .bool => |scalar| return local.zigValueToJs(scalar, .{}),
+        .integer => |scalar| return local.zigValueToJs(scalar, .{}),
+        .float => |scalar| return local.zigValueToJs(scalar, .{}),
+        .string, .number_string => |scalar| return local.zigValueToJs(scalar, .{}),
     }
 }
 
@@ -1018,6 +1240,129 @@ fn isBooleanAttribute(name: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(name, attribute)) return true;
     }
     return false;
+}
+
+fn getElementText(
+    session: *Server.Session,
+    arena: Allocator,
+    id: []const u8,
+    out: *std.Io.Writer,
+) !std.http.Status {
+    const element = (try resolveElement(session, id, out)) orelse return .not_found;
+    const frame = primaryFrame(session) orelse
+        return sendError(out, .not_found, "no such window", "Current browsing context has no document");
+    var text: std.Io.Writer.Allocating = .init(arena);
+    defer text.deinit();
+    element.getInnerText(&text.writer, frame) catch |err| switch (err) {
+        // Non-HTML (SVG, XML) elements have no rendered-text algorithm.
+        error.NotHtmlElement => element.asNode().getTextContent(&text.writer) catch
+            return sendError(out, .internal_server_error, "unknown error", "Could not read element text"),
+        else => return sendError(out, .internal_server_error, "unknown error", @errorName(err)),
+    };
+    return sendValue(out, text.writer.buffered());
+}
+
+fn getElementCssValue(
+    session: *Server.Session,
+    arena: Allocator,
+    id: []const u8,
+    name: []const u8,
+    out: *std.Io.Writer,
+) !std.http.Status {
+    const element = (try resolveElement(session, id, out)) orelse return .not_found;
+    const frame = primaryFrame(session) orelse
+        return sendError(out, .not_found, "no such window", "Current browsing context has no document");
+    const property = try decodePathSegment(arena, name);
+    const style = frame.window.getComputedStyle(element, null, frame) catch |err|
+        return sendError(out, .internal_server_error, "unknown error", @errorName(err));
+    return sendValue(out, style.asCSSStyleDeclaration().getPropertyValue(property, frame));
+}
+
+// ponytail: interactability is "does the engine consider it visible", not the
+// spec's full pointer-interactability hit test. Lightpanda's layout is
+// synthetic, so a real hit test would invent coordinates it does not model.
+fn interactableElement(
+    session: *Server.Session,
+    id: []const u8,
+    out: *std.Io.Writer,
+) !?struct { element: *Element, frame: *lp.Frame } {
+    const element = (try resolveElement(session, id, out)) orelse return null;
+    const frame = primaryFrame(session) orelse {
+        _ = try sendError(out, .not_found, "no such window", "Current browsing context has no document");
+        return null;
+    };
+    if (!element.checkVisibilityCached(null, frame)) {
+        _ = try sendError(out, .bad_request, "element not interactable", "Element is not displayed");
+        return null;
+    }
+    return .{ .element = element, .frame = frame };
+}
+
+fn elementClick(session: *Server.Session, id: []const u8, out: *std.Io.Writer) !std.http.Status {
+    const target = (try interactableElement(session, id, out)) orelse return .bad_request;
+    const rect = target.element.boundingClientRectValuesForVisible(target.frame);
+    lp.actions.clickAt(
+        target.element.asNode(),
+        rect.x + rect.width / 2,
+        rect.y + rect.height / 2,
+        .{},
+        target.frame,
+    ) catch |err| return sendError(out, .internal_server_error, "unknown error", @errorName(err));
+    return sendValue(out, @as(?u8, null));
+}
+
+fn elementClear(session: *Server.Session, id: []const u8, out: *std.Io.Writer) !std.http.Status {
+    const target = (try interactableElement(session, id, out)) orelse return .bad_request;
+    lp.actions.fill(target.element.asNode(), "", target.frame) catch |err| switch (err) {
+        error.InvalidNodeType => return sendError(out, .bad_request, "invalid element state", "Element is not editable"),
+        else => return sendError(out, .internal_server_error, "unknown error", @errorName(err)),
+    };
+    return sendValue(out, @as(?u8, null));
+}
+
+fn elementSendKeys(
+    session: *Server.Session,
+    arena: Allocator,
+    id: []const u8,
+    body: []const u8,
+    out: *std.Io.Writer,
+) !std.http.Status {
+    const Params = struct { text: []const u8 };
+    var parsed = std.json.parseFromSlice(Params, arena, body, .{ .ignore_unknown_fields = true }) catch
+        return sendError(out, .bad_request, "invalid argument", "Element Send Keys requires a text string");
+    defer parsed.deinit();
+
+    const target = (try interactableElement(session, id, out)) orelse return .bad_request;
+    target.element.focus(target.frame) catch |err|
+        return sendError(out, .internal_server_error, "unknown error", @errorName(err));
+
+    var keys = (std.unicode.Utf8View.init(parsed.value.text) catch
+        return sendError(out, .bad_request, "invalid argument", "Element Send Keys text must be valid UTF-8")).iterator();
+    while (keys.nextCodepointSlice()) |key| {
+        // A key can navigate (implicit form submission), which detaches the
+        // element; the remaining keys have nowhere to go.
+        if (!target.element.asNode().isConnected()) break;
+        lp.actions.press(target.element.asNode(), webDriverKey(key), target.frame) catch |err|
+            return sendError(out, .internal_server_error, "unknown error", @errorName(err));
+    }
+    return sendValue(out, @as(?u8, null));
+}
+
+// ponytail: only the WebDriver private-use keys that change a form's behavior
+// are mapped; the rest of U+E000..U+E05D reaches the page as-is. Extend the
+// table if a client needs arrows or modifiers.
+fn webDriverKey(key: []const u8) []const u8 {
+    const keys = [_]struct { code: []const u8, name: []const u8 }{
+        .{ .code = "\u{e003}", .name = "Backspace" },
+        .{ .code = "\u{e004}", .name = "Tab" },
+        .{ .code = "\u{e006}", .name = "Enter" },
+        .{ .code = "\u{e007}", .name = "Enter" },
+        .{ .code = "\u{e00c}", .name = "Escape" },
+    };
+    for (keys) |candidate| {
+        if (std.mem.eql(u8, key, candidate.code)) return candidate.name;
+    }
+    return key;
 }
 
 fn navigate(
@@ -1217,6 +1562,14 @@ fn matchRoute(path: []const u8) ?Route {
         .command = .get_active_element,
         .session_id = session_id,
     };
+    if (std.mem.eql(u8, suffix, "/execute/sync")) return .{
+        .command = .execute_sync,
+        .session_id = session_id,
+    };
+    if (std.mem.eql(u8, suffix, "/execute/async")) return .{
+        .command = .execute_async,
+        .session_id = session_id,
+    };
     if (matchElementRoute(session_id, suffix)) |route| return route;
     return null;
 }
@@ -1242,10 +1595,22 @@ fn matchElementRoute(session_id: []const u8, suffix: []const u8) ?Route {
         .{ .is_element_selected, null }
     else if (std.mem.eql(u8, command_suffix, "/enabled"))
         .{ .is_element_enabled, null }
+    else if (std.mem.eql(u8, command_suffix, "/text"))
+        .{ .get_element_text, null }
+    else if (std.mem.eql(u8, command_suffix, "/click"))
+        .{ .element_click, null }
+    else if (std.mem.eql(u8, command_suffix, "/clear"))
+        .{ .element_clear, null }
+    else if (std.mem.eql(u8, command_suffix, "/value"))
+        .{ .element_send_keys, null }
     else if (std.mem.startsWith(u8, command_suffix, "/attribute/") and
         command_suffix.len > "/attribute/".len and
         std.mem.indexOfScalar(u8, command_suffix["/attribute/".len..], '/') == null)
         .{ .get_element_attribute, command_suffix["/attribute/".len..] }
+    else if (std.mem.startsWith(u8, command_suffix, "/css/") and
+        command_suffix.len > "/css/".len and
+        std.mem.indexOfScalar(u8, command_suffix["/css/".len..], '/') == null)
+        .{ .get_element_css_value, command_suffix["/css/".len..] }
     else
         return null;
 
@@ -1280,6 +1645,8 @@ fn commandMethod(command: Command) std.http.Method {
         .get_element_attribute,
         .is_element_selected,
         .is_element_enabled,
+        .get_element_text,
+        .get_element_css_value,
         => .GET,
         .new_session,
         .navigate,
@@ -1288,6 +1655,11 @@ fn commandMethod(command: Command) std.http.Method {
         .find_elements,
         .find_element_from_element,
         .find_elements_from_element,
+        .element_click,
+        .element_clear,
+        .element_send_keys,
+        .execute_sync,
+        .execute_async,
         => .POST,
         .delete_session, .close_window => .DELETE,
     };
@@ -1298,7 +1670,24 @@ fn sendValue(out: *std.Io.Writer, value: anytype) !std.http.Status {
     return .ok;
 }
 
+// The harness already produced W3C-shaped JSON; re-encoding it would double the
+// escaping, so it goes out verbatim.
+fn sendRawValue(out: *std.Io.Writer, json: []const u8) !std.http.Status {
+    try out.print("{{\"value\":{s}}}", .{json});
+    return .ok;
+}
+
 fn sendError(out: *std.Io.Writer, status: std.http.Status, code: []const u8, message: []const u8) !std.http.Status {
+    return sendErrorWithStack(out, status, code, message, "");
+}
+
+fn sendErrorWithStack(
+    out: *std.Io.Writer,
+    status: std.http.Status,
+    code: []const u8,
+    message: []const u8,
+    stacktrace: []const u8,
+) !std.http.Status {
     const ErrorResponse = struct {
         value: struct {
             @"error": []const u8,
@@ -1310,7 +1699,7 @@ fn sendError(out: *std.Io.Writer, status: std.http.Status, code: []const u8, mes
         .value = .{
             .@"error" = code,
             .message = message,
-            .stacktrace = "",
+            .stacktrace = stacktrace,
         },
     }, .{}, out);
     return status;
@@ -1352,7 +1741,17 @@ test "WebDriver: routes use URL paths and distinguish methods" {
     try std.testing.expect(matchRoute("/session/id/element/ref/attribute/") == null);
     try std.testing.expect(matchRoute("/session/id/element/ref/attribute/data/kind") == null);
     try std.testing.expect(commandForMethod(child_route, .GET) == null);
-    try std.testing.expect(matchRoute("/session/id/execute/sync") == null);
+    try std.testing.expectEqual(Command.execute_sync, commandForMethod(matchRoute("/session/id/execute/sync").?, .POST).?);
+    try std.testing.expectEqual(Command.execute_async, commandForMethod(matchRoute("/session/id/execute/async").?, .POST).?);
+    try std.testing.expect(commandForMethod(matchRoute("/session/id/execute/sync").?, .GET) == null);
+    try std.testing.expectEqual(Command.get_element_text, commandForMethod(matchRoute("/session/id/element/ref/text").?, .GET).?);
+    try std.testing.expectEqual(Command.element_click, commandForMethod(matchRoute("/session/id/element/ref/click").?, .POST).?);
+    try std.testing.expectEqual(Command.element_clear, commandForMethod(matchRoute("/session/id/element/ref/clear").?, .POST).?);
+    try std.testing.expectEqual(Command.element_send_keys, commandForMethod(matchRoute("/session/id/element/ref/value").?, .POST).?);
+    const css_route = matchRoute("/session/id/element/ref/css/background-color").?;
+    try std.testing.expectEqualStrings("background-color", css_route.attribute_name.?);
+    try std.testing.expectEqual(Command.get_element_css_value, commandForMethod(css_route, .GET).?);
+    try std.testing.expect(matchRoute("/session/id/element/ref/css/") == null);
     try std.testing.expect(matchRoute("/session/id/unknown") == null);
 }
 
@@ -1405,8 +1804,14 @@ test "WebDriver: protocol session validates capabilities and preserves navigatio
     const execute_path = try std.fmt.allocPrint(testing.allocator, "/session/{s}/execute/sync", .{session_id});
     defer testing.allocator.free(execute_path);
     out.clearRetainingCapacity();
-    try testing.expectEqual(.not_found, try handle(server, request_allocator, .POST, execute_path, "{\"script\":\"return 1\",\"args\":[]}", &out.writer));
-    try testing.expectJson(.{ .value = .{ .@"error" = "unknown command" } }, out.writer.buffered());
+    try testing.expectEqual(.ok, try handle(server, request_allocator, .POST, execute_path, "{\"script\":\"return 1 + arguments[0]\",\"args\":[2]}", &out.writer));
+    try testing.expectString("{\"value\":3}", out.writer.buffered());
+
+    // Deliberately false even under an active WebDriver session; see the
+    // comment on Navigator.getWebdriver.
+    out.clearRetainingCapacity();
+    try testing.expectEqual(.ok, try handle(server, request_allocator, .POST, execute_path, "{\"script\":\"return navigator.webdriver\",\"args\":[]}", &out.writer));
+    try testing.expectString("{\"value\":false}", out.writer.buffered());
 
     const timeouts_path = try std.fmt.allocPrint(testing.allocator, "/session/{s}/timeouts", .{session_id});
     defer testing.allocator.free(timeouts_path);
