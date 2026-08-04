@@ -106,6 +106,14 @@ window.blockPreventSubmitTarget = () => {
     document.getElementById("prevent-submit").setAttribute("formtarget", "_blank");
 };
 document.getElementById("password").value = "current-secret";
+if (location.search === "?wait-selector") {
+    setTimeout(() => {
+        const ready = document.createElement("div");
+        ready.id = "live-ready";
+        ready.textContent = "ready";
+        document.body.appendChild(ready);
+    }, 20);
+}
 </script>
 </body>
 </html>

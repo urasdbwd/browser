@@ -24,6 +24,8 @@ pub const OpenOpts = struct {
     width: u32,
     height: u32,
     wait_ms: u32,
+    wait_until: ?lp.Config.WaitUntil = null,
+    wait_selector: ?[:0]const u8 = null,
 };
 
 allocator: std.mem.Allocator,
@@ -90,7 +92,18 @@ pub fn open(self: *LiveSession, opts: OpenOpts, writer: *std.Io.Writer) !void {
     try frame.navigate(url, .{ .reason = .address_bar, .kind = .{ .push = null } });
 
     var runner = session.runner(.{});
-    try runner.waitForFrame(page.frame_id, opts.wait_ms, .{ .until = .domcontentloaded });
+    const wait_started = lp.datetime.milliTimestamp(.boot);
+    if (opts.wait_until) |wait_until| {
+        try runner.waitForFrame(page.frame_id, opts.wait_ms, .{ .until = wait_until });
+    } else if (opts.wait_selector == null) {
+        try runner.waitForFrame(page.frame_id, opts.wait_ms, .{ .until = .domcontentloaded });
+    }
+    if (opts.wait_selector) |selector| {
+        const elapsed: u32 = @intCast(lp.datetime.milliTimestamp(.boot) -| wait_started);
+        const remaining = opts.wait_ms -| elapsed;
+        if (remaining == 0) return error.Timeout;
+        _ = try runner.waitForSelector(page.frame_id, selector, remaining);
+    }
 
     self.notification = notification;
     self.page = page;
@@ -444,9 +457,23 @@ fn liveSessionRoundTrip() !void {
     defer live.deinit();
 
     const button_url: [:0]const u8 = "http://127.0.0.1:9582/src/browser/tests/render_live.html";
+    const wait_url: [:0]const u8 = "http://127.0.0.1:9582/src/browser/tests/render_live.html?wait-selector";
     const nav_url: [:0]const u8 = "http://127.0.0.1:9582/src/browser/tests/mcp_nav.html";
     var opened: std.Io.Writer.Allocating = .init(testing.test_app.allocator);
     defer opened.deinit();
+
+    try live.open(.{
+        .url = wait_url,
+        .width = 640,
+        .height = 480,
+        .wait_ms = 2_000,
+        .wait_selector = "#live-ready",
+    }, &opened.writer);
+    try testing.expect(std.mem.indexOf(u8, opened.written(), "<div id=\"live-ready\">ready</div>") != null);
+    const wait_token = live.tokenText();
+    try live.closeForToken(wait_token[0..]);
+    opened.clearRetainingCapacity();
+
     try live.open(.{ .url = button_url, .width = 640, .height = 480, .wait_ms = 2_000 }, &opened.writer);
     try testing.expect(live.isActive());
     try testing.expectEqual(@as(u64, 1), live.version);

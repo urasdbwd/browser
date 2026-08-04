@@ -386,7 +386,11 @@ const { attachLightpandaRenderer } = await import(
     endpoint: "https://custom-renderer.example/api/render",
     token: "live-token",
   });
-  await renderer.open("https://source.example/live");
+  await renderer.open("https://source.example/live", {
+    waitMs: 1234,
+    waitUntil: "networkidle",
+    waitSelector: "#ready",
+  });
   assert.equal(renderer.iframe.getAttribute("sandbox"), "allow-same-origin");
   assert.equal(renderer.iframe.getAttribute("sandbox").includes("allow-scripts"), false);
   assert.equal(renderer.iframe.getAttribute("sandbox").includes("allow-forms"), false);
@@ -397,6 +401,9 @@ const { attachLightpandaRenderer } = await import(
     request: {
       op: "open",
       url: "https://source.example/live",
+      wait_ms: 1234,
+      wait_until: "networkidle",
+      wait_selector: "#ready",
       width: 640,
       height: 480,
       snapshot_mode: "unchanged_204",
@@ -430,6 +437,7 @@ const { attachLightpandaRenderer } = await import(
     session: "0123456789abcdef0123456789abcdef",
     version: 1,
     target: 0,
+    wait_ms: 1234,
     snapshot_mode: "unchanged_204",
   });
   renderer.destroy();

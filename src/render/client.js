@@ -267,6 +267,8 @@ export class LightpandaRenderer extends EventTarget {
       op: "open",
       url: source,
       wait_ms: options.waitMs,
+      wait_until: options.waitUntil,
+      wait_selector: options.waitSelector,
       width: Math.max(1, Math.round((options.width ?? bounds.width) || 1280)),
       height: Math.max(1, Math.round((options.height ?? bounds.height) || 720)),
       snapshot_mode: "unchanged_204",

@@ -529,6 +529,8 @@ const LiveRequest = struct {
     value: ?[]const u8 = null,
     selected_index: ?u32 = null,
     wait_ms: u32 = 5_000,
+    wait_until: ?lp.Config.WaitUntil = null,
+    wait_selector: ?[]const u8 = null,
     width: u32 = 1280,
     height: u32 = 720,
     snapshot_mode: LiveSnapshotMode = .full,
@@ -612,15 +614,30 @@ fn processLive(live: *LiveSession, arena: std.mem.Allocator, job: *Job) void {
                 job.result = .bad_request;
                 return;
             }
+            if (request.wait_selector) |selector| {
+                if (selector.len == 0 or selector.len > 1024) {
+                    job.result = .bad_request;
+                    return;
+                }
+            }
             const canonical = validTargetUrl(arena, url) catch {
                 job.result = .bad_request;
                 return;
             };
+            const selector: ?[:0]const u8 = if (request.wait_selector) |value|
+                arena.dupeZ(u8, value) catch {
+                    job.result = .internal_error;
+                    return;
+                }
+            else
+                null;
             live.open(.{
                 .url = canonical,
                 .width = request.width,
                 .height = request.height,
                 .wait_ms = @min(request.wait_ms, job.max_wait_ms),
+                .wait_until = request.wait_until,
+                .wait_selector = selector,
             }, &job.out.writer) catch |err| {
                 job.result = mapLiveError(err);
                 return;
@@ -1173,11 +1190,14 @@ test "render server: live operations carry a versioned activation" {
     const open = try std.json.parseFromSliceLeaky(
         LiveRequest,
         arena.allocator(),
-        "{\"op\":\"open\",\"url\":\"https://example.test/\"}",
+        "{\"op\":\"open\",\"url\":\"https://example.test/\",\"wait_ms\":1234,\"wait_until\":\"networkidle\",\"wait_selector\":\"#ready\"}",
         .{},
     );
     try std.testing.expect(open.op == .open);
     try std.testing.expectEqualStrings("https://example.test/", open.url.?);
+    try std.testing.expectEqual(@as(u32, 1234), open.wait_ms);
+    try std.testing.expectEqual(lp.Config.WaitUntil.networkidle, open.wait_until.?);
+    try std.testing.expectEqualStrings("#ready", open.wait_selector.?);
     try std.testing.expectEqual(LiveSnapshotMode.full, open.snapshot_mode);
 
     const activate = try std.json.parseFromSliceLeaky(
