@@ -1279,11 +1279,15 @@ fn respondNotModified(request: *std.http.Server.Request, cors_value: ?[]const u8
 }
 
 fn respondJson(request: *std.http.Server.Request, status: std.http.Status, body: []const u8, cors_value: ?[]const u8) !void {
-    var headers: [3]std.http.Header = undefined;
+    var headers: [4]std.http.Header = undefined;
     var count: usize = 0;
     headers[count] = .{ .name = "content-type", .value = "application/json; charset=utf-8" };
     count += 1;
     headers[count] = .{ .name = "cache-control", .value = "no-store" };
+    count += 1;
+    // The body is identical for every origin but the Allow-Origin header is
+    // not; every other responder already declares this.
+    headers[count] = .{ .name = "vary", .value = "origin" };
     count += 1;
     if (cors_value) |value| {
         headers[count] = .{ .name = "access-control-allow-origin", .value = value };
