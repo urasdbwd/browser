@@ -133,5 +133,48 @@
   testing.expectEqual('function', typeof mql.addEventListener);
   testing.expectEqual('function', typeof mql.removeEventListener);
   testing.expectEqual('function', typeof mql.dispatchEvent);
+  testing.expectEqual('function', typeof mql.addListener);
+  testing.expectEqual('function', typeof mql.removeListener);
+  testing.expectEqual(null, mql.onchange);
+}
+</script>
+
+<script id=matchMedia_change_listeners>
+{
+  // A `change` event must reach the onchange handler AND every listener,
+  // registered through either addEventListener or the legacy addListener.
+  const mql = window.matchMedia('(min-width: 600px)');
+  const seen = [];
+
+  mql.onchange = (e) => seen.push('onchange:' + e.matches + ':' + e.media);
+  mql.addEventListener('change', () => seen.push('listener1'));
+  mql.addEventListener('change', () => seen.push('listener2'));
+
+  const legacy = () => seen.push('legacy');
+  mql.addListener(legacy);
+
+  const removed = () => seen.push('removed');
+  mql.addListener(removed);
+  mql.removeListener(removed);
+
+  mql.dispatchEvent(new MediaQueryListEvent('change', { matches: true, media: '(min-width: 600px)' }));
+
+  testing.expectEqual(
+    ['onchange:true:(min-width: 600px)', 'listener1', 'listener2', 'legacy'],
+    seen,
+  );
+}
+</script>
+
+<script id=matchMedia_list_event>
+{
+  const e = new MediaQueryListEvent('change', { matches: true, media: 'print' });
+  testing.expectEqual('change', e.type);
+  testing.expectEqual(true, e.matches);
+  testing.expectEqual('print', e.media);
+
+  const bare = new MediaQueryListEvent('change');
+  testing.expectEqual(false, bare.matches);
+  testing.expectEqual('', bare.media);
 }
 </script>

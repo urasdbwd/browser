@@ -150,7 +150,7 @@ pub fn setProperty(self: *CSSStyleDeclaration, property_name: []const u8, value:
 /// Apply one declaration parsed from a `style=` block. Unlike the imperative
 /// setProperty path, within a single declaration block a normal declaration must
 /// not override an earlier !important one (CSS cascade precedence).
-fn applyParsedDeclaration(self: *CSSStyleDeclaration, declaration: CssParser.Declaration, frame: *Frame) !void {
+pub fn applyParsedDeclaration(self: *CSSStyleDeclaration, declaration: CssParser.Declaration, frame: *Frame) !void {
     if (!declaration.important) {
         const normalized = normalizePropertyName(declaration.name, &frame.buf);
         if (self.findProperty(.wrap(normalized))) |existing| {

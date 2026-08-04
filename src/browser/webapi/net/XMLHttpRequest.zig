@@ -25,6 +25,7 @@ const Transfer = @import("../../../network/HttpClient.zig").Transfer;
 
 const URL = @import("../../URL.zig");
 const Mime = @import("../../Mime.zig");
+const html5ever = @import("../../parser/html5ever.zig");
 const Page = @import("../../Page.zig");
 const Frame = @import("../../Frame.zig");
 
@@ -63,6 +64,8 @@ _request_body: ?[]const u8 = null,
 
 _response: ?Response = null,
 _response_data: std.ArrayList(u8) = .empty,
+// responseText, decoded once from _response_data (see finalCharset).
+_response_text: ?[]const u8 = null,
 _response_status: u16 = 0,
 _response_len: ?usize = 0,
 _response_url: [:0]const u8 = "",
@@ -205,6 +208,7 @@ pub fn open(self: *XMLHttpRequest, method_: []const u8, url: [:0]const u8) !void
     self._response = null;
     self._response_xml = null;
     self._response_data.clearRetainingCapacity();
+    self._response_text = null;
     self._response_status = 0;
     self._response_len = 0;
     self._response_url = "";
@@ -387,12 +391,37 @@ pub fn setResponseType(self: *XMLHttpRequest, value: []const u8) !void {
     }
 }
 
-pub fn getResponseText(self: *const XMLHttpRequest) []const u8 {
-    // TODO: per WHATWG XHR "get a text response", the bytes must be decoded
-    // using the final encoding derived from the final MIME type
-    // (_override_mime ?? _response_mime). Currently the raw bytes are
-    // returned and V8 treats them as UTF-8.
-    return self._response_data.items;
+/// https://xhr.spec.whatwg.org/#text-response — the raw bytes are decoded with
+/// the final MIME type's charset (an overrideMimeType() wins over the response's
+/// own Content-Type), falling back to the document's encoding, then UTF-8.
+/// V8 takes the returned slice as UTF-8, so a non-UTF-8 body must be converted
+/// here or it renders as mojibake.
+pub fn getResponseText(self: *XMLHttpRequest) ![]const u8 {
+    const data = self._response_data.items;
+
+    // Readable while the transfer is still running, so only the final body is
+    // worth holding on to; a partial decode would go stale on the next chunk.
+    if (self._ready_state != .done) {
+        return html5ever.decodeToUtf8(self._exec.call_arena, self.finalCharset(), data);
+    }
+
+    if (self._response_text) |text| {
+        return text;
+    }
+    const text = try html5ever.decodeToUtf8(self._arena.allocator(), self.finalCharset(), data);
+    self._response_text = text;
+    return text;
+}
+
+/// The encoding the response body should be decoded with.
+fn finalCharset(self: *const XMLHttpRequest) []const u8 {
+    if (self._override_mime orelse self._response_mime) |mime| {
+        if (!mime.is_default_charset) {
+            return mime.charsetString();
+        }
+    }
+    const charset = self._exec.charset.*;
+    return if (charset.len == 0) "UTF-8" else charset;
 }
 
 pub fn getStatus(self: *const XMLHttpRequest) u16 {
@@ -419,7 +448,7 @@ pub fn getResponse(self: *XMLHttpRequest, exec: *const Execution) !?Response {
 
     const data = self._response_data.items;
     const res: Response = switch (self._response_type) {
-        .default, .text => .{ .text = data },
+        .default, .text => .{ .text = try self.getResponseText() },
         .json => blk: {
             const local = exec.js.local.?;
 

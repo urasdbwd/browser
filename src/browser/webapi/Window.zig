@@ -23,6 +23,7 @@ const builtin = @import("builtin");
 const js = @import("../js/js.zig");
 const URL = @import("../URL.zig");
 const Frame = @import("../Frame.zig");
+const StyleManager = @import("../StyleManager.zig");
 const Console = @import("Console.zig");
 const History = @import("History.zig");
 const Navigation = @import("navigation/Navigation.zig");
@@ -47,6 +48,7 @@ const idb = @import("storage/idb/idb.zig");
 const CookieStore = @import("storage/CookieStore.zig");
 const Element = @import("Element.zig");
 const CSSStyleProperties = @import("css/CSSStyleProperties.zig");
+const ImageBitmap = @import("canvas/ImageBitmap.zig");
 const CustomElementRegistry = @import("CustomElementRegistry.zig");
 const Selection = @import("Selection.zig");
 const Timers = @import("Timers.zig");
@@ -658,19 +660,23 @@ pub fn reportError(self: *Window, err: js.Value, frame: *Frame) !void {
 }
 
 pub fn matchMedia(_: *const Window, query: []const u8, frame: *Frame) !*MediaQueryList {
-    return frame._factory.eventTarget(MediaQueryList{
-        ._proto = undefined,
-        ._media = try frame.dupeString(query),
-    });
+    return MediaQueryList.init(query, frame);
 }
 
 pub fn getComputedStyle(_: *const Window, element: *Element, pseudo_element: ?[]const u8, frame: *Frame) !*CSSStyleProperties {
     if (pseudo_element) |pe| {
         if (pe.len != 0) {
-            log.warn(.not_implemented, "window.GetComputedStyle", .{ .pseudo_element = pe });
             // Chrome hands out a distinct object per pseudo-element, so these
-            // can't share the per-element cache entry.
-            return CSSStyleProperties.init(element, true, frame);
+            // can't share the per-element cache entry. A pseudo box has no
+            // element of its own: its computed style is entirely the author
+            // rules matching `element::<pseudo>`, hence the null element.
+            const style = try CSSStyleProperties.init(null, true, frame);
+            if (StyleManager.PseudoElement.parse(pe)) |pseudo| {
+                try frame._style_manager.applyPseudoStyle(element, pseudo, style.asCSSStyleDeclaration());
+            } else {
+                log.warn(.not_implemented, "window.GetComputedStyle", .{ .pseudo_element = pe });
+            }
+            return style;
         }
     }
     const gop = try frame._element_computed_styles.getOrPut(frame.arena, element);
@@ -815,12 +821,16 @@ pub fn focus(_: *Window) void {}
 pub fn blur(_: *Window) void {}
 
 pub fn postMessage(self: *Window, message: js.Value, target_origin: ?[]const u8, transfer: ?[]const *MessagePort, frame: *Frame) !void {
-    // For now, we ignore targetOrigin checking and just dispatch the message
-    // In a full implementation, we would validate the origin
-    _ = target_origin;
-
     const target_frame = self._frame;
     const source_window = target_frame.js.getIncumbent().window;
+
+    // Origin should be the source window's origin (where the message came from)
+    const origin = source_window.getOrigin();
+
+    // Per spec an omitted targetOrigin defaults to "/" (sender's own origin).
+    if (!try targetOriginMatches(target_origin orelse "/", origin, self.getOrigin(), frame)) {
+        return;
+    }
 
     const arena = try target_frame.getArena(.medium, "Window.postMessage");
     errdefer arena.release();
@@ -848,8 +858,6 @@ pub fn postMessage(self: *Window, message: js.Value, target_origin: ?[]const u8,
     };
     errdefer cloned.release();
 
-    // Origin should be the source window's origin (where the message came from)
-    const origin = try source_window._location.getOrigin(&frame.js.execution);
     const callback = try arena.create(PostMessageCallback);
     callback.* = .{
         .arena = arena,
@@ -867,6 +875,42 @@ pub fn postMessage(self: *Window, message: js.Value, target_origin: ?[]const u8,
     });
 }
 
+// https://html.spec.whatwg.org/#window-post-message-steps, step 5-8.
+//   "*"  -> deliver anywhere
+//   "/"  -> the target must be same-origin as the sender
+//   else -> targetOrigin is parsed as a URL and its origin must equal the
+//           target window's origin (scheme + host + port).
+// A non-matching targetOrigin drops the message silently; a targetOrigin that
+// isn't a URL at all is a SyntaxError.
+fn targetOriginMatches(target_origin: []const u8, source_origin: []const u8, window_origin: []const u8, frame: *Frame) !bool {
+    if (std.mem.eql(u8, target_origin, "*")) {
+        return true;
+    }
+
+    // Opaque origins (about:blank without an inherited origin, data:, ...) are
+    // never same-origin with anything, including themselves.
+    if (std.mem.eql(u8, window_origin, "null")) {
+        return false;
+    }
+
+    if (std.mem.eql(u8, target_origin, "/")) {
+        return std.mem.eql(u8, source_origin, window_origin);
+    }
+
+    const url = try frame.call_arena.dupeZ(u8, target_origin);
+    const parsed = try URL.getOrigin(frame.call_arena, url) orelse {
+        // ponytail: URL.getOrigin only yields origins for http(s). Anything
+        // else is either a non-URL (SyntaxError per spec) or a scheme with an
+        // opaque origin (drop). A scheme separator is a good enough proxy;
+        // swap in the full URL parser if a real site needs the distinction.
+        if (std.mem.indexOfScalar(u8, target_origin, ':') == null) {
+            return error.SyntaxError;
+        }
+        return false;
+    };
+    return std.mem.eql(u8, parsed, window_origin);
+}
+
 const base64 = @import("encoding/base64.zig");
 pub fn btoa(_: *const Window, input: base64.BinInput, frame: *Frame) ![]const u8 {
     return base64.encode(frame.local_arena, input);
@@ -875,6 +919,10 @@ pub fn btoa(_: *const Window, input: base64.BinInput, frame: *Frame) ![]const u8
 pub fn atob(_: *const Window, input: base64.BinInput, frame: *Frame) !js.String.OneByte {
     const decoded = try base64.decode(frame.local_arena, input);
     return .{ .bytes = decoded };
+}
+
+pub fn createImageBitmap(_: *const Window, source: js.Value, sx: ?js.Value, sy: ?js.Value, sw: ?js.Value, sh: ?js.Value, exec: *const Execution) !js.Promise {
+    return ImageBitmap.create(source, sx, sy, sw, sh, exec);
 }
 
 pub fn structuredClone(_: *const Window, value: js.Value) !js.Value {
@@ -1242,6 +1290,7 @@ pub const JsApi = struct {
     pub const atob = bridge.function(Window.atob, .{});
     pub const reportError = bridge.function(Window.reportError, .{});
     pub const structuredClone = bridge.function(Window.structuredClone, .{});
+    pub const createImageBitmap = bridge.function(Window.createImageBitmap, .{});
     pub const getComputedStyle = bridge.function(Window.getComputedStyle, .{});
     pub const getSelection = bridge.function(Window.getSelection, .{});
     pub const frameElement = bridge.accessor(Window.getFrameElement, null, .{});

@@ -10,6 +10,8 @@
     let received = null;
 
     window.addEventListener('message', (e) => {
+        // Other scripts in this file post to the same window; ours is an object.
+        if (typeof e.data !== 'object') return;
         received = e.data;
         state.resolve();
     });
@@ -23,6 +25,49 @@
         payload.n = 999;
         testing.expectEqual(1, received.n);
     });
+}
+</script>
+
+<script id=postMessageTargetOrigin type=module>
+// targetOrigin gates delivery: "*" and the window's own origin (explicit, or
+// via "/", or by omission) are delivered; any other origin is dropped.
+{
+    const state = await testing.async();
+    const received = [];
+
+    window.addEventListener('message', (e) => {
+        // Other scripts in this file post to the same window; ours are strings.
+        if (typeof e.data !== 'string') return;
+        received.push(e.data);
+        if (e.data === 'last') {
+            testing.expectEqual(testing.ORIGIN, e.origin);
+            testing.expectEqual(window, e.source);
+            state.resolve();
+        }
+    });
+
+    window.postMessage('exact', testing.ORIGIN);
+    window.postMessage('slash', '/');
+    window.postMessage('omitted');
+    window.postMessage('other-host', 'http://example.com');
+    window.postMessage('other-port', testing.ORIGIN + '1');
+    window.postMessage('other-scheme', testing.ORIGIN.replace('http:', 'https:'));
+    window.postMessage('last', '*');
+
+    await state.done(() => {
+        testing.expectEqual(['exact', 'slash', 'omitted', 'last'], received);
+    });
+}
+</script>
+
+<script id=postMessageTargetOriginSyntaxError>
+// A targetOrigin that isn't a URL at all throws, rather than silently dropping.
+{
+    for (const bad of ['example.com', '//example.com']) {
+        testing.withError((e) => testing.expectEqual('SyntaxError', e.name), () => {
+            window.postMessage('x', bad);
+        });
+    }
 }
 </script>
 

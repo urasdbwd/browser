@@ -3,11 +3,53 @@
 
 <iframe id="receiver"></iframe>
 
+<script id="cross_origin_target_origin" type=module>
+// A targetOrigin naming our own origin must not be delivered to a cross-origin
+// frame: that is what checkout/SSO iframes rely on to know who they're talking
+// to. Only the matching origin (or "*") gets through.
+{
+  const state = await testing.async();
+  const ALT_ORIGIN = testing.ORIGIN.replace('127.0.0.1', 'localhost');
+  const echoes = [];
+
+  window.addEventListener('message', (e) => {
+    if (e.origin !== ALT_ORIGIN) return;
+
+    if (e.data.ready) {
+      const child = e.source;
+      // Dropped: the frame's origin is localhost, not ours.
+      child.postMessage('drop-exact', testing.ORIGIN);
+      // Dropped: "/" means "same origin as me", and we are not same-origin.
+      child.postMessage('drop-slash', '/');
+      // Dropped: an omitted targetOrigin defaults to "/".
+      child.postMessage('drop-omitted');
+      // Delivered.
+      child.postMessage('alt', ALT_ORIGIN);
+      child.postMessage('done', '*');
+      return;
+    }
+
+    echoes.push(e.data.echo);
+    if (e.data.echo === 'done') state.resolve();
+  });
+
+  const iframe = document.createElement('iframe');
+  iframe.src = testing.BASE_URL.replace('127.0.0.1', 'localhost') + 'frames/support/message_echo.html';
+  document.documentElement.appendChild(iframe);
+
+  await state.done(() => {
+    testing.expectEqual(['alt', 'done'], echoes);
+  });
+}
+</script>
+
 <script id="messages" type=module>
 {
   const state = await testing.async();
   let reply = null;
   window.addEventListener('message', (e) => {
+    // The cross-origin test below talks to a second receiver; ignore it.
+    if (e.origin !== testing.ORIGIN) return;
     reply = e.data;
     state.resolve();
   });

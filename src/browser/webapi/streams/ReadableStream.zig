@@ -312,6 +312,84 @@ pub fn pipeTo(self: *ReadableStream, destination: *WritableStream, exec: *const 
     return promise;
 }
 
+/// tee() — splits this stream into two that each receive every chunk. The
+/// source is read once, through a single reader, and each chunk is enqueued on
+/// both branches, so neither branch can starve the other.
+///
+/// ponytail: no backpressure — the source is drained as fast as it produces,
+/// and a cancel on one branch doesn't propagate. Model both if a real site
+/// depends on a half-consumed tee.
+pub fn tee(self: *ReadableStream, exec: *const Execution) ![2]*ReadableStream {
+    if (self.getLocked()) {
+        return error.ReaderLocked;
+    }
+
+    const branches = [2]*ReadableStream{
+        try init(null, null, exec),
+        try init(null, null, exec),
+    };
+    try TeeState.start(self, branches, exec);
+    return branches;
+}
+
+/// State for an async tee operation.
+const TeeState = struct {
+    execution: *const Execution,
+    reader: *ReadableStreamDefaultReader,
+    branches: [2]*ReadableStream,
+
+    fn start(stream: *ReadableStream, branches: [2]*ReadableStream, exec: *const Execution) !void {
+        const reader = try stream.getReader(exec);
+        const state = try exec.arena.create(TeeState);
+        state.* = .{
+            .execution = exec,
+            .reader = reader,
+            .branches = branches,
+        };
+        try state.pumpRead();
+    }
+
+    fn pumpRead(self: *TeeState) !void {
+        const exec = self.execution;
+        const local = exec.js.local.?;
+        const read_promise = try self.reader.read(exec);
+
+        const then_fn = local.newCallback(onReadFulfilled, self);
+        const catch_fn = local.newCallback(onReadRejected, self);
+
+        _ = read_promise.thenAndCatch(then_fn, catch_fn) catch {
+            self.finish();
+        };
+    }
+
+    fn onReadFulfilled(self: *TeeState, data_: ?PipeState.ReadData) void {
+        const data = data_ orelse return self.finish();
+
+        if (data.done or data.value.isUndefined()) {
+            return self.finish();
+        }
+
+        for (self.branches) |branch| {
+            branch._controller.enqueueValue(data.value) catch {};
+        }
+
+        self.pumpRead() catch {
+            self.finish();
+        };
+    }
+
+    fn onReadRejected(self: *TeeState) void {
+        self.finish();
+    }
+
+    fn finish(self: *TeeState) void {
+        self.reader.releaseLock();
+        for (self.branches) |branch| {
+            branch._controller.close() catch {};
+        }
+    }
+};
+
 /// State for an async pipe operation.
 const PipeState = struct {
     execution: *const Execution,
@@ -420,6 +498,7 @@ pub const JsApi = struct {
     pub const getReader = bridge.function(ReadableStream.getReader, .{});
     pub const pipeThrough = bridge.function(ReadableStream.pipeThrough, .{});
     pub const pipeTo = bridge.function(ReadableStream.pipeTo, .{});
+    pub const tee = bridge.function(ReadableStream.tee, .{});
     pub const locked = bridge.accessor(ReadableStream.getLocked, null, .{});
     pub const symbol_async_iterator = bridge.iterator(ReadableStream.getAsyncIterator, .{ .async = true });
 };

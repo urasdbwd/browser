@@ -34,7 +34,8 @@ const SelectorList = @import("webapi/selector/List.zig");
 const CSSStyleRule = @import("webapi/css/CSSStyleRule.zig");
 const CSSStyleSheet = @import("webapi/css/CSSStyleSheet.zig");
 const CSSStyleProperties = @import("webapi/css/CSSStyleProperties.zig");
-const CSSStyleProperty = @import("webapi/css/CSSStyleDeclaration.zig").Property;
+const CSSStyleDeclaration = @import("webapi/css/CSSStyleDeclaration.zig");
+const CSSStyleProperty = CSSStyleDeclaration.Property;
 
 const log = lp.log;
 const String = lp.String;
@@ -60,6 +61,11 @@ id_rules: std.StringHashMapUnmanaged(RuleList) = .empty,
 class_rules: std.StringHashMapUnmanaged(RuleList) = .empty,
 tag_rules: std.AutoHashMapUnmanaged(Tag, RuleList) = .empty,
 other_rules: RuleList = .empty, // universal, attribute, pseudo-class endings
+
+// Author rules whose selector ends in a pseudo-element (`a::before`). These
+// don't target a real element, so they stay out of the buckets above and are
+// only consulted by getComputedStyle(el, '::before').
+pseudo_rules: std.ArrayList(PseudoRule) = .empty,
 
 /// The thing to remember about layers is that we can't determine priority's
 /// layer_rank until everything is parsed. So we need to build up meta data when
@@ -427,6 +433,10 @@ fn finalizeLayerRanks(self: *StyleManager, build_arena: Allocator) Allocator.Err
 
     self.stampRuleList(&self.other_rules);
 
+    for (self.pseudo_rules.items) |*rule| {
+        rule.priority |= @as(u64, self.layerRank(rule.priority)) << RANK_SHIFT;
+    }
+
     var id_it = self.id_rules.valueIterator();
     while (id_it.next()) |rules| {
         self.stampRuleList(rules);
@@ -444,18 +454,21 @@ fn finalizeLayerRanks(self: *StyleManager, build_arena: Allocator) Allocator.Err
 }
 
 fn stampRuleList(self: *StyleManager, rules: *RuleList) void {
-    const layers = self.layers.items;
-    const rule_layers = self.rule_layers.items;
     for (rules.items(.priority)) |*priority| {
-        const doc_order: u32 = @as(u22, @truncate(priority.*));
-        const layer = rule_layers[doc_order - 1];
-        const rank = if (layer == NO_LAYER) UNLAYERED_RANK else layers[layer].rank;
-        priority.* |= @as(u64, rank) << RANK_SHIFT;
+        priority.* |= @as(u64, self.layerRank(priority.*)) << RANK_SHIFT;
     }
+}
+
+fn layerRank(self: *const StyleManager, priority: u64) u32 {
+    const doc_order: u32 = @as(u22, @truncate(priority));
+    const layer = self.rule_layers.items[doc_order - 1];
+    return if (layer == NO_LAYER) UNLAYERED_RANK else self.layers.items[layer].rank;
 }
 
 fn addRawRule(self: *StyleManager, build_arena: Allocator, selector_text: []const u8, block_text: []const u8, layer: u16) !void {
     if (selector_text.len == 0) return;
+
+    try self.addPseudoRules(build_arena, selector_text, block_text, layer);
 
     var props = VisibilityProperties{};
     var it = CssParser.parseDeclarationsList(block_text);
@@ -561,6 +574,8 @@ fn rebuildIfDirty(self: *StyleManager) !void {
 
     self.other_rules = .{};
     try self.other_rules.ensureTotalCapacity(self.arena.allocator(), other_rules_count);
+
+    self.pseudo_rules = .empty;
 
     const sheets = self.frame.document._style_sheets orelse return;
     for (sheets._sheets.items) |sheet| {
@@ -938,8 +953,14 @@ fn addRule(self: *StyleManager, build_arena: Allocator, style_rule: *CSSStyleRul
         return;
     }
 
-    // Check if the rule has visibility-relevant properties
     const style = style_rule._style orelse return;
+    if (std.mem.indexOfScalar(u8, selector_text, ':') != null) {
+        // The CSSOM keeps declarations parsed; re-serialize so both ingestion
+        // paths hand addPseudoRules the same raw block text.
+        try self.addPseudoRules(build_arena, selector_text, try style.asCSSStyleDeclaration().getCssText(self.frame), NO_LAYER);
+    }
+
+    // Check if the rule has visibility-relevant properties
     const props = extractVisibilityProperties(style);
     if (!props.isRelevant()) {
         return;
@@ -1138,6 +1159,142 @@ const VisibilityProperties = struct {
             self.pointer_events_none != null;
     }
 };
+
+pub const PseudoElement = enum {
+    after,
+    backdrop,
+    before,
+    first_letter,
+    first_line,
+    marker,
+    placeholder,
+    selection,
+
+    const names = std.StaticStringMap(PseudoElement).initComptime(.{
+        .{ "after", .after },
+        .{ "backdrop", .backdrop },
+        .{ "before", .before },
+        .{ "first-letter", .first_letter },
+        .{ "first-line", .first_line },
+        .{ "marker", .marker },
+        .{ "placeholder", .placeholder },
+        .{ "selection", .selection },
+    });
+
+    /// Parses a `getComputedStyle` pseudo-element argument. Both the modern
+    /// `::before` and the legacy `:before` spelling are accepted.
+    pub fn parse(raw: []const u8) ?PseudoElement {
+        if (raw.len == 0 or raw[0] != ':') {
+            return null;
+        }
+        var name = raw[1..];
+        if (name.len != 0 and name[0] == ':') {
+            name = name[1..];
+        }
+
+        var buf: [32]u8 = undefined;
+        if (name.len == 0 or name.len > buf.len) {
+            return null;
+        }
+        return names.get(std.ascii.lowerString(&buf, name));
+    }
+};
+
+/// Splits `li.item::before` into its element selector and its pseudo-element.
+/// Returns null when the compound doesn't end in a known pseudo-element.
+fn splitPseudoElement(text: []const u8) ?struct { selector: []const u8, pseudo: PseudoElement } {
+    const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return null;
+    const pseudo = PseudoElement.parse(text[colon..]) orelse return null;
+
+    var selector_end = colon;
+    if (selector_end > 0 and text[selector_end - 1] == ':') {
+        selector_end -= 1;
+    }
+    const selector = std.mem.trim(u8, text[0..selector_end], &std.ascii.whitespace);
+    // A bare `::before` targets any element.
+    return .{ .selector = if (selector.len == 0) "*" else selector, .pseudo = pseudo };
+}
+
+const PseudoRule = struct {
+    pseudo: PseudoElement,
+    // The originating element's selector, i.e. the rule's selector minus its
+    // trailing pseudo-element.
+    selector: Selector.Selector,
+    // Raw declaration block; re-parsed on the (rare) getComputedStyle call
+    // rather than kept as a parsed list nothing else would ever read.
+    declarations: []const u8,
+    priority: u64,
+};
+
+/// Records the `x::before { ... }` rules within a selector list. `selector_text`
+/// is the rule's full, unparsed selector list; `declarations` its block body.
+fn addPseudoRules(self: *StyleManager, build_arena: Allocator, selector_text: []const u8, declarations: []const u8, layer: u16) !void {
+    if (std.mem.indexOfScalar(u8, selector_text, ':') == null) {
+        return;
+    }
+
+    const allocator = self.arena.allocator();
+    var stored_declarations: ?[]const u8 = null;
+
+    // ponytail: naive comma split, so a pseudo-element inside `:is(a, b)` is
+    // missed. Reuse the selector parser's list splitting if that shows up.
+    var it = std.mem.splitScalar(u8, selector_text, ',');
+    while (it.next()) |raw| {
+        const part = std.mem.trim(u8, raw, &std.ascii.whitespace);
+        const split = splitPseudoElement(part) orelse continue;
+
+        const selectors = SelectorParser.parseList(allocator, split.selector) catch continue;
+        if (selectors.len == 0) {
+            continue;
+        }
+
+        if (stored_declarations == null) {
+            stored_declarations = try allocator.dupe(u8, declarations);
+        }
+
+        for (selectors) |selector| {
+            try self.pseudo_rules.append(allocator, .{
+                .pseudo = split.pseudo,
+                .selector = selector,
+                .declarations = stored_declarations.?,
+                .priority = (@as(u64, computeSpecificity(selector)) << SPEC_SHIFT) | @min(self.next_doc_order, MAX_DOC_ORDER),
+            });
+            self.next_doc_order += 1;
+            try self.rule_layers.append(build_arena, layer);
+        }
+    }
+}
+
+/// Merges every author rule matching `el::<pseudo>` into `target`, in cascade
+/// order (lowest priority first, so later declarations win). The pseudo box has
+/// no element of its own, so this is the whole of its computed style.
+pub fn applyPseudoStyle(self: *StyleManager, el: *Element, pseudo: PseudoElement, target: *CSSStyleDeclaration) !void {
+    self.rebuildIfDirty() catch return;
+
+    const frame = self.frame;
+    var matched: std.ArrayList(*const PseudoRule) = .empty;
+    for (self.pseudo_rules.items) |*rule| {
+        if (rule.pseudo != pseudo) {
+            continue;
+        }
+        if (matchesSelector(el, rule.selector, frame)) {
+            try matched.append(frame.call_arena, rule);
+        }
+    }
+
+    std.mem.sort(*const PseudoRule, matched.items, {}, struct {
+        fn lessThan(_: void, a: *const PseudoRule, b: *const PseudoRule) bool {
+            return a.priority < b.priority;
+        }
+    }.lessThan);
+
+    for (matched.items) |rule| {
+        var it = CssParser.parseDeclarationsList(rule.declarations);
+        while (it.next()) |declaration| {
+            try target.applyParsedDeclaration(declaration, frame);
+        }
+    }
+}
 
 const VisibilityRule = struct {
     selector: Selector.Selector, // Single selector, not a list

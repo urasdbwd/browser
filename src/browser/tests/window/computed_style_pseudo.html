@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+
+<style>
+  ::before { letter-spacing: 1px; }
+  .box::before { content: "A"; color: red; }
+  .box::after { content: "Z"; }
+  #styled::before { color: blue; }
+  .box::before { font-weight: bold !important; }
+  #styled::before { font-weight: normal; }
+  .box:hover::before { text-transform: uppercase; }
+  input::placeholder { color: gray; }
+</style>
+
+<body>
+  <div id="styled" class="box" style="color: green"></div>
+  <div id="plain"></div>
+  <input id="field">
+</body>
+
+<script id=computedStylePseudoBasic>
+{
+  const before = getComputedStyle($('#styled'), '::before');
+  testing.expectEqual('"A"', before.content);
+  // A bare `::before` rule matches any element.
+  testing.expectEqual('1px', before.letterSpacing);
+}
+</script>
+
+<script id=computedStylePseudoLegacySpelling>
+{
+  // The single-colon spelling is still accepted by every browser.
+  testing.expectEqual('"A"', getComputedStyle($('#styled'), ':before').content);
+}
+</script>
+
+<script id=computedStylePseudoCascade>
+{
+  const before = getComputedStyle($('#styled'), '::before');
+  // #styled beats .box on specificity...
+  testing.expectEqual('blue', before.color);
+  // ...but not over !important.
+  testing.expectEqual('bold', before.fontWeight);
+}
+</script>
+
+<script id=computedStylePseudoIsolated>
+{
+  const el = $('#styled');
+  // ::before and ::after are separate boxes with separate styles.
+  testing.expectEqual('"Z"', getComputedStyle(el, '::after').content);
+  testing.expectEqual('', getComputedStyle(el, '::after').color);
+  // Each call hands out a distinct object, like Chrome.
+  testing.expectEqual(false, getComputedStyle(el, '::before') === getComputedStyle(el, '::before'));
+  // The element's own inline style is not the pseudo box's style.
+  testing.expectEqual('green', getComputedStyle(el).color);
+}
+</script>
+
+<script id=computedStylePseudoNoMatch>
+{
+  // #plain has no class, so only the universal rule applies.
+  const before = getComputedStyle($('#plain'), '::before');
+  testing.expectEqual('', before.content);
+  testing.expectEqual('1px', before.letterSpacing);
+  // :hover never matches in a headless engine.
+  testing.expectEqual('', getComputedStyle($('#styled'), '::before').textTransform);
+}
+</script>
+
+<script id=computedStylePseudoPlaceholder>
+{
+  testing.expectEqual('gray', getComputedStyle($('#field'), '::placeholder').color);
+  testing.expectEqual('', getComputedStyle($('#styled'), '::placeholder').color);
+}
+</script>
+
+<script id=computedStylePseudoUnknown>
+{
+  // An unrecognized pseudo-element yields an empty style rather than throwing.
+  const style = getComputedStyle($('#styled'), '::made-up');
+  testing.expectEqual('', style.content);
+  testing.expectEqual('object', typeof style);
+}
+</script>

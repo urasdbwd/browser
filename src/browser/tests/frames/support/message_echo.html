@@ -1,0 +1,10 @@
+<!DOCTYPE html>
+<script>
+  // Echoes back whatever reaches us, so the opener can tell which of several
+  // posts were actually delivered. Announces readiness first: the opener has no
+  // reliable load signal for a cross-origin frame.
+  window.addEventListener('message', (e) => {
+    window.top.postMessage({echo: e.data}, '*');
+  });
+  window.top.postMessage({ready: true}, '*');
+</script>
