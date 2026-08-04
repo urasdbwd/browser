@@ -12,6 +12,7 @@ F=
 ZIGFLAGS ?=
 PI_OPTIMIZE ?= ReleaseSmall
 PI_JOBS ?= 1
+BENCH_ITERS ?= 5
 
 # OS and ARCH
 kernel = $(shell uname -ms)
@@ -138,6 +139,10 @@ test-client:
 	@command -v node >/dev/null 2>&1 \
 		&& node --test src/render/client.test.mjs \
 		|| printf "\033[33mnode not found: skipping src/render/client.test.mjs\033[0m\n"
+
+## Measure cold-start time, peak RSS and binary size (BENCH_ITERS=5)
+bench:
+	@bench/run.sh zig-out/bin/lightpanda $(BENCH_ITERS)
 
 ## Run demo/runner end to end tests
 end2end:

@@ -145,6 +145,11 @@ pub fn build(b: *Build) !void {
                 },
             }),
         });
+        // Drops the vendored C that `trimCLibrary` split into per-function
+        // sections but nothing references. Worth ~0 on mach-o, which already
+        // dead-strips per symbol via subsections-via-symbols; it is the ELF
+        // (Raspberry Pi) target this is here for.
+        exe.link_gc_sections = true;
         b.installArtifact(exe);
 
         const exe_check = b.addLibrary(.{
@@ -306,6 +311,7 @@ fn linkSqlite(b: *Build, mod: *Build.Module, enable_csan: ?std.zig.SanitizeC, is
     const lib = dep.artifact("sqlite3");
     lib.root_module.sanitize_c = enable_csan;
     lib.root_module.sanitize_thread = is_tsan;
+    trimCLibrary(lib);
 
     const macros = [_]struct { []const u8, []const u8 }{
         .{ "SQLITE_DEFAULT_FILE_PERMISSIONS", "0600" },
@@ -411,6 +417,25 @@ fn linkCurl(b: *Build, mod: *Build.Module, is_tsan: bool) !void {
     }
 }
 
+/// Trim a vendored C dependency. None of them throw or unwind through their
+/// own frames, so their unwind tables are pure binary weight. Splitting
+/// functions and data into their own sections lets the final link's
+/// `--gc-sections` (`-dead_strip` on mach-o) drop the parts curl, boringssl
+/// and sqlite compile in but we never call.
+///
+/// Measured on macos-aarch64 (ReleaseFast, prebuilt V8): -269 KiB of
+/// __eh_frame + __unwind_info, -279 KiB of binary. boringssl keeps some,
+/// because `-fno-unwind-tables` cannot strip the CFI its perlasm writes by
+/// hand.
+///
+/// Deliberately not applied to the Zig side: `std.debug` still wants to walk
+/// its own frames for error-return traces and `src/crash_handler.zig`.
+fn trimCLibrary(lib: *Build.Step.Compile) void {
+    lib.root_module.unwind_tables = .none;
+    lib.link_function_sections = true;
+    lib.link_data_sections = true;
+}
+
 fn buildZlib(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, is_tsan: bool) *Build.Step.Compile {
     const dep = b.dependency("zlib", .{});
 
@@ -422,6 +447,7 @@ fn buildZlib(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.Opti
     });
 
     const lib = b.addLibrary(.{ .name = "z", .root_module = mod });
+    trimCLibrary(lib);
     lib.installHeadersDirectory(dep.path(""), "", .{});
     mod.addCSourceFiles(.{
         .root = dep.path(""),
@@ -455,6 +481,7 @@ fn buildBrotli(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.Op
     common_mod.addIncludePath(dep.path("c/include"));
 
     const brotlicmn = b.addLibrary(.{ .name = "brotlicommon", .root_module = common_mod });
+    trimCLibrary(brotlicmn);
 
     brotlicmn.installHeadersDirectory(dep.path("c/include/brotli"), "brotli", .{});
     common_mod.addCSourceFiles(.{
@@ -480,6 +507,7 @@ fn buildBrotli(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.Op
         },
     });
     const brotlidec = b.addLibrary(.{ .name = "brotlidec", .root_module = dec_mod });
+    trimCLibrary(brotlidec);
     dec_mod.linkLibrary(brotlicmn);
 
     const enc_mod = b.createModule(.{
@@ -503,6 +531,7 @@ fn buildBrotli(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.Op
         },
     });
     const brotlienc = b.addLibrary(.{ .name = "brotlienc", .root_module = enc_mod });
+    trimCLibrary(brotlienc);
     enc_mod.linkLibrary(brotlicmn);
 
     return .{ brotlicmn, brotlidec, brotlienc };
@@ -517,9 +546,11 @@ fn buildBoringSsl(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin
 
     const ssl = dep.artifact("ssl");
     ssl.bundle_ubsan_rt = false;
+    trimCLibrary(ssl);
 
     const crypto = dep.artifact("crypto");
     crypto.bundle_ubsan_rt = false;
+    trimCLibrary(crypto);
 
     return .{ ssl, crypto };
 }
@@ -545,6 +576,7 @@ fn buildNghttp2(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.O
     mod.addConfigHeader(config);
 
     const lib = b.addLibrary(.{ .name = "nghttp2", .root_module = mod });
+    trimCLibrary(lib);
 
     lib.installConfigHeader(config);
     lib.installHeadersDirectory(dep.path("lib/includes/nghttp2"), "nghttp2", .{});
@@ -831,6 +863,7 @@ fn buildCurl(
     curl_config.addValues(config);
 
     const lib = b.addLibrary(.{ .name = "curl", .root_module = mod });
+    trimCLibrary(lib);
     mod.addConfigHeader(curl_config);
     lib.installHeadersDirectory(dep.path("include/curl"), "curl", .{});
     mod.addCSourceFiles(.{
