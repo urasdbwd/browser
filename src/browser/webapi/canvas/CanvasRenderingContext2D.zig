@@ -43,9 +43,6 @@ _fp_seed: u64 = 0xcbf29ce484222325,
 _dirty: bool = false,
 _font: [96]u8 = "10px sans-serif".* ++ .{0} ** 81,
 _font_len: u8 = 15,
-_stroke_style: color.RGBA = color.RGBA.Named.black,
-_line_width: f64 = 1.0,
-_global_alpha: f64 = 1.0,
 _ops: [ops_capacity]u8 = undefined,
 _ops_len: u16 = 0,
 _ops_sent: u16 = 0,
@@ -227,37 +224,8 @@ pub fn setFillStyle(
     self.recordColor("FS", self._fill_style);
 }
 
-pub fn getStrokeStyle(self: *const CanvasRenderingContext2D, exec: *Execution) ![]const u8 {
-    var w = std.Io.Writer.Allocating.init(exec.local_arena);
-    try self._stroke_style.format(&w.writer);
-    return w.written();
-}
-
 pub fn setStrokeStyle(self: *CanvasRenderingContext2D, value: []const u8) void {
-    self._stroke_style = color.RGBA.parse(value) catch self._stroke_style;
-    self.recordColor("SS", self._stroke_style);
-}
-
-pub fn getLineWidth(self: *const CanvasRenderingContext2D) f64 {
-    return self._line_width;
-}
-
-pub fn setLineWidth(self: *CanvasRenderingContext2D, value: f64) void {
-    // Spec: non-finite and non-positive widths are ignored.
-    if (!std.math.isFinite(value) or value <= 0) return;
-    self._line_width = value;
-    self.record("[\"LW\",{d}]", .{value});
-}
-
-pub fn getGlobalAlpha(self: *const CanvasRenderingContext2D) f64 {
-    return self._global_alpha;
-}
-
-pub fn setGlobalAlpha(self: *CanvasRenderingContext2D, value: f64) void {
-    // Spec: values outside [0,1] and non-finite values are ignored.
-    if (!std.math.isFinite(value) or value < 0 or value > 1) return;
-    self._global_alpha = value;
-    self.record("[\"GA\",{d}]", .{value});
+    self.mixBytes(value);
 }
 
 pub fn getFont(self: *const CanvasRenderingContext2D) []const u8 {
@@ -698,14 +666,17 @@ pub const JsApi = struct {
 
     pub const canvas = bridge.accessor(CanvasRenderingContext2D.getCanvas, null, .{});
     pub const font = bridge.accessor(CanvasRenderingContext2D.getFont, CanvasRenderingContext2D.setFont, .{});
-    // strokeStyle/lineWidth/globalAlpha are accessors rather than plain
-    // properties so the replay log sees them; a game that only sets these would
-    // otherwise render with default paint on the client. They deliberately do
-    // not feed the fingerprint hash, keeping getImageData/toDataURL unchanged.
-    pub const globalAlpha = bridge.accessor(CanvasRenderingContext2D.getGlobalAlpha, CanvasRenderingContext2D.setGlobalAlpha, .{});
+    // ponytail: strokeStyle/lineWidth/globalAlpha stay plain JS properties, so
+    // the server never sees them and the replay log cannot carry them — strokes
+    // repaint on the client with default black at 1px and no alpha. Converting
+    // them to accessors is what you would reach for, and it does record them,
+    // but it also breaks JS class registration badly enough that unrelated pages
+    // stop building a DOM (four dump tests and an Input test fail). Upgrade path:
+    // fix the accessor registration in js/bridge.zig first, then flip these.
+    pub const globalAlpha = bridge.property(1.0, .{ .template = false, .readonly = false });
     pub const globalCompositeOperation = bridge.property("source-over", .{ .template = false, .readonly = false });
-    pub const strokeStyle = bridge.accessor(CanvasRenderingContext2D.getStrokeStyle, CanvasRenderingContext2D.setStrokeStyle, .{});
-    pub const lineWidth = bridge.accessor(CanvasRenderingContext2D.getLineWidth, CanvasRenderingContext2D.setLineWidth, .{});
+    pub const strokeStyle = bridge.property("#000000", .{ .template = false, .readonly = false });
+    pub const lineWidth = bridge.property(1.0, .{ .template = false, .readonly = false });
     pub const lineCap = bridge.property("butt", .{ .template = false, .readonly = false });
     pub const lineJoin = bridge.property("miter", .{ .template = false, .readonly = false });
     pub const miterLimit = bridge.property(10.0, .{ .template = false, .readonly = false });
