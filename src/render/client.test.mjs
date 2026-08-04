@@ -636,7 +636,11 @@ test("canvas pixels are mirrored into a replaced <img> the snapshot can lay out"
   canvas.width = 480;
   canvas.height = 280;
   canvas.toDataURL = () => "data:image/png;base64,AAAA";
-  canvas.ownerDocument = { createElement: makeElement };
+  canvas.style = {};
+  canvas.ownerDocument = {
+    createElement: makeElement,
+    defaultView: { getComputedStyle: () => ({ display: "inline" }) },
+  };
 
   const image = mirrorCanvasPixels(canvas);
   assert.equal(canvas.children.length, 1);
@@ -646,6 +650,9 @@ test("canvas pixels are mirrored into a replaced <img> the snapshot can lay out"
   assert.equal(image.getAttribute("width"), "480");
   assert.equal(image.getAttribute("height"), "280");
   assert.equal(image.getAttribute("src"), "data:image/png;base64,AAAA");
+  // An inline box does not wrap its block content, so the mirror would overflow
+  // the canvas and page borders would land in the wrong place.
+  assert.equal(canvas.style.display, "inline-block");
 
   // A later frame updates the same mirror instead of stacking a second one.
   canvas.toDataURL = () => "data:image/png;base64,BBBB";

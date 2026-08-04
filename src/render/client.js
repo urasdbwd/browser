@@ -514,6 +514,15 @@ export function mirrorCanvasPixels(canvas) {
     image.setAttribute("style", "display:block");
     canvas.append(image);
   }
+  // Non-replaced means plain `inline`, and an inline box does not wrap around
+  // its block content: the mirror renders but overflows a 3.75x21.25 canvas box,
+  // so page borders and backgrounds land in the wrong place. Restore the
+  // shrink-wrap a replaced element would have had, and only when the page did
+  // not pick a display of its own.
+  const view = canvas.ownerDocument.defaultView;
+  if (view?.getComputedStyle?.(canvas).display === "inline") {
+    canvas.style.display = "inline-block";
+  }
   // The intrinsic size comes from the canvas's own bitmap dimensions, so page
   // CSS that targets the canvas still positions and decorates the box.
   if (image.getAttribute("width") !== String(canvas.width)) {
