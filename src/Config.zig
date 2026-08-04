@@ -974,16 +974,25 @@ pub fn blockedUrlPatterns(self: *const Config) ?std.mem.SplitIterator(u8, .scala
     return std.mem.splitScalar(u8, patterns, ',');
 }
 
+// The pi defaults were 2, justified by memory. `bench/sessions.sh` refutes
+// that: a session costs 6.3 MiB marginal on the pi profile (23.8 MiB fixed),
+// so a 1 GB board affords well over a hundred before RAM binds. The real
+// constraint is CPU — 4 cores with v8ThreadPoolSize=1 — so 8 is chosen for
+// headroom on the mostly-idle sessions an agent workload produces, not from a
+// CPU measurement on real hardware. Lower it with --cdp-max-connections /
+// --max-connections if your pages are CPU-bound.
+const pi_max_sessions = 8;
+
 pub fn maxConnections(self: *const Config) u16 {
     return switch (self.mode) {
         .serve => |opts| opts.cdp_max_connections orelse
-            memoryCappedSessions(if (self.resourceProfile() == .pi) 2 else 16),
+            memoryCappedSessions(if (self.resourceProfile() == .pi) pi_max_sessions else 16),
         .render => |opts| blk: {
-            const default: u16 = if (self.resourceProfile() == .pi) 2 else 8;
+            const default: u16 = if (self.resourceProfile() == .pi) pi_max_sessions else 8;
             break :blk @max(opts.max_connections orelse memoryCappedSessions(default), 1);
         },
         .mcp => |opts| blk: {
-            const default: u16 = if (self.resourceProfile() == .pi) 2 else 16;
+            const default: u16 = if (self.resourceProfile() == .pi) pi_max_sessions else 16;
             break :blk @max(opts.max_connections orelse memoryCappedSessions(default), 1);
         },
         .fetch, .agent => 0,
@@ -1075,7 +1084,7 @@ pub fn mcpMaxSessions(self: *const Config) u16 {
         .serve, .fetch, .render, .agent => null,
         else => unreachable,
     };
-    const default: u16 = if (profile == .pi) 2 else 16;
+    const default: u16 = if (profile == .pi) pi_max_sessions else 16;
     return @max(configured orelse memoryCappedSessions(default), 1);
 }
 
@@ -1448,7 +1457,7 @@ test "Config: pi resource profile bounds expensive defaults" {
     try std.testing.expectEqual(@as(u8, 2), config.httpMaxHostOpen());
     try std.testing.expectEqual(@as(?usize, 32 * 1024 * 1024), config.httpMaxResponseSize());
     try std.testing.expectEqual(@as(u8, 2), config.wsMaxConcurrent());
-    try std.testing.expectEqual(@as(u16, 2), config.maxConnections());
+    try std.testing.expectEqual(@as(u16, pi_max_sessions), config.maxConnections());
     try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), config.mcpMaxResponseSize());
     try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), config.mcpMaxRequestSize());
     try std.testing.expectEqual(@as(u31, 16), config.maxPendingConnections());
@@ -1556,8 +1565,8 @@ test "Config: pi resource profile caps MCP isolates" {
     } });
     defer config.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(u16, 2), config.mcpMaxSessions());
-    try std.testing.expectEqual(@as(u16, 2), config.maxConnections());
+    try std.testing.expectEqual(@as(u16, pi_max_sessions), config.mcpMaxSessions());
+    try std.testing.expectEqual(@as(u16, pi_max_sessions), config.maxConnections());
     try std.testing.expectEqual(@as(u32, 256 * 1024), config.cdpMaxMessageSize());
     try std.testing.expectEqual(@as(u14, 4096), config.cdpMaxHTTPMessageSize());
     try std.testing.expect(!config.metricsEndpointEnabled());
@@ -1586,7 +1595,7 @@ test "Config: render handoff defaults are Pi-class and bounded" {
     try std.testing.expect(config.clientSideRendering());
     try std.testing.expectEqual(ResourceProfile.pi, config.resourceProfile());
     try std.testing.expectEqual(@as(?u32, 64), config.v8MaxHeapMb());
-    try std.testing.expectEqual(@as(u16, 2), config.maxConnections());
+    try std.testing.expectEqual(@as(u16, pi_max_sessions), config.maxConnections());
     try std.testing.expectEqual(@as(u31, 8), config.maxPendingConnections());
     try std.testing.expectEqual(@as(usize, 16 * 1024), config.renderMaxRequestSize());
     try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), config.renderMaxResponseSize());
