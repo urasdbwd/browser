@@ -1,0 +1,40 @@
+<!doctype html>
+<html><head><meta charset=utf-8><title>turnstile probe</title></head>
+<body>
+<h1>Turnstile probe</h1>
+<!-- Cloudflare's documented test sitekeys. Which one is used is chosen by the
+     ?k= query param so one page covers every mode. -->
+<form id=f>
+  <div id=w></div>
+  <button type=submit>submit</button>
+</form>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+<script>
+  const KEYS = {
+    pass:        '1x00000000000000000000AA', // always passes, visible
+    block:       '2x00000000000000000000AB', // always blocks
+    interactive: '3x00000000000000000000FF', // forces an interactive challenge
+    invisible:   '1x00000000000000000000BB', // always passes, invisible
+  };
+  const mode = new URLSearchParams(location.search).get('k') || 'pass';
+  document.getElementById('w').className = 'cf-turnstile';
+  document.getElementById('w').setAttribute('data-sitekey', KEYS[mode] || KEYS.pass);
+  console.log('PROBE mode=' + mode + ' sitekey=' + (KEYS[mode] || KEYS.pass));
+
+  // Report what the page can see, on a timer, so we capture the whole lifecycle.
+  let ticks = 0;
+  const iv = setInterval(() => {
+    ticks++;
+    const input = document.querySelector('[name=cf-turnstile-response]');
+    const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+    console.log('PROBE t=' + ticks +
+      ' apiLoaded=' + (typeof window.turnstile !== 'undefined') +
+      ' widget=' + !!document.querySelector('.cf-turnstile') +
+      ' iframe=' + !!iframe +
+      ' input=' + !!input +
+      ' tokenLen=' + (input && input.value ? input.value.length : 0) +
+      ' title=' + JSON.stringify(document.title));
+    if (ticks >= 12) { clearInterval(iv); console.log('PROBE done'); }
+  }, 1000);
+</script>
+</body></html>
