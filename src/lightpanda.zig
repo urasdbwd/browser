@@ -193,6 +193,9 @@ pub const FetchOpts = struct {
     /// When true, click Turnstile widgets before selector/script waits that may
     /// depend on a response token.
     solve_captchas: bool = false,
+    /// Receives the solve outcome when solving ran. Left untouched otherwise,
+    /// so callers can distinguish "off" from "no widget".
+    turnstile: ?*Turnstile.Result = null,
 };
 /// Loads each url in `urls` in a fresh session and waits per `opts`.
 ///
@@ -254,7 +257,8 @@ pub fn fetch(app: *App, browser: *Browser, urls: []const [:0]const u8, opts: Fet
     if (opts.solve_captchas or app.config.solveCaptchas()) {
         // Outcome is logged by solveTurnstile; a challenge we could not solve
         // is not fatal here — the caller still gets whatever the page rendered.
-        _ = try runner.solveTurnstile(opts.wait_ms);
+        const result = try runner.solveTurnstile(opts.wait_ms);
+        if (opts.turnstile) |out| out.* = result;
     }
 
     if (opts.wait_until) |wu| {
@@ -273,7 +277,10 @@ pub fn fetch(app: *App, browser: *Browser, urls: []const [:0]const u8, opts: Fet
         // failure. Plenty of real pages never go idle — a Cloudflare challenge
         // frame polls for the lifetime of the document — and dumping what we
         // have beats exiting fatal with no output at all.
-        runner.waitForAll(opts.wait_ms, .{ .until = .done }) catch |err| switch (err) {
+        // Shares the one `wait_ms` budget with the solve above; restarting it
+        // here would make `--wait-ms N` cost 2N on a challenge page.
+        const elapsed: u32 = @intCast(timer.untilNow(io, .boot).toMilliseconds());
+        runner.waitForAll(opts.wait_ms -| elapsed, .{ .until = .done }) catch |err| switch (err) {
             error.Timeout => {},
             else => return err,
         };

@@ -157,6 +157,11 @@ pub const Outcome = struct {
     target_version: ?[16]u8 = null,
     can_go_back: bool = false,
     can_go_forward: bool = false,
+    /// Turnstile solve outcome for the document currently loaded
+    /// (`no_widget` / `solved` / `timeout`), or null when solving is off.
+    /// Set by navigation and carried until the next one — it describes the
+    /// page, so a `click` that does not navigate keeps reporting it.
+    turnstile: ?[]const u8 = null,
 };
 
 /// Surfaced to the client when a document is too large to serialize. A notice
@@ -228,6 +233,7 @@ targets: TargetTable = .{},
 next_target_generation: u64,
 target_key_secret: u64,
 direct_resources: bool,
+turnstile: ?[]const u8 = null,
 
 pub fn process(
     state: *?LiveSession,
@@ -279,6 +285,7 @@ pub fn processParsed(
             .target_version = targetVersion(live.targets.generation),
             .can_go_back = live.session.navigation.getCanGoBack(),
             .can_go_forward = live.session.navigation.getCanGoForward(),
+            .turnstile = live.turnstile,
         };
     }
 
@@ -336,6 +343,7 @@ pub fn processParsed(
         .target_version = if (snapshot) targetVersion(live.targets.generation) else null,
         .can_go_back = live.session.navigation.getCanGoBack(),
         .can_go_forward = live.session.navigation.getCanGoForward(),
+        .turnstile = live.turnstile,
     };
 }
 
@@ -383,6 +391,7 @@ fn init(
     const page = session.createPage() catch return error.InternalError;
     const frame = page.frame() orelse return error.InternalError;
     _ = try remainingCommandMs(deadline);
+    const started: std.Io.Timestamp = .now(lp.io, .boot);
     frame.navigate(canonical, .{
         .reason = .address_bar,
         .kind = .{ .push = null },
@@ -394,6 +403,7 @@ fn init(
         @min(command.wait_ms, try remainingCommandMs(deadline)),
         .{ .until = command.wait_until orelse default_navigation_wait },
     ) catch |err| return mapWaitError(err);
+    const turnstile = solveTurnstile(app, session, command.wait_ms, started, deadline);
 
     var target_random: [2]u64 = undefined;
     std.Io.randomSecure(lp.io, std.mem.asBytes(&target_random)) catch
@@ -413,6 +423,7 @@ fn init(
         .next_target_generation = next_target_generation,
         .target_key_secret = target_key_secret,
         .direct_resources = command.direct_resources.enabled(app.config),
+        .turnstile = turnstile,
     };
 }
 
@@ -493,6 +504,7 @@ fn navigateAndWait(
     self.notification.register(.frame_navigate_failed, &attempt, NavigationAttempt.onFailed) catch
         return error.InternalError;
     defer self.notification.unregister(.frame_navigate_failed, &attempt);
+    const started: std.Io.Timestamp = .now(lp.io, .boot);
     self.session.navigateRoot(self.page.frame_id, url, opts) catch |err|
         return mapNavigationActionError(err);
 
@@ -503,6 +515,9 @@ fn navigateAndWait(
         .{ .until = command.wait_until orelse default_navigation_wait },
     ) catch |err| return mapWaitError(err);
     if (attempt.failed) return error.NavigationFailed;
+    // Every navigation, not just the session's first: a live client can browse
+    // into a protected page at any point.
+    self.turnstile = solveTurnstile(self.app, self.session, command.wait_ms, started, deadline);
 }
 
 fn click(self: *LiveSession, command: Command, deadline: std.Io.Timestamp) ProcessError!void {
@@ -864,6 +879,41 @@ fn canonicalURL(arena: std.mem.Allocator, raw: []const u8) ProcessError![:0]cons
         return error.BadRequest;
     }
     return canonical;
+}
+
+/// Blocking managed-Turnstile solve for a freshly navigated page, so the
+/// snapshot we ship is the post-solve DOM rather than the challenge page.
+/// Honours `--solve-captchas` (auto = on under `--stealth`) exactly as `fetch`
+/// does. Returns the outcome tag, or null when solving is off.
+///
+/// `started` is when the navigation began: the solve gets whatever is left of
+/// the command's `wait_ms`, never a fresh budget, and is capped by `deadline`.
+/// An ordinary page costs only the time to go idle — `Runner.solveTurnstile`
+/// returns `.no_widget` the first time the frame settles with nothing to solve.
+fn solveTurnstile(
+    app: *App,
+    session: *lp.Session,
+    wait_ms: u32,
+    started: std.Io.Timestamp,
+    deadline: std.Io.Timestamp,
+) ?[]const u8 {
+    if (app.config.solveCaptchas() == false) return null;
+    const spent: u32 = @intCast(started.untilNow(lp.io, .boot).toMilliseconds());
+    // No budget left means we never looked, which is not an outcome. The
+    // command's own deadline check reports the timeout.
+    const remaining = remainingCommandMs(deadline) catch return null;
+    const budget = @min(wait_ms -| spent, remaining);
+    if (budget == 0) return null;
+
+    var runner = session.runner(.{});
+    // A solve we could not finish is not fatal: the caller still gets the
+    // snapshot, and the outcome tells it what it is looking at.
+    const result = runner.solveTurnstile(budget) catch |err| {
+        lp.log.debug(.app, "live turnstile solve", .{ .err = @errorName(err) });
+        return null;
+    };
+    lp.log.info(.app, "live turnstile", .{ .result = @tagName(result), .budget_ms = budget });
+    return @tagName(result);
 }
 
 fn commandDeadline(max_wait_ms: u32) std.Io.Timestamp {
