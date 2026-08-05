@@ -60,11 +60,14 @@ pub const Result = enum { allowed, blocked, pending };
 // Spec predicates
 // ---------------------------------------------------------------------------
 
-pub fn sameOrigin(arena: Allocator, origin: []const u8, url: [:0]const u8) bool {
+// Is this request outside CORS entirely — same-origin, or not an HTTP(S) url
+// at all? A blob:, data: or about: url is fetched by scheme rather than over
+// the network, so it has no origin to compare and never needs a grant.
+fn exempt(arena: Allocator, origin: []const u8, url: [:0]const u8) bool {
     // ponytail: byte comparison of the serialized origins. Good enough
     // because both sides come out of URL.resolve/getOrigin; it does not
     // normalize a default port written explicitly (http://x:80 vs http://x).
-    const other = (URL.getOrigin(arena, url) catch return false) orelse return false;
+    const other = (URL.getOrigin(arena, url) catch return true) orelse return true;
     return std.mem.eql(u8, origin, other);
 }
 
@@ -167,7 +170,7 @@ pub fn responseAllowed(transfer: *Transfer) bool {
     // the initiator turns it into an opaque filtered response instead.
     if (params.mode == .no_cors) return true;
 
-    if (sameOrigin(transfer.arena.allocator(), params.origin, transfer.req.url)) {
+    if (exempt(transfer.arena.allocator(), params.origin, transfer.req.url)) {
         return true;
     }
     if (params.mode == .same_origin) return false;
@@ -192,7 +195,7 @@ pub const Expose = struct {
 pub fn exposeFilter(transfer: *Transfer) ?Expose {
     const params = transfer.req.cors orelse return null;
     if (params.mode == .no_cors) return null;
-    if (sameOrigin(transfer.arena.allocator(), params.origin, transfer.req.url)) return null;
+    if (exempt(transfer.arena.allocator(), params.origin, transfer.req.url)) return null;
     return .{
         .list = headerValue(transfer, "access-control-expose-headers") orelse "",
         .credentialed = params.credentialed,
@@ -255,7 +258,7 @@ pub fn check(self: *Cors, transfer: *Transfer) !Result {
     const arena = transfer.arena.allocator();
     const method = transfer.req.method;
 
-    if (sameOrigin(arena, params.origin, transfer.req.url)) {
+    if (exempt(arena, params.origin, transfer.req.url)) {
         // Fetch §5.7: same-origin requests still carry Origin unless the
         // method is GET or HEAD.
         if (!(method == .GET or method == .HEAD)) {
