@@ -177,6 +177,8 @@ const Job = struct {
     deadline: std.Io.Timestamp = .zero,
     owner: u64 = 0,
     live_outcome: LiveSession.Outcome = .{ .id = 0 },
+    /// One-shot render: Turnstile outcome tag, null when solving is off.
+    turnstile: ?[]const u8 = null,
     result: Result = .ok,
     done: std.Io.Event = .unset,
     next: ?*Job = null,
@@ -631,8 +633,14 @@ fn processRender(
 ) void {
     browser.viewport_override = .{ .width = request.width, .height = request.height };
 
+    // `lp.fetch` runs the solve itself when `--solve-captchas` is on (auto = on
+    // under `--stealth`), sharing the one wait budget with the page waits. It
+    // only writes here when it ran, so the config decides whether we report.
+    var turnstile: lp.Turnstile.Result = .no_widget;
+
     var urls = [_][:0]const u8{request.url};
     lp.fetch(self.app, browser, &urls, .{
+        .turnstile = &turnstile,
         .wait_ms = @min(request.wait_ms, max_wait_ms),
         .wait_until = request.wait_until,
         .wait_selector = request.wait_selector,
@@ -657,6 +665,10 @@ fn processRender(
         };
         return;
     };
+    if (self.app.config.solveCaptchas()) {
+        job.turnstile = @tagName(turnstile);
+        lp.log.info(.app, "render turnstile", .{ .result = job.turnstile });
+    }
     job.result = .ok;
 }
 
@@ -765,10 +777,11 @@ fn serve(
             client_etag,
             preferences,
             cors_value,
+            null,
         );
     }
     if ((request.head.method == .GET or request.head.method == .HEAD) and std.mem.eql(u8, path, "/healthz")) {
-        return respondBody(request, "ok\n", .ok, "text/plain; charset=utf-8", "no-store", null, .{}, cors_value);
+        return respondBody(request, "ok\n", .ok, "text/plain; charset=utf-8", "no-store", null, .{}, cors_value, null);
     }
     if (request.head.method != .POST or !std.mem.eql(u8, path, "/v1/render")) {
         return respondJson(request, .not_found, "{\"error\":\"not found\"}\n", cors_value);
@@ -835,6 +848,7 @@ fn serve(
         null,
         preferences,
         cors_value,
+        job.turnstile,
     );
 }
 
@@ -1095,7 +1109,7 @@ fn sendLiveResult(
     else
         EncodedLiveSnapshot{ .bytes = &.{}, .encoding = .identity };
 
-    var buffer: [512]u8 = undefined;
+    var buffer: [640]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     try writeLiveMetadata(job, payload.encoding, body.len, delta, &writer);
     try websocket.writeMessage(writer.buffered(), .text);
@@ -1142,6 +1156,9 @@ fn writeLiveMetadata(
             .snapshot_delta = snapshot_delta,
             .can_go_back = job.live_outcome.can_go_back,
             .can_go_forward = job.live_outcome.can_go_forward,
+            // null unless --solve-captchas is active. Lets a client tell a real
+            // page from a snapshot of an unsolved challenge.
+            .turnstile = job.live_outcome.turnstile,
         }, .{}, writer);
     } else {
         try std.json.Stringify.value(.{
@@ -1184,12 +1201,13 @@ fn respondBody(
     etag: ?[]const u8,
     preferences: Compression.Preferences,
     cors_value: ?[]const u8,
+    turnstile: ?[]const u8,
 ) !void {
     var compression = Compression.Stream.init(preferences, body) orelse
         return respondNotAcceptable(request, cors_value);
     defer compression.deinit();
 
-    var headers: [8]std.http.Header = undefined;
+    var headers: [10]std.http.Header = undefined;
     var count: usize = 0;
     headers[count] = .{ .name = "content-type", .value = content_type };
     count += 1;
@@ -1212,6 +1230,14 @@ fn respondBody(
         count += 1;
         headers[count] = .{ .name = "cross-origin-resource-policy", .value = "cross-origin" };
         count += 1;
+    }
+    // A snapshot of an unsolved challenge page is otherwise indistinguishable
+    // from the real thing. The body is HTML, so a header is the only slot.
+    if (turnstile) |value| {
+        headers[count] = .{ .name = "x-lp-turnstile", .value = value };
+        count += 1;
+        // ponytail: not in access-control-expose-headers — the render API is
+        // server-to-server. Add it when a browser client needs to read this.
     }
 
     if (compression.encoding == .identity) {
@@ -1469,7 +1495,7 @@ test "render server: live metadata carries target version and stale error" {
     var metadata: std.Io.Writer = .fixed(&metadata_buffer);
     try writeLiveMetadata(&job, .br, 4_096, null, &metadata);
     try std.testing.expectEqualStrings(
-        "{\"id\":7,\"ok\":true,\"snapshot\":true,\"closed\":false,\"warning\":null,\"target_version\":\"0123456789abcdef\",\"snapshot_encoding\":\"br\",\"snapshot_bytes\":4096,\"snapshot_delta\":null,\"can_go_back\":false,\"can_go_forward\":false}",
+        "{\"id\":7,\"ok\":true,\"snapshot\":true,\"closed\":false,\"warning\":null,\"target_version\":\"0123456789abcdef\",\"snapshot_encoding\":\"br\",\"snapshot_bytes\":4096,\"snapshot_delta\":null,\"can_go_back\":false,\"can_go_forward\":false,\"turnstile\":null}",
         metadata.buffered(),
     );
 
@@ -1477,7 +1503,7 @@ test "render server: live metadata carries target version and stale error" {
     metadata = .fixed(&metadata_buffer);
     try writeLiveMetadata(&job, .identity, 0, null, &metadata);
     try std.testing.expectEqualStrings(
-        "{\"id\":7,\"ok\":true,\"snapshot\":false,\"closed\":false,\"warning\":null,\"target_version\":null,\"snapshot_encoding\":null,\"snapshot_bytes\":0,\"snapshot_delta\":null,\"can_go_back\":false,\"can_go_forward\":false}",
+        "{\"id\":7,\"ok\":true,\"snapshot\":false,\"closed\":false,\"warning\":null,\"target_version\":null,\"snapshot_encoding\":null,\"snapshot_bytes\":0,\"snapshot_delta\":null,\"can_go_back\":false,\"can_go_forward\":false,\"turnstile\":null}",
         metadata.buffered(),
     );
 
