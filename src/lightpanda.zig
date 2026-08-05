@@ -194,6 +194,12 @@ pub fn Once(comptime f: fn () void) type {
 /// as an error, where this one is best-effort and keeps the partial dump.
 const default_settle_ms: u32 = 500;
 
+/// Budget for the implicit settle: the cap, or the caller's override, but
+/// never more than the wait they actually allowed.
+fn settleBudget(wait_ms: u32, settle_ms: ?u32) u32 {
+    return @min(wait_ms, settle_ms orelse default_settle_ms);
+}
+
 pub const FetchOpts = struct {
     wait_ms: u32 = 5000,
     /// Overrides `default_settle_ms` for the implicit settle. Still capped by
@@ -294,7 +300,7 @@ pub fn fetch(app: *App, browser: *Browser, urls: []const [:0]const u8, opts: Fet
         // Which is exactly why it does NOT get the caller's whole wait_ms: a
         // page that never settles would charge every single load the full
         // budget. Raise `settle_ms` if a page really does hydrate late.
-        const settle = @min(opts.wait_ms, opts.settle_ms orelse default_settle_ms);
+        const settle = settleBudget(opts.wait_ms, opts.settle_ms);
         runner.waitForAll(settle, .{ .until = .done }) catch |err| switch (err) {
             error.Timeout => {},
             else => return err,
@@ -537,6 +543,22 @@ pub const RC = struct {
 };
 
 const testing = @import("testing.zig");
+
+test "fetch: the implicit settle never spends the whole wait budget" {
+    // The regression this guards: a page that never goes idle used to burn
+    // all of wait_ms on a wait nobody asked for.
+    try testing.expectEqual(@as(u32, 500), settleBudget(5000, null));
+    try testing.expectEqual(@as(u32, 500), settleBudget(30_000, null));
+
+    // A caller who allowed less than the cap still only gets what they allowed.
+    try testing.expectEqual(@as(u32, 200), settleBudget(200, null));
+    try testing.expectEqual(@as(u32, 100), settleBudget(100, 5000));
+
+    // ...and settle_ms is the way back to the old behaviour.
+    try testing.expectEqual(@as(u32, 5000), settleBudget(5000, 5000));
+    try testing.expectEqual(@as(u32, 0), settleBudget(5000, 0));
+}
+
 test "writeJsonEnvelope: null frame" {
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
