@@ -184,6 +184,7 @@ fn run(allocator: Allocator, main_arena: Allocator, proc_args: std.process.Args)
 
             var fetch_opts = lp.FetchOpts{
                 .wait_ms = opts.wait_ms,
+                .settle_ms = opts.settle_ms,
                 .wait_until = opts.wait_until,
                 .wait_script = opts.wait_script,
                 .inject_script = opts.inject_script,

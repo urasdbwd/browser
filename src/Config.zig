@@ -409,6 +409,7 @@ const Commands = cli.Builder(.{
             .{ .name = "with_frames", .type = bool },
             .{ .name = "strip_mode", .type = dump.Opts.Strip, .default = dump.Opts.Strip{} },
             .{ .name = "wait_ms", .type = u32, .default = 5_000 },
+            .{ .name = "settle_ms", .type = ?u32 },
             .{ .name = "wait_until", .type = ?WaitUntil },
             .{
                 .name = "wait_script",
@@ -445,6 +446,7 @@ const Commands = cli.Builder(.{
             .{ .name = "max_response_size", .type = ?usize },
             .{ .name = "max_wait_ms", .type = ?u32 },
             .{ .name = "client_timeout_ms", .type = ?u32 },
+            .{ .name = "workers", .type = ?u16 },
         },
         .shared_options = CommonOptions,
     },
@@ -1062,6 +1064,26 @@ pub fn renderMaxWaitMs(self: *const Config) u32 {
         .render => |opts| blk: {
             const default: u32 = if (self.resourceProfile() == .pi) 10_000 else 30_000;
             break :blk @max(opts.max_wait_ms orelse default, 1);
+        },
+        else => unreachable,
+    };
+}
+
+// Render worker threads. Each owns a V8 isolate, so this is the render
+// server's real concurrency: one worker meant every request queued behind
+// the one in front of it.
+//
+// Bounded by cores because a render is CPU-bound (parse + script), and by
+// memoryCappedSessions because an isolate is not free. Worker 0 is reserved
+// for the live endpoint, so the floor is 2 where we can afford it — with 1
+// worker an open live session makes every render 409.
+pub fn renderWorkers(self: *const Config) u16 {
+    return switch (self.mode) {
+        .render => |opts| blk: {
+            if (opts.workers) |w| break :blk @max(w, 1);
+            const cores = std.math.lossyCast(u16, std.Thread.getCpuCount() catch 1);
+            const cap: u16 = if (self.resourceProfile() == .pi) 2 else 4;
+            break :blk @max(memoryCappedSessions(@min(cap, @max(cores, 1))), 1);
         },
         else => unreachable,
     };

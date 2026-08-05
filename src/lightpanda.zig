@@ -180,8 +180,25 @@ pub fn Once(comptime f: fn () void) type {
     };
 }
 
+/// Budget for the implicit "let the page settle" wait taken when the caller
+/// asked for no wait at all. Pages that settle do so well inside this; pages
+/// that never settle never will, and used to burn the entire wait_ms on every
+/// load. Measured over example/HN/reddit/vercel/wikipedia/github: 4 of 6 are
+/// byte-identical to a 5s wait at 100ms, wikipedia needs 250ms, and the whole
+/// tail past here is worth <= 1.3% of the payload for 10x the latency.
+///
+/// Same 500ms as the network-idle hold in Frame.zig, deliberately.
+///
+/// Raise it with `settle_ms` for a page that hydrates late. `wait_until:
+/// .done` is NOT the escape hatch: an explicit wait propagates the timeout
+/// as an error, where this one is best-effort and keeps the partial dump.
+const default_settle_ms: u32 = 500;
+
 pub const FetchOpts = struct {
     wait_ms: u32 = 5000,
+    /// Overrides `default_settle_ms` for the implicit settle. Still capped by
+    /// `wait_ms`. Only consulted when the caller asked for no wait of its own.
+    settle_ms: ?u32 = null,
     wait_until: ?Config.WaitUntil = null,
     wait_script: ?[:0]const u8 = null,
     inject_script: std.ArrayList([]const u8) = .empty,
@@ -277,10 +294,15 @@ pub fn fetch(app: *App, browser: *Browser, urls: []const [:0]const u8, opts: Fet
         // failure. Plenty of real pages never go idle — a Cloudflare challenge
         // frame polls for the lifetime of the document — and dumping what we
         // have beats exiting fatal with no output at all.
-        // Shares the one `wait_ms` budget with the solve above; restarting it
-        // here would make `--wait-ms N` cost 2N on a challenge page.
+        //
+        // Two independent bounds apply. It shares the one `wait_ms` budget
+        // with the Turnstile solve above -- restarting it here would make
+        // `--wait-ms N` cost 2N on a challenge page -- and it is additionally
+        // capped by `settle_ms`, because a page that never settles would
+        // otherwise charge every load the full budget.
         const elapsed: u32 = @intCast(timer.untilNow(io, .boot).toMilliseconds());
-        runner.waitForAll(opts.wait_ms -| elapsed, .{ .until = .done }) catch |err| switch (err) {
+        const settle = @min(opts.wait_ms -| elapsed, opts.settle_ms orelse default_settle_ms);
+        runner.waitForAll(settle, .{ .until = .done }) catch |err| switch (err) {
             error.Timeout => {},
             else => return err,
         };

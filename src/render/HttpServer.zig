@@ -184,64 +184,98 @@ const Job = struct {
     next: ?*Job = null,
 };
 
+// Two intrusive lists behind one mutex and one condvar: renders, which any
+// worker may take, and live commands, which only the live worker may take
+// (it is the one holding that session's Session and V8 context). Sharing the
+// condvar is what keeps this a blocking queue rather than a poll.
 const Queue = struct {
     mutex: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
     head: ?*Job = null,
     tail: ?*Job = null,
+    live_head: ?*Job = null,
+    live_tail: ?*Job = null,
     closed: std.atomic.Value(bool) = .init(false),
+
+    // Which lists a given pop is allowed to drain.
+    const Take = enum {
+        render_only,
+        // Live jobs first: a queued live command must not sit behind a render.
+        any,
+        live_only,
+    };
 
     fn push(self: *Queue, job: *Job) bool {
         self.mutex.lockUncancelable(lp.io);
         defer self.mutex.unlock(lp.io);
         if (self.closed.load(.acquire)) return false;
         job.next = null;
-        if (self.tail) |tail| tail.next = job else self.head = job;
-        self.tail = job;
-        self.cond.signal(lp.io);
+        if (job.kind == .render) {
+            if (self.tail) |tail| tail.next = job else self.head = job;
+            self.tail = job;
+        } else {
+            if (self.live_tail) |tail| tail.next = job else self.live_head = job;
+            self.live_tail = job;
+        }
+        // Broadcast, not signal: the one worker allowed to take this job may
+        // not be the one a signal would wake.
+        self.cond.broadcast(lp.io);
         return true;
     }
 
-    fn pop(self: *Queue) ?*Job {
+    fn pop(self: *Queue, take: Take) ?*Job {
         self.mutex.lockUncancelable(lp.io);
         defer self.mutex.unlock(lp.io);
-        while (self.head == null and !self.closed.load(.acquire)) {
+        while (self.peek(take) == null and !self.closed.load(.acquire)) {
             self.cond.waitUncancelable(lp.io, &self.mutex);
         }
-        return self.takeHead();
+        return self.takeHead(take);
     }
 
-    fn tryPop(self: *Queue) ?*Job {
+    fn tryPop(self: *Queue, take: Take) ?*Job {
         self.mutex.lockUncancelable(lp.io);
         defer self.mutex.unlock(lp.io);
-        return self.takeHead();
+        return self.takeHead(take);
     }
 
-    fn popFor(self: *Queue, timeout_ms: u64) ?*Job {
-        return self.popForWaiting(timeout_ms, null);
+    fn popFor(self: *Queue, take: Take, timeout_ms: u64) ?*Job {
+        return self.popForWaiting(take, timeout_ms, null);
     }
 
-    fn popForWaiting(self: *Queue, timeout_ms: u64, waiting: ?*std.Io.Event) ?*Job {
+    fn popForWaiting(self: *Queue, take: Take, timeout_ms: u64, waiting: ?*std.Io.Event) ?*Job {
         self.mutex.lockUncancelable(lp.io);
         defer self.mutex.unlock(lp.io);
-        if (self.head == null and timeout_ms > 0 and !self.closed.load(.acquire)) {
+        if (self.peek(take) == null and timeout_ms > 0 and !self.closed.load(.acquire)) {
             if (waiting) |event| event.set(lp.io);
             lp.timedWait(&self.cond, &self.mutex, timeout_ms * ns_per_ms) catch {};
         }
-        return self.takeHead();
+        return self.takeHead(take);
     }
 
-    fn takeHead(self: *Queue) ?*Job {
-        const job = self.head orelse return null;
-        self.head = job.next;
-        if (self.head == null) self.tail = null;
+    fn peek(self: *const Queue, take: Take) ?*Job {
+        return switch (take) {
+            .render_only => self.head,
+            .any => self.live_head orelse self.head,
+            .live_only => self.live_head,
+        };
+    }
+
+    fn takeHead(self: *Queue, take: Take) ?*Job {
+        const job = self.peek(take) orelse return null;
+        if (job.kind == .render) {
+            self.head = job.next;
+            if (self.head == null) self.tail = null;
+        } else {
+            self.live_head = job.next;
+            if (self.live_head == null) self.live_tail = null;
+        }
         return job;
     }
 
     fn closedAndEmpty(self: *Queue) bool {
         self.mutex.lockUncancelable(lp.io);
         defer self.mutex.unlock(lp.io);
-        return self.closed.load(.acquire) and self.head == null;
+        return self.closed.load(.acquire) and self.head == null and self.live_head == null;
     }
 
     fn close(self: *Queue) void {
@@ -268,9 +302,12 @@ active_conns: std.atomic.Value(u32) = .init(0),
 conn_mutex: std.Io.Mutex = .init,
 conns: std.ArrayList(posix.socket_t) = .empty,
 
-worker_thread: std.Thread = undefined,
+// One thread per worker, each owning its own V8 isolate. Worker 0 is the
+// live worker: a live session pins the Session and context it was opened on,
+// so its commands must come back to the same thread.
+worker_threads: []std.Thread = &.{},
 browser_mutex: std.Io.Mutex = .init,
-active_browser: ?*lp.Browser = null,
+active_browsers: []?*lp.Browser = &.{},
 
 pub fn init(allocator: std.mem.Allocator, app: *App) !*HttpServer {
     const self = try allocator.create(HttpServer);
@@ -295,7 +332,29 @@ pub fn init(allocator: std.mem.Allocator, app: *App) !*HttpServer {
     errdefer self.conns.deinit(allocator);
     try self.conns.ensureTotalCapacity(allocator, self.max_connections);
 
-    self.worker_thread = try std.Thread.spawn(.{ .stack_size = worker_stack_size }, worker, .{self});
+    const worker_count = app.config.renderWorkers();
+    self.active_browsers = try allocator.alloc(?*lp.Browser, worker_count);
+    errdefer allocator.free(self.active_browsers);
+    @memset(self.active_browsers, null);
+
+    self.worker_threads = try allocator.alloc(std.Thread, worker_count);
+    errdefer allocator.free(self.worker_threads);
+
+    var spawned: usize = 0;
+    errdefer {
+        // Unwind a partial spawn: close the queue so the started workers
+        // fall out of their wait, then join them.
+        self.queue.close();
+        for (self.worker_threads[0..spawned]) |thread| thread.join();
+    }
+    while (spawned < worker_count) : (spawned += 1) {
+        self.worker_threads[spawned] = try std.Thread.spawn(
+            .{ .stack_size = worker_stack_size },
+            worker,
+            .{ self, spawned },
+        );
+    }
+    lp.log.note(.app, "client render workers", .{ .count = worker_count });
     return self;
 }
 
@@ -310,8 +369,10 @@ pub fn deinit(self: *HttpServer) void {
     while (self.active_conns.load(.acquire) > 0) {
         lp.io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
-    self.worker_thread.join();
+    for (self.worker_threads) |thread| thread.join();
 
+    self.allocator.free(self.worker_threads);
+    self.allocator.free(self.active_browsers);
     self.conns.deinit(self.allocator);
     self.live_tickets.deinit(self.allocator);
     self.allocator.destroy(self);
@@ -328,7 +389,9 @@ pub fn run(self: *HttpServer, address: sys_net.IpAddress) !void {
 fn terminateBrowser(self: *HttpServer) void {
     self.browser_mutex.lockUncancelable(lp.io);
     defer self.browser_mutex.unlock(lp.io);
-    if (self.active_browser) |browser| browser.env.terminate();
+    for (self.active_browsers) |maybe| {
+        if (maybe) |browser| browser.env.terminate();
+    }
 }
 
 fn onAccept(ctx: *anyopaque, socket: posix.socket_t) void {
@@ -409,13 +472,18 @@ fn unregister(self: *HttpServer, socket: posix.socket_t) void {
     }
 }
 
-fn worker(self: *HttpServer) void {
+fn worker(self: *HttpServer, index: usize) void {
+    // Only worker 0 serves the live endpoint; every other worker is renders
+    // only and never sees a live job.
+    const is_live_worker = index == 0;
+    const solo = self.worker_threads.len == 1;
+
     var browser: lp.Browser = undefined;
     var browser_initialized = false;
     defer if (browser_initialized) browser.deinit();
     defer {
         self.browser_mutex.lockUncancelable(lp.io);
-        self.active_browser = null;
+        self.active_browsers[index] = null;
         self.browser_mutex.unlock(lp.io);
     }
 
@@ -426,10 +494,23 @@ fn worker(self: *HttpServer) void {
     while (true) {
         if (browser_initialized and live == null) browser.http_client.heartbeat.disarm();
         const job = job: {
-            if (live == null) break :job self.queue.pop();
-            if (self.queue.tryPop()) |queued| break :job queued;
+            const take: Queue.Take = if (!is_live_worker)
+                .render_only
+            else if (live == null)
+                .any
+            else if (solo)
+                // Nobody else can serve renders, so keep taking them and keep
+                // answering 409 rather than leaving the client to time out.
+                .any
+            else
+                // A sibling worker will pick renders up; this thread belongs
+                // to the live session now.
+                .live_only;
+
+            if (live == null) break :job self.queue.pop(take);
+            if (self.queue.tryPop(take)) |queued| break :job queued;
             const delay_ms = if (live) |*session| session.pump() else unreachable;
-            break :job self.queue.popFor(liveWaitMs(delay_ms));
+            break :job self.queue.popFor(take, liveWaitMs(delay_ms));
         } orelse {
             if (self.queue.closedAndEmpty()) break;
             continue;
@@ -449,7 +530,7 @@ fn worker(self: *HttpServer) void {
                         break :initialized false;
                     };
                     browser_initialized = true;
-                    self.active_browser = &browser;
+                    self.active_browsers[index] = &browser;
                     break :initialized true;
                 };
                 if (!initialized) {
@@ -552,15 +633,12 @@ fn processLive(
 
 const RenderRequest = struct {
     url: []const u8,
-    // With no explicit wait_until the settle target is `.done` -- no macrotasks
-    // AND no network activity -- which plenty of real pages never reach: an
-    // analytics beacon, a poll, or an open event stream keeps it busy forever,
-    // so the request burns this budget in full and returns a slow success.
-    // Measured on vercel.com: 5.079s at 5000ms vs 0.084s with
-    // wait_until=domcontentloaded, for 1.3% more HTML. 1500ms keeps the
-    // "wait for late content" semantics while bounding the waste; pass an
-    // explicit wait_until (or a larger wait_ms) when a page needs longer.
-    wait_ms: u32 = 1_500,
+    wait_ms: u32 = 5_000,
+    // Caps only the implicit "let the page settle" wait, which chases `.done`
+    // (no macrotasks AND no network) -- a state many real pages never reach,
+    // so without a cap every load burns the full wait_ms. Raise it for a page
+    // that genuinely hydrates late.
+    settle_ms: ?u32 = null,
     wait_until: ?lp.Config.WaitUntil = null,
     wait_selector: ?[]const u8 = null,
     width: u32 = 1280,
@@ -571,6 +649,7 @@ const RenderRequest = struct {
 const PreparedRender = struct {
     url: [:0]const u8,
     wait_ms: u32,
+    settle_ms: ?u32,
     wait_until: ?lp.Config.WaitUntil,
     wait_selector: ?[:0]const u8,
     width: u32,
@@ -624,6 +703,7 @@ fn prepareRender(
     return .{
         .url = canonical,
         .wait_ms = request.wait_ms,
+        .settle_ms = request.settle_ms,
         .wait_until = request.wait_until,
         .wait_selector = selector,
         .width = request.width,
@@ -650,6 +730,7 @@ fn processRender(
     lp.fetch(self.app, browser, &urls, .{
         .turnstile = &turnstile,
         .wait_ms = @min(request.wait_ms, max_wait_ms),
+        .settle_ms = request.settle_ms,
         .wait_until = request.wait_until,
         .wait_selector = request.wait_selector,
         .dump = .{
@@ -1676,7 +1757,7 @@ test "render server: queue push wakes a timed waiter" {
         result: ?*Job = null,
 
         fn run(self: *@This()) void {
-            self.result = self.queue.popForWaiting(1_000, &self.ready);
+            self.result = self.queue.popForWaiting(.any, 1_000, &self.ready);
         }
     } = .{ .queue = &queue };
 
@@ -1685,6 +1766,39 @@ test "render server: queue push wakes a timed waiter" {
     try std.testing.expect(queue.push(&job));
     thread.join();
     try std.testing.expect(waiter.result == &job);
+}
+
+test "render server: only the live worker can take live jobs" {
+    // A live command pins the Session and V8 context of the worker that
+    // opened it. If a render-only worker could take one, it would answer
+    // against a browser that has no such session.
+    var queue: Queue = .{};
+    var output_buffer: [1]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&output_buffer);
+
+    var render_job: Job = .{ .kind = .render, .body = "", .out = &output };
+    var live_job: Job = .{ .kind = .live, .body = "", .out = &output };
+    var close_job: Job = .{ .kind = .live_close, .body = "", .out = &output };
+
+    try std.testing.expect(queue.push(&render_job));
+    try std.testing.expect(queue.push(&live_job));
+    try std.testing.expect(queue.push(&close_job));
+
+    // A render-only worker never sees either live job...
+    try std.testing.expect(queue.tryPop(.render_only) == &render_job);
+    try std.testing.expect(queue.tryPop(.render_only) == null);
+
+    // ...and the live worker drains them in order, live before render.
+    try std.testing.expect(queue.tryPop(.live_only) == &live_job);
+    try std.testing.expect(queue.tryPop(.any) == &close_job);
+    try std.testing.expect(queue.tryPop(.any) == null);
+
+    // `.any` prefers a queued live command over a waiting render, so a live
+    // client is never stuck behind someone else's page load.
+    try std.testing.expect(queue.push(&render_job));
+    try std.testing.expect(queue.push(&live_job));
+    try std.testing.expect(queue.tryPop(.any) == &live_job);
+    try std.testing.expect(queue.tryPop(.any) == &render_job);
 }
 
 test "render server: closed queue drains jobs accepted before close" {
@@ -1696,11 +1810,11 @@ test "render server: closed queue drains jobs accepted before close" {
         .out = &output,
     };
 
-    try std.testing.expect(queue.popFor(0) == null);
+    try std.testing.expect(queue.popFor(.any, 0) == null);
     try std.testing.expect(queue.push(&job));
     queue.close();
     try std.testing.expect(!queue.closedAndEmpty());
-    try std.testing.expect(queue.tryPop() == &job);
+    try std.testing.expect(queue.tryPop(.any) == &job);
     try std.testing.expect(queue.closedAndEmpty());
 }
 
