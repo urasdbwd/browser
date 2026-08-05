@@ -162,7 +162,9 @@
   {
     // PUT is not a safelisted method: preflight, and it grants PUT.
     const state = await testing.async();
-    const response = await fetch(XO + '/cors/data?acao=origin&acam=PUT', {method: 'PUT'});
+    // The body is only here so the request declares a Content-Length; the
+    // test server asserts on a body-less PUT.
+    const response = await fetch(XO + '/cors/data?acao=origin&acam=PUT', {method: 'PUT', body: 'x'});
     const text = await response.text();
     state.resolve();
     await state.done(() => testing.expectEqual('{"cors":true}', text));
@@ -174,7 +176,7 @@
     const state = await testing.async();
     let err = null;
     try {
-      const response = await fetch(XO + '/cors/data?acao=origin&acam=GET', {method: 'PUT'});
+      const response = await fetch(XO + '/cors/data?acao=origin&acam=GET', {method: 'PUT', body: 'x'});
       err = 'read body: ' + (await response.text());
     } catch (e) {
       err = e.constructor.name;

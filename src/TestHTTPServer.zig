@@ -76,9 +76,13 @@ pub fn run(self: *TestHTTPServer, wg: *lp.WaitGroup) !void {
 fn handleConnection(self: *TestHTTPServer, conn: std.Io.net.Stream) !void {
     defer conn.close(lp.io);
 
+    // Separate buffers: the request head (and anything a handler slices out
+    // of it, like a response header taken from the target) lives in the read
+    // buffer, and sharing it with the writer corrupts the response mid-send.
     var req_buf: [2048]u8 = undefined;
+    var res_buf: [2048]u8 = undefined;
     var conn_reader = conn.reader(lp.io, &req_buf);
-    var conn_writer = conn.writer(lp.io, &req_buf);
+    var conn_writer = conn.writer(lp.io, &res_buf);
 
     var http_server = std.http.Server.init(&conn_reader.interface, &conn_writer.interface);
 

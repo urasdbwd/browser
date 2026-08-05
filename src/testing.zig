@@ -626,13 +626,21 @@ var serve_counts = [_]struct { name: []const u8, count: u32 = 0 }{
 fn corsEndpoint(req: *std.http.Server.Request, path: []const u8) !void {
     const query = path[std.mem.indexOfScalar(u8, path, '?') orelse path.len ..];
 
-    var headers: std.ArrayList(std.http.Header) = .empty;
+    // Stack-allocated: the server runs a thread per connection and
+    // `arena_allocator` is a shared global, so a handler that allocates
+    // races with every concurrent request. Every value below is a slice of
+    // this thread's request buffer, which outlives the respond call.
+    var headers: [8]std.http.Header = undefined;
+    var count: usize = 0;
     if (corsQuery(query, "acao")) |acao| {
-        const value = if (std.mem.eql(u8, acao, "origin"))
-            corsRequestHeader(req, "origin") orelse "null"
-        else
-            acao;
-        try headers.append(arena_allocator, .{ .name = "access-control-allow-origin", .value = value });
+        headers[count] = .{
+            .name = "access-control-allow-origin",
+            .value = if (std.mem.eql(u8, acao, "origin"))
+                corsRequestHeader(req, "origin") orelse "null"
+            else
+                acao,
+        };
+        count += 1;
     }
     inline for (.{
         .{ "acac", "access-control-allow-credentials" },
@@ -642,19 +650,20 @@ fn corsEndpoint(req: *std.http.Server.Request, path: []const u8) !void {
         .{ "max_age", "access-control-max-age" },
     }) |pair| {
         if (corsQuery(query, pair[0])) |value| {
-            try headers.append(arena_allocator, .{ .name = pair[1], .value = value });
+            headers[count] = .{ .name = pair[1], .value = value };
+            count += 1;
         }
     }
 
     if (req.head.method == .OPTIONS) {
         const status: std.http.Status = if (corsQuery(query, "preflight_status") != null) .forbidden else .no_content;
-        return req.respond("", .{ .status = status, .extra_headers = headers.items });
+        return req.respond("", .{ .status = status, .extra_headers = headers[0..count] });
     }
 
-    try headers.append(arena_allocator, .{ .name = "content-type", .value = "application/json" });
-    try headers.append(arena_allocator, .{ .name = "x-total", .value = "42" });
-    try headers.append(arena_allocator, .{ .name = "x-secret", .value = "hidden" });
-    return req.respond("{\"cors\":true}", .{ .extra_headers = headers.items });
+    headers[count] = .{ .name = "content-type", .value = "application/json" };
+    headers[count + 1] = .{ .name = "x-total", .value = "42" };
+    headers[count + 2] = .{ .name = "x-secret", .value = "hidden" };
+    return req.respond("{\"cors\":true}", .{ .extra_headers = headers[0 .. count + 3] });
 }
 
 fn corsQuery(query: []const u8, name: []const u8) ?[]const u8 {
