@@ -552,7 +552,15 @@ fn processLive(
 
 const RenderRequest = struct {
     url: []const u8,
-    wait_ms: u32 = 5_000,
+    // With no explicit wait_until the settle target is `.done` -- no macrotasks
+    // AND no network activity -- which plenty of real pages never reach: an
+    // analytics beacon, a poll, or an open event stream keeps it busy forever,
+    // so the request burns this budget in full and returns a slow success.
+    // Measured on vercel.com: 5.079s at 5000ms vs 0.084s with
+    // wait_until=domcontentloaded, for 1.3% more HTML. 1500ms keeps the
+    // "wait for late content" semantics while bounding the waste; pass an
+    // explicit wait_until (or a larger wait_ms) when a page needs longer.
+    wait_ms: u32 = 1_500,
     wait_until: ?lp.Config.WaitUntil = null,
     wait_selector: ?[]const u8 = null,
     width: u32 = 1280,

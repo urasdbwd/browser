@@ -104,7 +104,10 @@ pub const Command = struct {
     ctrl_key: bool = false,
     meta_key: bool = false,
     shift_key: bool = false,
-    wait_ms: u32 = 5_000,
+    // See RenderRequest.wait_ms: with no explicit wait_until the settle target
+    // is `.done`, which a page with any background network never reaches, so
+    // this budget gets burned in full on every navigation.
+    wait_ms: u32 = 1_500,
     wait_until: ?lp.Config.WaitUntil = null,
     width: u32 = 1280,
     height: u32 = 720,
