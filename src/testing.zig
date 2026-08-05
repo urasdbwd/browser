@@ -646,6 +646,9 @@ fn corsEndpoint(req: *std.http.Server.Request, path: []const u8) !void {
         }
     }
 
+    std.debug.print("CORSDBG target={s} query={s} n={d}\n", .{ path, query, headers.items.len });
+    for (headers.items) |h| std.debug.print("CORSDBG   {s}: {s}\n", .{ h.name, h.value });
+
     if (req.head.method == .OPTIONS) {
         const status: std.http.Status = if (corsQuery(query, "preflight_status") != null) .forbidden else .no_content;
         return req.respond("", .{ .status = status, .extra_headers = headers.items });
