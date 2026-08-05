@@ -161,6 +161,8 @@ fn listContains(list: []const u8, needle: []const u8) bool {
 pub fn responseAllowed(transfer: *Transfer) bool {
     const params = transfer.req.cors orelse return true;
 
+    if (schemeBypassesCors(transfer.req.url)) return true;
+
     // no-cors never reads the response, so there is nothing to protect;
     // the initiator turns it into an opaque filtered response instead.
     if (params.mode == .no_cors) return true;
@@ -234,8 +236,22 @@ pub fn deinit(self: *Cors) void {
     self.pending.deinit(self.allocator);
 }
 
+// Schemes that never do a network CORS check. `blob:` and `filesystem:` are
+// same-origin with the context that minted them, `data:` and `about:` fetch
+// nothing. `URL.getOrigin` cannot parse any of them, so without this guard
+// sameOrigin() says false and a legitimate same-origin blob read is blocked.
+fn schemeBypassesCors(url: []const u8) bool {
+    for ([_][]const u8{ "blob:", "data:", "about:", "filesystem:" }) |scheme| {
+        if (std.ascii.startsWithIgnoreCase(url, scheme)) return true;
+    }
+    return false;
+}
+
 pub fn check(self: *Cors, transfer: *Transfer) !Result {
     const params = transfer.req.cors orelse return .allowed;
+    if (schemeBypassesCors(transfer.req.url)) {
+        return .allowed;
+    }
     const arena = transfer.arena.allocator();
     const method = transfer.req.method;
 

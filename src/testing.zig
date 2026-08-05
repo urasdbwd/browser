@@ -626,13 +626,35 @@ var serve_counts = [_]struct { name: []const u8, count: u32 = 0 }{
 fn corsEndpoint(req: *std.http.Server.Request, path: []const u8) !void {
     const query = path[std.mem.indexOfScalar(u8, path, '?') orelse path.len ..];
 
-    var headers: std.ArrayList(std.http.Header) = .empty;
+    // Header values MUST be copied out of the request buffer. `path` aliases
+    // `req.head.target`, and `req.respond()` reuses that memory before it
+    // serializes the headers -- leaving the values pointing at whatever landed
+    // there instead ("*" came back as "t"). Copy into a frame-local scratch
+    // buffer, which outlives the respond call.
+    var scratch: [512]u8 = undefined;
+    var used: usize = 0;
+    const keep = struct {
+        fn f(buf: []u8, at: *usize, value: []const u8) []const u8 {
+            const start = at.*;
+            @memcpy(buf[start..][0..value.len], value);
+            at.* = start + value.len;
+            return buf[start..][0..value.len];
+        }
+    }.f;
+
+    var headers: [10]std.http.Header = undefined;
+    var n: usize = 0;
+
     if (corsQuery(query, "acao")) |acao| {
-        const value = if (std.mem.eql(u8, acao, "origin"))
+        const raw = if (std.mem.eql(u8, acao, "origin"))
             corsRequestHeader(req, "origin") orelse "null"
         else
             acao;
-        try headers.append(arena_allocator, .{ .name = "access-control-allow-origin", .value = value });
+        headers[n] = .{
+            .name = "access-control-allow-origin",
+            .value = keep(&scratch, &used, raw),
+        };
+        n += 1;
     }
     inline for (.{
         .{ "acac", "access-control-allow-credentials" },
@@ -642,22 +664,20 @@ fn corsEndpoint(req: *std.http.Server.Request, path: []const u8) !void {
         .{ "max_age", "access-control-max-age" },
     }) |pair| {
         if (corsQuery(query, pair[0])) |value| {
-            try headers.append(arena_allocator, .{ .name = pair[1], .value = value });
+            headers[n] = .{ .name = pair[1], .value = keep(&scratch, &used, value) };
+            n += 1;
         }
     }
 
-    std.debug.print("CORSDBG target={s} query={s} n={d}\n", .{ path, query, headers.items.len });
-    for (headers.items) |h| std.debug.print("CORSDBG   {s}: {s}\n", .{ h.name, h.value });
-
     if (req.head.method == .OPTIONS) {
         const status: std.http.Status = if (corsQuery(query, "preflight_status") != null) .forbidden else .no_content;
-        return req.respond("", .{ .status = status, .extra_headers = headers.items });
+        return req.respond("", .{ .status = status, .extra_headers = headers[0..n] });
     }
 
-    try headers.append(arena_allocator, .{ .name = "content-type", .value = "application/json" });
-    try headers.append(arena_allocator, .{ .name = "x-total", .value = "42" });
-    try headers.append(arena_allocator, .{ .name = "x-secret", .value = "hidden" });
-    return req.respond("{\"cors\":true}", .{ .extra_headers = headers.items });
+    headers[n] = .{ .name = "content-type", .value = "application/json" };
+    headers[n + 1] = .{ .name = "x-total", .value = "42" };
+    headers[n + 2] = .{ .name = "x-secret", .value = "hidden" };
+    return req.respond("{\"cors\":true}", .{ .extra_headers = headers[0 .. n + 3] });
 }
 
 fn corsQuery(query: []const u8, name: []const u8) ?[]const u8 {
