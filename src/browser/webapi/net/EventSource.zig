@@ -24,6 +24,7 @@ const js = @import("../../js/js.zig");
 const URL = @import("../../URL.zig");
 const Mime = @import("../../Mime.zig");
 const Page = @import("../../Page.zig");
+const Cors = @import("../../../network/Cors.zig");
 const Transfer = @import("../../../network/HttpClient.zig").Transfer;
 
 const Event = @import("../Event.zig");
@@ -345,37 +346,12 @@ fn httpHeaderDoneCallback(transfer: *Transfer) !Transfer.HeaderResult {
     return .proceed;
 }
 
-// The general http stack doesn't model CORS (fetch/XHR assume it passed),
-// but the EventSource WPTs require enforcement, and it's self-contained
-// enough to do here: the response must echo an acceptable
-// Access-Control-Allow-Origin (plus Allow-Credentials for credentialed
-// requests).
+// EventSource isn't routed through the network layer's CORS gate (it's a
+// streaming transfer with its own connection lifecycle), so it calls the
+// shared allow-origin check directly.
 fn corsAllowed(self: *const EventSource, transfer: *Transfer) bool {
-    var allow_origin: ?[]const u8 = null;
-    var allow_credentials: ?[]const u8 = null;
-    var it = transfer.responseHeaderIterator();
-    while (it.next()) |hdr| {
-        if (std.ascii.eqlIgnoreCase(hdr.name, "access-control-allow-origin")) {
-            allow_origin = hdr.value;
-        } else if (std.ascii.eqlIgnoreCase(hdr.name, "access-control-allow-credentials")) {
-            allow_credentials = hdr.value;
-        }
-    }
-
-    const allowed = allow_origin orelse return false;
-    if (std.mem.eql(u8, allowed, "*")) {
-        // the wildcard is not valid for credentialed requests
-        return !self._with_credentials;
-    }
     const origin = self._exec.origin() orelse "null";
-    if (!std.mem.eql(u8, allowed, origin)) {
-        return false;
-    }
-    if (self._with_credentials) {
-        const creds = allow_credentials orelse return false;
-        return std.mem.eql(u8, creds, "true");
-    }
-    return true;
+    return Cors.allowOriginMatches(transfer, origin, self._with_credentials);
 }
 
 fn httpDataCallback(transfer: *Transfer, data: []const u8) !void {

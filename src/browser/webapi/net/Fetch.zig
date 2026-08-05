@@ -21,6 +21,7 @@ const lp = @import("lightpanda");
 
 const js = @import("../../js/js.zig");
 const URL = @import("../../URL.zig");
+const Cors = @import("../../../network/Cors.zig");
 const HttpClient = @import("../../../network/HttpClient.zig");
 
 const AbortSignal = @import("../AbortSignal.zig");
@@ -43,6 +44,10 @@ _resolver: js.PromiseResolver.Global,
 _owns_response: bool,
 _signal: ?*AbortSignal,
 _manual_redirect: bool,
+_no_cors: bool,
+// Set once a no-cors response is filtered to opaque: the body must not
+// reach script.
+_drop_body: bool = false,
 
 pub const Input = Request.Input;
 pub const InitOpts = Request.InitOpts;
@@ -81,6 +86,7 @@ pub fn init(input: Input, options: ?InitOpts, exec: *const Execution) !js.Promis
         ._owns_response = true,
         ._signal = request._signal,
         ._manual_redirect = request._redirect == .manual,
+        ._no_cors = request._mode == .@"no-cors",
     };
 
     const session = exec.session;
@@ -105,6 +111,7 @@ pub fn init(input: Input, options: ?InitOpts, exec: *const Execution) !js.Promis
         .resource_type = .fetch,
         .cookie_jar = cookie_jar,
         .cookie_origin = exec.url.*,
+        .cors = corsParams(exec, request._mode, request._credentials == .include),
         .redirect = switch (request._redirect) {
             .follow => .follow,
             .manual => .manual,
@@ -139,6 +146,23 @@ pub fn init(input: Input, options: ?InitOpts, exec: *const Execution) !js.Promis
     // and double-free the arena.
     transfer.submit() catch {};
     return resolver.promise();
+}
+
+// ponytail: an opaque origin (about:blank, data:, non-http scheme) opts out
+// of CORS entirely rather than blocking every cross-origin read. Those pages
+// can't produce a matching Access-Control-Allow-Origin anyway, and failing
+// closed there would break the internal/about: paths that use fetch today.
+pub fn corsParams(exec: *const Execution, mode: Request.Mode, credentialed: bool) ?Cors.Params {
+    const origin = exec.origin() orelse return null;
+    return .{
+        .origin = origin,
+        .mode = switch (mode) {
+            .cors => .cors,
+            .@"same-origin" => .same_origin,
+            .@"no-cors" => .no_cors,
+        },
+        .credentialed = credentialed,
+    };
 }
 
 fn httpHeaderDoneCallback(transfer: *Transfer) !Transfer.HeaderResult {
@@ -191,7 +215,9 @@ fn httpHeaderDoneCallback(transfer: *Transfer) !Transfer.HeaderResult {
             if (std.mem.eql(u8, fo, ro)) {
                 res._type = .basic; // Same-origin
             } else {
-                res._type = .cors; // Cross-origin (for simplicity, assume CORS passed)
+                // Cross-origin. The CORS check already passed in the network
+                // layer — a failure never reaches this callback.
+                res._type = .cors;
             }
         } else {
             res._type = .basic;
@@ -200,8 +226,24 @@ fn httpHeaderDoneCallback(transfer: *Transfer) !Transfer.HeaderResult {
         res._type = .basic;
     }
 
+    // mode: "no-cors" cross-origin yields an opaque filtered response:
+    // status 0, no headers, no body.
+    if (res._type == .cors and self._no_cors) {
+        res._status = 0;
+        res._status_text = "";
+        res._url = "";
+        res._type = .@"opaque";
+        res._is_redirected = false;
+        self._drop_body = true;
+        return .proceed;
+    }
+
+    const expose = Cors.exposeFilter(transfer);
     var it = transfer.responseHeaderIterator();
     while (it.next()) |hdr| {
+        if (expose) |e| {
+            if (!e.allows(hdr.name)) continue;
+        }
         try res._headers.append(hdr.name, hdr.value, exec);
     }
 
@@ -218,6 +260,9 @@ fn httpDataCallback(transfer: *Transfer, data: []const u8) !void {
         }
     }
 
+    if (self._drop_body) {
+        return;
+    }
     try self._buf.appendSlice(self._response._arena.allocator(), data);
 }
 
