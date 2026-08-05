@@ -12,20 +12,40 @@
     ? testing.ORIGIN.replace('127.0.0.1', 'localhost')
     : testing.ORIGIN.replace('localhost', '127.0.0.1');
   testing.expectFalse(XO === testing.ORIGIN);
+
+  // Never let a rejection escape: an unexpected block must fail an
+  // assertion, not hang the script until the runner times out.
+  window.attempt = async function(url, opts) {
+    try {
+      const response = await fetch(url, opts || {});
+      return {
+        text: await response.text(),
+        type: response.type,
+        status: response.status,
+        header: (n) => response.headers.get(n),
+      };
+    } catch (e) {
+      return {
+        text: 'ERR:' + e.constructor.name,
+        type: 'ERR',
+        status: -1,
+        header: () => 'ERR',
+      };
+    }
+  };
 </script>
 
 <script id=same_origin type=module>
   {
     // The overwhelming majority of traffic: no CORS machinery at all.
     const state = await testing.async();
-    const response = await fetch(testing.ORIGIN + '/cors/data');
-    const text = await response.text();
+    const r = await attempt(testing.ORIGIN + '/cors/data');
     state.resolve();
     await state.done(() => {
-      testing.expectEqual('basic', response.type);
-      testing.expectEqual('{"cors":true}', text);
+      testing.expectEqual('{"cors":true}', r.text);
+      testing.expectEqual('basic', r.type);
       // Same-origin sees every header, including the non-safelisted ones.
-      testing.expectEqual('hidden', response.headers.get('x-secret'));
+      testing.expectEqual('hidden', r.header('x-secret'));
     });
   }
 </script>
@@ -48,12 +68,11 @@
 <script id=cross_origin_wildcard type=module>
   {
     const state = await testing.async();
-    const response = await fetch(XO + '/cors/data?acao=*');
-    const text = await response.text();
+    const r = await attempt(XO + '/cors/data?acao=*');
     state.resolve();
     await state.done(() => {
-      testing.expectEqual('cors', response.type);
-      testing.expectEqual('{"cors":true}', text);
+      testing.expectEqual('{"cors":true}', r.text);
+      testing.expectEqual('cors', r.type);
     });
   }
 </script>
@@ -61,12 +80,11 @@
 <script id=cross_origin_exact type=module>
   {
     const state = await testing.async();
-    const response = await fetch(XO + '/cors/data?acao=origin');
-    const text = await response.text();
+    const r = await attempt(XO + '/cors/data?acao=origin');
     state.resolve();
     await state.done(() => {
-      testing.expectEqual(200, response.status);
-      testing.expectEqual('{"cors":true}', text);
+      testing.expectEqual('{"cors":true}', r.text);
+      testing.expectEqual(200, r.status);
     });
   }
 </script>
@@ -105,10 +123,9 @@
 <script id=credentialed_exact type=module>
   {
     const state = await testing.async();
-    const response = await fetch(XO + '/cors/data?acao=origin&acac=true', {credentials: 'include'});
-    const text = await response.text();
+    const r = await attempt(XO + '/cors/data?acao=origin&acac=true', {credentials: 'include'});
     state.resolve();
-    await state.done(() => testing.expectEqual('{"cors":true}', text));
+    await state.done(() => testing.expectEqual('{"cors":true}', r.text));
   }
 </script>
 
@@ -131,12 +148,11 @@
   {
     // A non-safelisted author header forces an OPTIONS preflight.
     const state = await testing.async();
-    const response = await fetch(XO + '/cors/data?acao=origin&acah=x-custom', {
+    const r = await attempt(XO + '/cors/data?acao=origin&acah=x-custom', {
       headers: {'X-Custom': 'yes'},
     });
-    const text = await response.text();
     state.resolve();
-    await state.done(() => testing.expectEqual('{"cors":true}', text));
+    await state.done(() => testing.expectEqual('{"cors":true}', r.text));
   }
 </script>
 
@@ -164,10 +180,9 @@
     const state = await testing.async();
     // The body is only here so the request declares a Content-Length; the
     // test server asserts on a body-less PUT.
-    const response = await fetch(XO + '/cors/data?acao=origin&acam=PUT', {method: 'PUT', body: 'x'});
-    const text = await response.text();
+    const r = await attempt(XO + '/cors/data?acao=origin&acam=PUT', {method: 'PUT', body: 'x'});
     state.resolve();
-    await state.done(() => testing.expectEqual('{"cors":true}', text));
+    await state.done(() => testing.expectEqual('{"cors":true}', r.text));
   }
 </script>
 
@@ -208,14 +223,13 @@
   {
     // no-cors never errors, it yields an opaque response instead.
     const state = await testing.async();
-    const response = await fetch(XO + '/cors/data', {mode: 'no-cors'});
-    const text = await response.text();
+    const r = await attempt(XO + '/cors/data', {mode: 'no-cors'});
     state.resolve();
     await state.done(() => {
-      testing.expectEqual('opaque', response.type);
-      testing.expectEqual(0, response.status);
-      testing.expectEqual('', text);
-      testing.expectEqual(null, response.headers.get('content-type'));
+      testing.expectEqual('opaque', r.type);
+      testing.expectEqual(0, r.status);
+      testing.expectEqual('', r.text);
+      testing.expectEqual(null, r.header('content-type'));
     });
   }
 </script>
@@ -238,16 +252,15 @@
 <script id=expose_headers type=module>
   {
     const state = await testing.async();
-    const response = await fetch(XO + '/cors/data?acao=*&expose=x-total');
-    await response.text();
+    const r = await attempt(XO + '/cors/data?acao=*&expose=x-total');
     state.resolve();
     await state.done(() => {
       // Safelisted: always visible.
-      testing.expectEqual('application/json', response.headers.get('content-type'));
+      testing.expectEqual('application/json', r.header('content-type'));
       // Named in Expose-Headers.
-      testing.expectEqual('42', response.headers.get('x-total'));
+      testing.expectEqual('42', r.header('x-total'));
       // Not named: hidden.
-      testing.expectEqual(null, response.headers.get('x-secret'));
+      testing.expectEqual(null, r.header('x-secret'));
     });
   }
 </script>
