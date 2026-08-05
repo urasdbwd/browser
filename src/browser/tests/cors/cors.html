@@ -292,3 +292,27 @@
     });
   }
 </script>
+
+<script id=preflight_cached type=module>
+  {
+    // Access-Control-Max-Age: two identical preflighted requests must cost
+    // ONE OPTIONS, not two. Without this the cache could silently never
+    // cache and every other test in this file would still pass.
+    const url = XO + '/cors/data?acao=origin&acah=x-custom&max_age=60';
+    const opts = {headers: {'X-Custom': '1'}};
+    const count = async () =>
+      parseInt(await (await fetch(testing.ORIGIN + '/cors/preflights')).text(), 10);
+
+    const state = await testing.async();
+    const before = await count();
+    const first = await attempt(url, opts);
+    const second = await attempt(url, opts);
+    const after = await count();
+    state.resolve();
+    await state.done(() => {
+      testing.expectEqual('{"cors":true}', first.text);
+      testing.expectEqual('{"cors":true}', second.text);
+      testing.expectEqual(1, after - before);
+    });
+  }
+</script>

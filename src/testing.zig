@@ -623,8 +623,20 @@ var serve_counts = [_]struct { name: []const u8, count: u32 = 0 }{
 // ask for exactly the combination it wants. `acao=origin` echoes the request's
 // Origin header back; anything else is emitted verbatim. A parameter that is
 // absent means the header is absent.
+// OPTIONS requests served so far, so a fixture can prove the preflight cache
+// actually suppresses the second one. Atomic: thread per connection.
+var cors_preflights: std.atomic.Value(u32) = .init(0);
+
 fn corsEndpoint(req: *std.http.Server.Request, path: []const u8) !void {
     const query = path[std.mem.indexOfScalar(u8, path, '?') orelse path.len ..];
+
+    if (std.mem.startsWith(u8, path, "/cors/preflights")) {
+        var buf: [16]u8 = undefined;
+        const body = try std.fmt.bufPrint(&buf, "{d}", .{cors_preflights.load(.monotonic)});
+        return req.respond(body, .{
+            .extra_headers = &.{.{ .name = "content-type", .value = "text/plain" }},
+        });
+    }
 
     // Stack-allocated: the server runs a thread per connection and
     // `arena_allocator` is a shared global, so a handler that allocates
@@ -656,6 +668,7 @@ fn corsEndpoint(req: *std.http.Server.Request, path: []const u8) !void {
     }
 
     if (req.head.method == .OPTIONS) {
+        _ = cors_preflights.fetchAdd(1, .monotonic);
         const status: std.http.Status = if (corsQuery(query, "preflight_status") != null) .forbidden else .no_content;
         return req.respond("", .{ .status = status, .extra_headers = headers[0..count] });
     }
