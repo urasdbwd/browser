@@ -1611,9 +1611,14 @@ test "Config: CLI accepts identity flags" {
 }
 
 test "Config: pi resource profile bounds expensive defaults" {
-    var config = try Config.init(std.testing.allocator, "test", .{ .serve = .{
-        .resource_profile = .pi,
-    } });
+    var config = try Config.init(std.testing.allocator, "test", .{
+        .serve = .{
+            .resource_profile = .pi,
+            // Captcha solving raises the watchdog floor to 30s; opt out here so the
+            // lean profile's own 10s default is what we assert.
+            .solve_captchas = .off,
+        },
+    });
     defer config.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(ResourceProfile.pi, config.resourceProfile());
@@ -1796,6 +1801,7 @@ test "Config: render handoff defaults are Pi-class and bounded" {
 test "Config: slot resource profile is a lean single-live process" {
     var config = try Config.init(std.testing.allocator, "test", .{ .render = .{
         .resource_profile = .slot,
+        .solve_captchas = .off,
     } });
     defer config.deinit(std.testing.allocator);
 
