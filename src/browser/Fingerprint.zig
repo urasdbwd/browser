@@ -116,7 +116,7 @@ pub const Profile = struct {
     pub fn fromSeed(seed: u64, platform: Platform) Profile {
         var rng = splitmix64(seed);
         const hw_choices = [_]u32{ 4, 6, 8, 8, 12, 16 };
-        const mem_choices = [_]f64{ 4.0, 8.0, 8.0, 16.0, 16.0, 32.0 };
+        const mem_choices = [_]f64{ 4.0, 8.0, 8.0, 8.0 };
 
         const hw = hw_choices[rng % hw_choices.len];
         rng = splitmix64(rng);

@@ -27,7 +27,8 @@
     \\          Defaults to --host value.
     \\  --cdp-max-connections <INT>
     \\          Maximum number of simultaneous CDP connections.
-    \\          Defaults to 16, or 2 with the pi resource profile.
+    \\          Defaults to 16, or up to 32 with the pi resource profile
+    \\          (reduced automatically when physical memory is insufficient).
     \\  --cdp-max-captured-response-size <INT>
     \\          Maximum response-body bytes retained for Network.getResponseBody in
     \\          one page lifecycle. Defaults to unlimited, or 8 MiB with the pi
@@ -176,8 +177,8 @@
     \\  --host <HOST>
     \\          Host to bind. Defaults to "127.0.0.1".
     \\  --max-connections <INT>
-    \\          Maximum simultaneous HTTP connections. Defaults to 2 with the pi
-    \\          profile or 8 with standard. Minimum is 1.
+    \\          Maximum simultaneous HTTP connections. Defaults to up to 32 with
+    \\          the pi profile (memory-capped), or 8 with standard. Minimum is 1.
     \\  --max-request-size <INT>
     \\          Maximum JSON request size. Defaults to 16384 (16 KiB).
     \\  --max-response-size <INT>
@@ -211,7 +212,8 @@
     \\          Defaults to "127.0.0.1".
     \\  --max-connections <INT>
     \\          Maximum simultaneous MCP HTTP connections.
-    \\          Defaults to 16, or 2 with --resource-profile pi. Minimum is 1.
+    \\          Defaults to 16, or up to 32 with --resource-profile pi
+    \\          (memory-capped). Minimum is 1.
     \\  --max-request-size <INT>
     \\          Maximum MCP HTTP JSON request size. Defaults to 16 MiB, or 4 MiB
     \\          with --resource-profile pi.
@@ -221,7 +223,8 @@
     \\          or 4 MiB with --resource-profile pi.
     \\  --max-sessions <INT>
     \\          Maximum live MCP browsing sessions. Each session owns a V8 isolate.
-    \\          Defaults to 16, or 2 with --resource-profile pi. Minimum is 1.
+    \\          Defaults to 16, or up to 32 with --resource-profile pi
+    \\          (memory-capped). Minimum is 1.
     \\  --port <INT>
     \\          Serve MCP over HTTP on this port instead of stdio. Clients POST
     \\          JSON-RPC to /mcp; route requests to a session with the
@@ -485,29 +488,34 @@
     \\  --storage-sqlite-path <PATH>
     \\          Path to the SQLite database file for persistent storage.
     \\          Use ":memory:" for in-memory storage.
-    \\  --stealth
-    \\          Present as Chrome instead of Lightpanda: Chrome User-Agent, Sec-Ch-Ua
-    \\          brands, navigator.userAgentData, a Chrome TLS ClientHello, and a random
-    \\          fingerprint seed (GPU/screen/cores/memory). Off by default — without it
-    \\          Lightpanda identifies itself honestly.
+    \\  --no-stealth
+    \\          Identify as Lightpanda instead of using the default Chrome-compatible
+    \\          identity. Disables the Chrome User-Agent, Sec-Ch-Ua brands,
+    \\          navigator.userAgentData and Chrome TLS ClientHello.
     \\  --fingerprint <INT>
     \\          Deterministic fingerprint seed. The same seed yields the same GPU,
     \\          screen, cores and deviceMemory. Activates the fingerprint profile on its
-    \\          own; combine with --stealth for the full Chrome identity.
+    \\          own; the default Chrome-compatible identity uses it automatically.
     \\  --fingerprint-platform <PLATFORM>
     \\          Platform the fingerprint profile reports: windows, macos, or linux.
     \\          Defaults to macos on a macOS host, windows elsewhere.
     \\  --solve-captchas <MODE>
     \\          After load, click managed Turnstile checkboxes and wait for a token.
-    \\          Modes: auto (default; on with --stealth), on, off. Visual puzzle
-    \\          CAPTCHAs still need a human or an external solver.
+    \\          Modes: auto (default; on unless --no-stealth), on, off.
+    \\
+    \\          Turnstile always stays local and click-only. Set CAPSOLVER_API_KEY,
+    \\          TWOCAPTCHA_API_KEY or ANTICAPTCHA_API_KEY to outsource reCAPTCHA v2.
+    \\          2Captcha and Anti-Captcha also support hCaptcha. The service token
+    \\          is written back into the page. The key and this flag enable
+    \\          automatic solving; the solveCaptchas agent tool can request one
+    \\          solve explicitly. Every service solve is billed. Allow 10-60s.
     \\  --user-agent <STRING>
     \\          Override the User-Agent header entirely. CDP rejects values containing
     \\          "Mozilla". The browser still sends Sec-Ch-Ua.
     \\          Incompatible with --user-agent-suffix.
     \\  --user-agent-suffix <STRING>
-    \\          Suffix appended to the Lightpanda/X.Y User-Agent (ignored with
-    \\          --stealth).
+    \\          Suffix appended to the Lightpanda/X.Y User-Agent (only used with
+    \\          --no-stealth).
     \\  --v8-flags-unsafe <FLAGS>
     \\          Flags passed as-is to the V8 JavaScript engine, space-separated.
     \\          e.g. --v8-flags-unsafe "--expose-gc --stack-size 1000".

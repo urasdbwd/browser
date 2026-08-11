@@ -31,6 +31,15 @@ fn profileSeed(exec: *const Execution) u64 {
     return exec.session.browser.app.config.fingerprint_profile.noise_seed;
 }
 
+pub fn networkDownlink(seed: u64) f64 {
+    const step: f64 = @floatFromInt((seed >> 16) % 21);
+    return 5.0 + step * 0.25;
+}
+
+pub fn networkRtt(seed: u64) u32 {
+    return @intCast(((seed >> 24) % 8) * 25 + 25);
+}
+
 pub const BatteryManager = struct {
     // Padding to avoid zero-size struct pointer collisions.
     _pad: bool = false,
@@ -79,6 +88,15 @@ pub const BatteryManager = struct {
 pub const NetworkInformation = struct {
     // Padding to avoid zero-size struct pointer collisions.
     _pad: bool = false,
+    _on_change: ?js.Function.Global = null,
+
+    pub fn getOnChange(self: *const NetworkInformation) ?js.Function.Global {
+        return self._on_change;
+    }
+
+    pub fn setOnChange(self: *NetworkInformation, callback: ?js.Function.Global) void {
+        self._on_change = callback;
+    }
 
     /// Chrome clamps `effectiveType` to "4g" on any decent broadband link, and
     /// that's what the overwhelming majority of real desktops report.
@@ -88,17 +106,24 @@ pub const NetworkInformation = struct {
 
     /// Chrome caps downlink at 10 Mbps and quantizes it to 0.05 steps.
     pub fn getDownlink(_: *const NetworkInformation, exec: *const Execution) f64 {
-        const step: f64 = @floatFromInt((profileSeed(exec) >> 16) % 21);
-        return 5.0 + step * 0.25;
+        return networkDownlink(profileSeed(exec));
     }
 
     /// Chrome quantizes rtt to 25ms buckets.
     pub fn getRtt(_: *const NetworkInformation, exec: *const Execution) u32 {
-        return @intCast(((profileSeed(exec) >> 24) % 8) * 25 + 25);
+        return networkRtt(profileSeed(exec));
     }
 
     pub fn getSaveData(_: *const NetworkInformation) bool {
         return false;
+    }
+
+    /// The connection technology's theoretical ceiling, which Chrome reports
+    /// as Infinity on wifi/ethernet. The value carries almost no information —
+    /// its *absence* is the signal (CreepJS counts `noDownlinkMax` toward
+    /// "like headless"), so what matters is that the property exists.
+    pub fn getDownlinkMax(_: *const NetworkInformation) f64 {
+        return std.math.inf(f64);
     }
 
     pub const JsApi = struct {
@@ -111,9 +136,10 @@ pub const NetworkInformation = struct {
             pub const empty_with_no_proto = true;
         };
 
+        pub const onchange = bridge.accessor(NetworkInformation.getOnChange, NetworkInformation.setOnChange, .{});
         pub const effectiveType = bridge.accessor(NetworkInformation.getEffectiveType, null, .{});
-        pub const downlink = bridge.accessor(NetworkInformation.getDownlink, null, .{});
         pub const rtt = bridge.accessor(NetworkInformation.getRtt, null, .{});
+        pub const downlink = bridge.accessor(NetworkInformation.getDownlink, null, .{});
         pub const saveData = bridge.accessor(NetworkInformation.getSaveData, null, .{});
     };
 };

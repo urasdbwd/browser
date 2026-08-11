@@ -707,13 +707,13 @@ pub fn handleClick(frame: *Frame, target: *Node, event: *Event) !void {
             // submitter's coordinate fields appended via FormData.collectForm
             // (see src/browser/webapi/net/FormData.zig).
             if (input._input_type == .submit or input._input_type == .image) {
-                return frame.submitForm(element, input.getForm(frame), .{});
+                return frame.submitForm(element, input.getForm(frame), .{ .user_activation = true });
             }
         },
         .button => |button| {
             if (focus_on_click) try element.focus(frame);
             if (std.mem.eql(u8, button.getType(), "submit")) {
-                return frame.submitForm(element, button.getForm(frame), .{});
+                return frame.submitForm(element, button.getForm(frame), .{ .user_activation = true });
             }
         },
         .select, .textarea => if (focus_on_click) try element.focus(frame),

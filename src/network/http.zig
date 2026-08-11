@@ -281,147 +281,8 @@ fn proxyOptionValue(
     return "";
 }
 
-// ── Chrome TLS fingerprint ───────────────────────────────────────────────────
-//
-// Cloudflare (and bot management generally) fingerprints the ClientHello —
-// JA3/JA4 — before a single byte of page JavaScript runs, so every JS-level
-// stealth measure downstream is moot if libcurl's stock hello goes out first.
-// curl here is linked against BoringSSL, the same TLS stack Chrome uses, so the
-// hello can be reshaped through the CURLOPT_SSL_CTX_FUNCTION hook rather than
-// by patching a foreign TLS stack. curl invokes that hook *after* applying its
-// own TLS defaults, so whatever is set here wins.
-//
-// These externs would normally live in src/sys/libcrypto.zig alongside the
-// other BoringSSL declarations; they are local because only this file uses
-// them.
-const boring = struct {
-    const CRYPTO_BUFFER = opaque {};
-
-    const TLS1_2_VERSION: u16 = 0x0303;
-    const TLS1_3_VERSION: u16 = 0x0304;
-
-    const SSL_GROUP_SECP256R1: u16 = 23;
-    const SSL_GROUP_SECP384R1: u16 = 24;
-    const SSL_GROUP_X25519: u16 = 29;
-    const SSL_GROUP_X25519_MLKEM768: u16 = 0x11ec;
-
-    const TLSEXT_cert_compression_brotli: u16 = 2;
-
-    const SSL_METHOD = opaque {};
-
-    const DecompressFn = *const fn (
-        ssl: *anyopaque,
-        out: **CRYPTO_BUFFER,
-        uncompressed_len: usize,
-        in: [*]const u8,
-        in_len: usize,
-    ) callconv(.c) c_int;
-
-    extern fn TLS_method() *const SSL_METHOD;
-    extern fn SSL_CTX_new(method: *const SSL_METHOD) ?*crypto.SSL_CTX;
-    extern fn SSL_CTX_free(ctx: *crypto.SSL_CTX) void;
-    extern fn SSL_CTX_set_cipher_list(ctx: *crypto.SSL_CTX, str: [*:0]const u8) c_int;
-    extern fn SSL_CTX_set1_group_ids(ctx: *crypto.SSL_CTX, group_ids: [*]const u16, num: usize) c_int;
-    extern fn SSL_CTX_set_verify_algorithm_prefs(ctx: *crypto.SSL_CTX, prefs: [*]const u16, num: usize) c_int;
-    extern fn SSL_CTX_set_grease_enabled(ctx: *crypto.SSL_CTX, enabled: c_int) void;
-    extern fn SSL_CTX_set_permute_extensions(ctx: *crypto.SSL_CTX, enabled: c_int) void;
-    extern fn SSL_CTX_set_min_proto_version(ctx: *crypto.SSL_CTX, version: u16) c_int;
-    extern fn SSL_CTX_set_max_proto_version(ctx: *crypto.SSL_CTX, version: u16) c_int;
-    extern fn SSL_CTX_enable_ocsp_stapling(ctx: *crypto.SSL_CTX) void;
-    extern fn SSL_CTX_enable_signed_cert_timestamps(ctx: *crypto.SSL_CTX) void;
-    extern fn SSL_CTX_add_cert_compression_alg(
-        ctx: *crypto.SSL_CTX,
-        alg_id: u16,
-        compress: ?*const anyopaque,
-        decompress: ?DecompressFn,
-    ) c_int;
-    extern fn CRYPTO_BUFFER_alloc(out_data: *[*]u8, len: usize) ?*CRYPTO_BUFFER;
-    extern fn CRYPTO_BUFFER_free(buf: *CRYPTO_BUFFER) void;
-};
-
-const chrome_tls = struct {
-    // TLS 1.2 suites in Chrome's wire order. BoringSSL emits the three TLS 1.3
-    // suites ahead of these in its own fixed order (AES-128-GCM, AES-256-GCM,
-    // CHACHA20-POLY1305), which already matches Chrome, and does not let
-    // SSL_CTX_set_cipher_list reorder them.
-    const cipher_list: [:0]const u8 =
-        "ECDHE-ECDSA-AES128-GCM-SHA256:" ++ // 0xc02b
-        "ECDHE-RSA-AES128-GCM-SHA256:" ++ // 0xc02f
-        "ECDHE-ECDSA-AES256-GCM-SHA384:" ++ // 0xc02c
-        "ECDHE-RSA-AES256-GCM-SHA384:" ++ // 0xc030
-        "ECDHE-ECDSA-CHACHA20-POLY1305:" ++ // 0xcca9
-        "ECDHE-RSA-CHACHA20-POLY1305:" ++ // 0xcca8
-        "ECDHE-RSA-AES128-SHA:" ++ // 0xc013
-        "ECDHE-RSA-AES256-SHA:" ++ // 0xc014
-        "AES128-GCM-SHA256:" ++ // 0x009c
-        "AES256-GCM-SHA384:" ++ // 0x009d
-        "AES128-SHA:" ++ // 0x002f
-        "AES256-SHA"; // 0x0035
-
-    // supported_groups. BoringSSL's GREASE support prepends the GREASE group
-    // itself, matching Chrome's leading GREASE slot.
-    const groups = [_]u16{
-        boring.SSL_GROUP_X25519_MLKEM768,
-        boring.SSL_GROUP_X25519,
-        boring.SSL_GROUP_SECP256R1,
-        boring.SSL_GROUP_SECP384R1,
-    };
-
-    // signature_algorithms, in Chrome's order. This is the *verify* preference
-    // list: it is what the client advertises it will accept from the peer.
-    // SSL_CTX_set_signing_algorithm_prefs is the unrelated client-cert side.
-    const sigalgs = [_]u16{
-        0x0403, // ecdsa_secp256r1_sha256
-        0x0804, // rsa_pss_rsae_sha256
-        0x0401, // rsa_pkcs1_sha256
-        0x0503, // ecdsa_secp384r1_sha384
-        0x0805, // rsa_pss_rsae_sha384
-        0x0501, // rsa_pkcs1_sha384
-        0x0806, // rsa_pss_rsae_sha512
-        0x0601, // rsa_pkcs1_sha512
-    };
-};
-
-// curl hands the SSL_CTX callback only the CURLOPT_SSL_CTX_DATA pointer, which
-// src/sys/libcurl.zig types as *X509_STORE, leaving no room to smuggle the
-// profile through it. The fingerprint profile is fixed for the process
-// lifetime, so a module-level flag written from reset() is equivalent.
-// ponytail: process-global; thread a struct through ssl_ctx_data (and widen the
-// libcurl.zig option type) if the fingerprint ever needs to vary per connection.
-var chrome_fingerprint = false;
-
-// Result of the one-time probe below, cached for the process lifetime.
-var chrome_fingerprint_probe: ?bool = null;
-
-/// Whether the full Chrome ClientHello can be applied on this BoringSSL build.
-///
-/// applyChromeFingerprint returns on its first error, so a single rejected step
-/// (a cipher name, a group id) would otherwise leave GREASE and permuted
-/// extensions applied but the cipher list, sigalgs, OCSP/SCT and certificate
-/// compression stock — a hello that is *more* uniquely identifiable than curl's
-/// untouched one. Every step depends only on compile-time constants, so running
-/// the whole sequence once against a throwaway context answers it for good: on
-/// failure nothing is applied to a real connection and curl's stock TLS
-/// configuration is left entirely alone.
-fn chromeFingerprintSupported() bool {
-    if (chrome_fingerprint_probe) |cached| {
-        return cached;
-    }
-    const supported = blk: {
-        const ctx = boring.SSL_CTX_new(boring.TLS_method()) orelse break :blk false;
-        defer boring.SSL_CTX_free(ctx);
-        applyChromeFingerprint(ctx) catch |err| {
-            log.warn(.http, "chrome tls fingerprint unavailable", .{ .err = err });
-            break :blk false;
-        };
-        break :blk true;
-    };
-    chrome_fingerprint_probe = supported;
-    return supported;
-}
-
-/// CURLOPT_SSL_CTX_FUNCTION hook: installs our certificate store and, under the
-/// stealth profile, reshapes the ClientHello to Chrome's.
+// CURLOPT_SSL_CTX_FUNCTION installs Lightpanda's certificate store. Chrome
+// transport shaping is applied by curl_easy_impersonate before this hook.
 fn sslCtxCallback(
     _: *libcurl.Curl,
     raw_ssl_ctx: *anyopaque,
@@ -430,90 +291,10 @@ fn sslCtxCallback(
     const ssl_ctx: *crypto.SSL_CTX = @ptrCast(raw_ssl_ctx);
     const store: *crypto.X509_STORE = @ptrCast(raw_x509_store);
 
-    // set1 takes its own reference, released with the SSL_CTX, so this stays
-    // balanced against Network's single long-lived store.
-    const result = crypto.SSL_CTX_set1_verify_cert_store(ssl_ctx, store);
-    if (result != 1) {
-        return libcurl.CURLE.ABORTED_BY_CALLBACK;
-    }
-
-    if (chrome_fingerprint) {
-        // Unreachable in practice: chrome_fingerprint is only set once the
-        // probe has run this exact sequence to completion. A failure here still
-        // leaves a usable connection, so log rather than abort it.
-        applyChromeFingerprint(ssl_ctx) catch |err| {
-            log.warn(.http, "chrome tls fingerprint", .{ .err = err });
-        };
-    }
-
-    return libcurl.CURLE.OK;
-}
-
-fn applyChromeFingerprint(ctx: *crypto.SSL_CTX) !void {
-    // GREASE in the cipher, group, extension and version slots. Chrome 110+
-    // also permutes its ClientHello extensions per connection, so a *stable*
-    // extension order is itself the tell — randomising is the match.
-    boring.SSL_CTX_set_grease_enabled(ctx, 1);
-    boring.SSL_CTX_set_permute_extensions(ctx, 1);
-
-    if (boring.SSL_CTX_set_min_proto_version(ctx, boring.TLS1_2_VERSION) != 1) {
-        return error.TlsMinVersion;
-    }
-    if (boring.SSL_CTX_set_max_proto_version(ctx, boring.TLS1_3_VERSION) != 1) {
-        return error.TlsMaxVersion;
-    }
-    if (boring.SSL_CTX_set_cipher_list(ctx, chrome_tls.cipher_list.ptr) != 1) {
-        return error.TlsCipherList;
-    }
-    if (boring.SSL_CTX_set1_group_ids(ctx, &chrome_tls.groups, chrome_tls.groups.len) != 1) {
-        return error.TlsGroups;
-    }
-    if (boring.SSL_CTX_set_verify_algorithm_prefs(ctx, &chrome_tls.sigalgs, chrome_tls.sigalgs.len) != 1) {
-        return error.TlsSigAlgs;
-    }
-
-    // status_request and signed_certificate_timestamp; Chrome sends both.
-    boring.SSL_CTX_enable_ocsp_stapling(ctx);
-    boring.SSL_CTX_enable_signed_cert_timestamps(ctx);
-
-    // compress_certificate (extension 27) advertising brotli only, as Chrome
-    // does. BoringSSL only advertises an algorithm it can actually decompress,
-    // so the extension costs a real decoder — brotli is already linked for
-    // src/render/Compression.zig.
-    const added = boring.SSL_CTX_add_cert_compression_alg(
-        ctx,
-        boring.TLSEXT_cert_compression_brotli,
-        null, // client never compresses its own certificate chain
-        brotliDecompressCert,
-    );
-    if (added != 1) {
-        return error.TlsCertCompression;
-    }
-}
-
-fn brotliDecompressCert(
-    _: *anyopaque,
-    out: **boring.CRYPTO_BUFFER,
-    uncompressed_len: usize,
-    in: [*]const u8,
-    in_len: usize,
-) callconv(.c) c_int {
-    const brotli = @import("brotli_decode");
-
-    var data: [*]u8 = undefined;
-    const buf = boring.CRYPTO_BUFFER_alloc(&data, uncompressed_len) orelse return 0;
-
-    // BoringSSL requires the result to be exactly uncompressed_len bytes.
-    var decoded_len = uncompressed_len;
-    const result = brotli.BrotliDecoderDecompress(in_len, in, &decoded_len, data);
-    if (result != @as(c_uint, brotli.BROTLI_DECODER_RESULT_SUCCESS) or decoded_len != uncompressed_len) {
-        boring.CRYPTO_BUFFER_free(buf);
-        return 0;
-    }
-
-    // Setting *out transfers ownership to BoringSSL.
-    out.* = buf;
-    return 1;
+    return if (crypto.SSL_CTX_set1_verify_cert_store(ssl_ctx, store) == 1)
+        libcurl.CURLE.OK
+    else
+        libcurl.CURLE.ABORTED_BY_CALLBACK;
 }
 
 pub const Connection = struct {
@@ -701,6 +482,10 @@ pub const Connection = struct {
         ip_filter: ?*const IpFilter,
     ) !void {
         libcurl.curl_easy_reset(self._easy);
+        if (config.stealth()) {
+            try libcurl.curl_easy_impersonate(self._easy, "chrome150");
+            try libcurl.curl_easy_setopt(self._easy, .http_version, libcurl.CURL_HTTP_VERSION_3ONLY);
+        }
         self.transport = .none;
         self.ip_filter_active = if (ip_filter) |filter| filter.hasBlockedRanges() else false;
         self.clearHeaders();
@@ -725,13 +510,7 @@ pub const Connection = struct {
         // TLS.
         const verify_host = config.tlsVerifyHost();
 
-        // Gated on the stealth profile so non-stealth behaviour is byte-for-byte
-        // unchanged.
-        chrome_fingerprint = config.stealth() and chromeFingerprintSupported();
-
-        // The SSL_CTX hook carries both the certificate store and the Chrome
-        // ClientHello shaping, so it is installed whenever either is wanted.
-        if (verify_host or chrome_fingerprint) {
+        if (verify_host) {
             try libcurl.curl_easy_setopt(self._easy, .ssl_ctx_function, sslCtxCallback);
             // Pass our store to CURLOPT_SSL_CTX_FUNCTION.
             try libcurl.curl_easy_setopt(self._easy, .ssl_ctx_data, x509_store);
@@ -837,6 +616,24 @@ pub const Connection = struct {
         var opened: c_long = undefined;
         try libcurl.curl_easy_getinfo(self._easy, .num_connects, &opened);
         return opened == 0;
+    }
+
+    pub const NetworkTiming = struct {
+        name_lookup_micros: libcurl.CurlOffT = 0,
+        connect_micros: libcurl.CurlOffT = 0,
+        app_connect_micros: libcurl.CurlOffT = 0,
+        pre_transfer_micros: libcurl.CurlOffT = 0,
+        start_transfer_micros: libcurl.CurlOffT = 0,
+    };
+
+    pub fn getNetworkTiming(self: *const Connection) !NetworkTiming {
+        var timing: NetworkTiming = .{};
+        try libcurl.curl_easy_getinfo(self._easy, .name_lookup_time_t, &timing.name_lookup_micros);
+        try libcurl.curl_easy_getinfo(self._easy, .connect_time_t, &timing.connect_micros);
+        try libcurl.curl_easy_getinfo(self._easy, .app_connect_time_t, &timing.app_connect_micros);
+        try libcurl.curl_easy_getinfo(self._easy, .pre_transfer_time_t, &timing.pre_transfer_micros);
+        try libcurl.curl_easy_getinfo(self._easy, .start_transfer_time_t, &timing.start_transfer_micros);
+        return timing;
     }
 
     // Total transfer time (name lookup to completion) in microseconds.
@@ -1199,15 +996,6 @@ test "Header.param" {
     try testing.expect((Header{ .name = "Content-Disposition", .value = "attachment" }).param("filename") == null);
     // Empty values are skipped.
     try testing.expect((Header{ .name = "Content-Disposition", .value = "attachment; filename=\"\"" }).param("filename") == null);
-}
-
-// Guards the whole Chrome ClientHello: if any single step stops being accepted
-// by the linked BoringSSL, this fails instead of silently shipping a stock
-// (or worse, half-shaped) hello under --stealth.
-test "Chrome TLS fingerprint applies in full" {
-    chrome_fingerprint_probe = null;
-    defer chrome_fingerprint_probe = null;
-    try testing.expect(chromeFingerprintSupported());
 }
 
 test "proxy option disables ambient proxies and rejects filtered explicit proxies" {

@@ -35,6 +35,7 @@ pub const Frame = @import("browser/Frame.zig");
 pub const Browser = @import("browser/Browser.zig");
 pub const Session = @import("browser/Session.zig");
 pub const Turnstile = @import("browser/Turnstile.zig");
+pub const CaptchaSolver = @import("browser/CaptchaSolver.zig");
 
 pub const js = @import("browser/js/js.zig");
 pub const dump = @import("browser/dump.zig");

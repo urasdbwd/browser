@@ -266,21 +266,4 @@ pub const JsApi = struct {
             ._proto = undefined,
         });
     }
-
-    pub const dir = bridge.accessor(HTMLDocument.getDir, HTMLDocument.setDir, .{ .ce_reactions = true });
-    pub const head = bridge.accessor(HTMLDocument.getHead, null, .{});
-    pub const body = bridge.accessor(HTMLDocument.getBody, HTMLDocument.setBody, .{ .ce_reactions = true });
-    pub const lang = bridge.accessor(HTMLDocument.getLang, HTMLDocument.setLang, .{});
-    pub const title = bridge.accessor(HTMLDocument.getTitle, HTMLDocument.setTitle, .{ .ce_reactions = true });
-    pub const images = bridge.accessor(HTMLDocument.getImages, null, .{});
-    pub const scripts = bridge.accessor(HTMLDocument.getScripts, null, .{});
-    pub const links = bridge.accessor(HTMLDocument.getLinks, null, .{});
-    pub const anchors = bridge.accessor(HTMLDocument.getAnchors, null, .{});
-    pub const forms = bridge.accessor(HTMLDocument.getForms, null, .{});
-    pub const embeds = bridge.accessor(HTMLDocument.getEmbeds, null, .{});
-    pub const applets = bridge.accessor(HTMLDocument.getApplets, null, .{});
-    pub const plugins = bridge.accessor(HTMLDocument.getEmbeds, null, .{});
-    pub const currentScript = bridge.accessor(HTMLDocument.getCurrentScript, null, .{});
-    pub const all = bridge.accessor(HTMLDocument.getAll, null, .{});
-    pub const doctype = bridge.accessor(HTMLDocument.getDocType, null, .{});
 };

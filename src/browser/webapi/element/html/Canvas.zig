@@ -104,7 +104,7 @@ pub fn getContext(self: *Canvas, context_type: []const u8, frame: *Frame) !?Draw
         if (std.mem.eql(u8, context_type, "webgl") or std.mem.eql(u8, context_type, "experimental-webgl")) {
             const noise = frame._session.browser.app.config.fingerprint_profile.noise_seed;
             const ctx = try frame._factory.create(WebGLRenderingContext{
-                ._canvas = self,
+                ._canvas = .{ .canvas = self },
                 ._fp_seed = noise,
             });
             break :blk .{ .webgl = ctx };
@@ -113,7 +113,7 @@ pub fn getContext(self: *Canvas, context_type: []const u8, frame: *Frame) !?Draw
         if (std.mem.eql(u8, context_type, "webgl2")) {
             const noise = frame._session.browser.app.config.fingerprint_profile.noise_seed;
             const ctx = try frame._factory.create(WebGL2RenderingContext{
-                ._canvas = self,
+                ._canvas = .{ .canvas = self },
                 ._fp_seed = noise,
             });
             break :blk .{ .webgl2 = ctx };
@@ -148,7 +148,7 @@ pub fn transferControlToOffscreen(self: *Canvas, exec: *Execution) !*OffscreenCa
 /// Only image/png is produced; other mime types still get a PNG data URL
 /// (browsers fall back similarly when an encoder is missing).
 ///
-/// Without --stealth / --fingerprint there is no fingerprint profile and we
+/// With --no-stealth and no --fingerprint there is no fingerprint profile and we
 /// keep upstream's honest "data:," — Lightpanda has no rasterizer and does not
 /// pretend to have one unless asked to look like Chrome.
 pub fn toDataURL(self: *Canvas, _: ?[]const u8, _: ?f64, exec: *Execution) ![]const u8 {

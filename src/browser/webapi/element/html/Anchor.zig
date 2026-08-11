@@ -40,6 +40,35 @@ pub fn asNode(self: *Anchor) *Node {
     return self.asElement().asNode();
 }
 
+fn StringAttribute(comptime name: []const u8) type {
+    return struct {
+        fn get(self: *const Anchor) []const u8 {
+            return self.asConstElement().getAttributeSafe(.wrap(name)) orelse "";
+        }
+
+        fn set(self: *Anchor, value: []const u8, frame: *Frame) !void {
+            try self.asElement().setAttributeSafe(.wrap(name), .wrap(value), frame);
+        }
+    };
+}
+
+const AttributionSrc = StringAttribute("attributionsrc");
+const Charset = StringAttribute("charset");
+const Coords = StringAttribute("coords");
+const Download = StringAttribute("download");
+const HrefLang = StringAttribute("hreflang");
+const HrefTranslate = StringAttribute("hreftranslate");
+const Ping = StringAttribute("ping");
+const ReferrerPolicy = StringAttribute("referrerpolicy");
+const Rev = StringAttribute("rev");
+const Shape = StringAttribute("shape");
+
+pub fn getInterestForElement(_: *const Anchor) ?*Element {
+    return null;
+}
+
+pub fn setInterestForElement(_: *Anchor, _: ?*Element) void {}
+
 pub fn getHref(self: *Anchor, frame: *Frame) ![]const u8 {
     const href = self.asElement().getAttributeSafe(comptime .wrap("href")) orelse return "";
     if (href.len == 0) {
@@ -247,24 +276,35 @@ pub const JsApi = struct {
         pub var class_id: bridge.ClassId = undefined;
     };
 
-    pub const href = bridge.accessor(Anchor.getHref, Anchor.setHref, .{ .ce_reactions = true });
-    pub const target = bridge.accessor(Anchor.getTarget, Anchor.setTarget, .{ .ce_reactions = true });
+    pub const download = bridge.accessor(Download.get, Download.set, .{ .ce_reactions = true });
+    pub const ping = bridge.accessor(Ping.get, Ping.set, .{ .ce_reactions = true });
+    pub const rel = bridge.accessor(Anchor.getRel, Anchor.setRel, .{ .ce_reactions = true });
+    pub const relList = bridge.accessor(_getRelList, null, .{ .null_as_undefined = true });
+    pub const referrerPolicy = bridge.accessor(ReferrerPolicy.get, ReferrerPolicy.set, .{ .ce_reactions = true });
+    pub const text = bridge.accessor(Anchor.getText, Anchor.setText, .{ .ce_reactions = true });
+    pub const coords = bridge.accessor(Coords.get, Coords.set, .{ .ce_reactions = true });
+    pub const charset = bridge.accessor(Charset.get, Charset.set, .{ .ce_reactions = true });
     pub const name = bridge.accessor(Anchor.getName, Anchor.setName, .{ .ce_reactions = true });
+    pub const rev = bridge.accessor(Rev.get, Rev.set, .{ .ce_reactions = true });
+    pub const shape = bridge.accessor(Shape.get, Shape.set, .{ .ce_reactions = true });
+    pub const target = bridge.accessor(Anchor.getTarget, Anchor.setTarget, .{ .ce_reactions = true });
+    pub const href = bridge.accessor(Anchor.getHref, Anchor.setHref, .{ .ce_reactions = true });
     pub const origin = bridge.accessor(Anchor.getOrigin, null, .{});
     pub const protocol = bridge.accessor(Anchor.getProtocol, Anchor.setProtocol, .{ .ce_reactions = true });
-    pub const host = bridge.accessor(Anchor.getHost, Anchor.setHost, .{ .ce_reactions = true });
-    pub const hostname = bridge.accessor(Anchor.getHostname, Anchor.setHostname, .{ .ce_reactions = true });
     pub const username = bridge.accessor(Anchor.getUsername, Anchor.setUsername, .{ .ce_reactions = true });
     pub const password = bridge.accessor(Anchor.getPassword, Anchor.setPassword, .{ .ce_reactions = true });
+    pub const host = bridge.accessor(Anchor.getHost, Anchor.setHost, .{ .ce_reactions = true });
+    pub const hostname = bridge.accessor(Anchor.getHostname, Anchor.setHostname, .{ .ce_reactions = true });
     pub const port = bridge.accessor(Anchor.getPort, Anchor.setPort, .{ .ce_reactions = true });
     pub const pathname = bridge.accessor(Anchor.getPathname, Anchor.setPathname, .{ .ce_reactions = true });
     pub const search = bridge.accessor(Anchor.getSearch, Anchor.setSearch, .{ .ce_reactions = true });
     pub const hash = bridge.accessor(Anchor.getHash, Anchor.setHash, .{ .ce_reactions = true });
-    pub const rel = bridge.accessor(Anchor.getRel, Anchor.setRel, .{ .ce_reactions = true });
+    pub const hreflang = bridge.accessor(HrefLang.get, HrefLang.set, .{ .ce_reactions = true });
     pub const @"type" = bridge.accessor(Anchor.getType, Anchor.setType, .{ .ce_reactions = true });
-    pub const text = bridge.accessor(Anchor.getText, Anchor.setText, .{ .ce_reactions = true });
-    pub const relList = bridge.accessor(_getRelList, null, .{ .null_as_undefined = true });
+    pub const interestForElement = bridge.accessor(Anchor.getInterestForElement, Anchor.setInterestForElement, .{});
     pub const toString = bridge.function(Anchor.getHref, .{});
+    pub const hrefTranslate = bridge.accessor(HrefTranslate.get, HrefTranslate.set, .{ .ce_reactions = true });
+    pub const attributionSrc = bridge.accessor(AttributionSrc.get, AttributionSrc.set, .{ .ce_reactions = true });
 
     fn _getRelList(self: *Anchor, frame: *Frame) !?*@import("../../collections.zig").DOMTokenList {
         const element = self.asElement();

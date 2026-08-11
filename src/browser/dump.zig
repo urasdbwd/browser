@@ -47,13 +47,25 @@ const RENDER_CSP_META =
     "connect-src 'none'; frame-src 'self' about:; child-src 'self' about:; " ++
     "worker-src 'none'; " ++
     "object-src 'none'; form-action 'none'\">";
+/// Bot-challenge widgets are the one cross-origin frame worth allowing: the
+/// snapshot ships the vendor's iframe element, but `frame-src 'self'` blocks it
+/// in the viewer's browser, so the operator sees an empty box instead of a
+/// checkbox they could click. Scoped to these four origins rather than `https:`
+/// so enabling direct resources does not turn every third-party frame on the
+/// page loose. Only reachable with direct resources on, which already accepts
+/// that the viewer's browser talks to third-party origins.
+const RENDER_CSP_CAPTCHA_FRAMES =
+    "https://challenges.cloudflare.com https://*.hcaptcha.com " ++
+    "https://www.google.com https://www.recaptcha.net";
 const RENDER_CSP_DIRECT_RESOURCES_META =
     "<meta http-equiv=\"Content-Security-Policy\" content=\"" ++
     "default-src 'none'; script-src 'none'; " ++
     "style-src 'unsafe-inline' data: blob: http: https:; " ++
     "img-src data: blob: http: https:; media-src data: blob: http: https:; " ++
     "font-src data: blob: http: https:; " ++
-    "connect-src 'none'; frame-src 'self' about:; child-src 'self' about:; " ++
+    "connect-src 'none'; " ++
+    "frame-src 'self' about: " ++ RENDER_CSP_CAPTCHA_FRAMES ++ "; " ++
+    "child-src 'self' about: " ++ RENDER_CSP_CAPTCHA_FRAMES ++ "; " ++
     "worker-src 'none'; " ++
     "object-src 'none'; form-action 'none'\">";
 const RENDER_REFERRER_META = "<meta name=\"referrer\" content=\"no-referrer\">";

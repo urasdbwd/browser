@@ -1,0 +1,7 @@
+#ifndef NGHTTP3_VERSION_H
+#define NGHTTP3_VERSION_H
+
+#define NGHTTP3_VERSION "1.15.0"
+#define NGHTTP3_VERSION_NUM 0x010f00
+
+#endif

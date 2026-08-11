@@ -3,6 +3,7 @@
 
 <link id=l1 rel="stylesheet" href="data:text/css,">
 <div id=d1 class="foo"></div>
+<iframe id=f1 sandbox></iframe>
 
 <script id=supports>
 {
@@ -12,6 +13,18 @@
   testing.expectEqual(true, rl.supports('preload'));
   testing.expectEqual(true, rl.supports('stylesheet'));
   testing.expectEqual(false, rl.supports('prefetch'));
+}
+</script>
+
+<script id=supports_sandbox>
+{
+  // reCAPTCHA probes each directive with supports() before add()ing it, so a
+  // throw here stops its widget from ever rendering.
+  const sb = $('#f1').sandbox;
+  testing.expectEqual(true, sb.supports('allow-scripts'));
+  testing.expectEqual(true, sb.supports('allow-popups-to-escape-sandbox'));
+  testing.expectEqual(true, sb.supports('ALLOW-SAME-ORIGIN'));
+  testing.expectEqual(false, sb.supports('allow-nonsense'));
 }
 </script>
 

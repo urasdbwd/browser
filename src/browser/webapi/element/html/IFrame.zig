@@ -71,6 +71,14 @@ pub fn setSrc(self: *IFrame, src: []const u8, frame: *Frame) !void {
     try self.asElement().setAttributeSafe(comptime .wrap("src"), .wrap(src), frame);
 }
 
+pub fn getSrcdoc(self: *IFrame) []const u8 {
+    return self.asElement().getAttributeSafe(comptime .wrap("srcdoc")) orelse "";
+}
+
+pub fn setSrcdoc(self: *IFrame, srcdoc: []const u8, frame: *Frame) !void {
+    try self.asElement().setAttributeSafe(comptime .wrap("srcdoc"), .wrap(srcdoc), frame);
+}
+
 fn srcChanged(self: *IFrame, frame: *Frame) !void {
     if (!self.asNode().isConnected()) return;
 
@@ -95,6 +103,29 @@ pub fn getSandbox(self: *IFrame, frame: *Frame) !?*DOMTokenList {
     return element.getTokenList(.sandbox, frame);
 }
 
+/// `[PutForwards=value]`: `iframe.sandbox = "allow-scripts"` forwards to
+/// `sandbox.value`. Without a setter this was a getter-only property, so the
+/// plain assignment every embed helper makes threw in strict mode and took the
+/// surrounding script down with it.
+pub fn setSandbox(self: *IFrame, value: String, frame: *Frame) !void {
+    const list = (try self.getSandbox(frame)) orelse return;
+    try list.setValue(value, frame);
+}
+
+fn getEmpty(_: *const IFrame) []const u8 {
+    return "";
+}
+
+fn getFalse(_: *const IFrame) bool {
+    return false;
+}
+
+fn setValue(_: *IFrame, _: js.Value) void {}
+
+fn getSVGDocument(self: *const IFrame) ?*Document {
+    return self.getContentDocument();
+}
+
 pub const JsApi = struct {
     pub const bridge = js.Bridge(IFrame);
 
@@ -105,10 +136,32 @@ pub const JsApi = struct {
     };
 
     pub const src = bridge.accessor(IFrame.getSrc, IFrame.setSrc, .{ .ce_reactions = true });
+    pub const srcdoc = bridge.accessor(IFrame.getSrcdoc, IFrame.setSrcdoc, .{ .ce_reactions = true });
     pub const name = bridge.accessor(IFrame.getName, IFrame.setName, .{ .ce_reactions = true });
-    pub const contentWindow = bridge.accessor(IFrame.getContentWindow, null, .{});
+    pub const sandbox = bridge.accessor(IFrame.getSandbox, IFrame.setSandbox, .{ .null_as_undefined = true, .ce_reactions = true });
+    pub const allowFullscreen = bridge.accessor(IFrame.getFalse, IFrame.setValue, .{});
+    pub const width = bridge.accessor(IFrame.getEmpty, IFrame.setValue, .{});
+    pub const height = bridge.accessor(IFrame.getEmpty, IFrame.setValue, .{});
     pub const contentDocument = bridge.accessor(IFrame.getContentDocument, null, .{});
-    pub const sandbox = bridge.accessor(IFrame.getSandbox, null, .{ .null_as_undefined = true });
+    pub const contentWindow = bridge.accessor(IFrame.getContentWindow, null, .{});
+    pub const referrerPolicy = bridge.accessor(IFrame.getEmpty, IFrame.setValue, .{});
+    pub const csp = bridge.accessor(IFrame.getEmpty, IFrame.setValue, .{});
+    pub const allow = bridge.accessor(IFrame.getEmpty, IFrame.setValue, .{});
+    pub const featurePolicy = bridge.accessor(IFrame.getEmpty, null, .{});
+    pub const loading = bridge.accessor(IFrame.getEmpty, IFrame.setValue, .{});
+    pub const @"align" = bridge.accessor(IFrame.getEmpty, IFrame.setValue, .{});
+    pub const scrolling = bridge.accessor(IFrame.getEmpty, IFrame.setValue, .{});
+    pub const frameBorder = bridge.accessor(IFrame.getEmpty, IFrame.setValue, .{});
+    pub const longDesc = bridge.accessor(IFrame.getEmpty, IFrame.setValue, .{});
+    pub const marginHeight = bridge.accessor(IFrame.getEmpty, IFrame.setValue, .{});
+    pub const marginWidth = bridge.accessor(IFrame.getEmpty, IFrame.setValue, .{});
+    pub const getSVGDocument = bridge.function(IFrame.getSVGDocument, .{});
+    pub const credentialless = bridge.accessor(IFrame.getFalse, IFrame.setValue, .{});
+    pub const allowPaymentRequest = bridge.accessor(IFrame.getFalse, IFrame.setValue, .{});
+    pub const privateToken = bridge.accessor(IFrame.getEmpty, IFrame.setValue, .{});
+    pub const browsingTopics = bridge.accessor(IFrame.getFalse, IFrame.setValue, .{});
+    pub const adAuctionHeaders = bridge.accessor(IFrame.getFalse, IFrame.setValue, .{});
+    pub const sharedStorageWritable = bridge.accessor(IFrame.getFalse, IFrame.setValue, .{});
 };
 
 pub const Build = struct {

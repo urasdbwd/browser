@@ -22,14 +22,23 @@
             .url = "https://github.com/nghttp2/nghttp2/releases/download/v1.69.0/nghttp2-1.69.0.tar.gz",
             .hash = "N-V-__8AAMHpvwChC6orFCDB8MeiumT6OlfmKfmrWlak7Int",
         },
-        .@"boringssl-zig" = .{
-            .url = "git+https://github.com/lightpanda-io/boringssl-zig.git#f07cc58fa4a051eb0985287e691db5dbb0e7e76f",
-            .hash = "boringssl-0.1.0-VtJeWd1OAAAQ5AuNOZGP5a_5ZyNn5BfeE-jiKqEm2gsE",
+        .nghttp3 = .{
+            // v1.17.0 with ordered HTTP/3 SETTINGS support used by curl-chrome.
+            .url = "https://github.com/lexiforest/nghttp3/archive/e8a38aeed47189a6475dcbda2bb815df2c5c456b.tar.gz",
+            .hash = "N-V-__8AAIazEwC3HqZ1RUbgzRQYvE-B9ENZbRkeUiSn8p3l",
         },
-        // .@"boringssl-zig" = .{ .path = "../boringssl-zig" },
+        .ngtcp2 = .{
+            .url = "https://github.com/ngtcp2/ngtcp2/releases/download/v1.17.0/ngtcp2-1.17.0.tar.gz",
+            .hash = "N-V-__8AAMrzYgCNtcRF3WE_xq3t5O9eRPd2epxJPaIYDv6y",
+        },
+        .boringssl = .{
+            .url = "git+https://github.com/lexiforest/boringssl.git#6a07634daa549b7047e2642bf5385c5815083f5c",
+            .hash = "N-V-__8AAGU_bg7tPpkB4MY-FPPr6VOVLHaluskxQxND8BJO",
+        },
         .curl = .{
-            .url = "https://github.com/curl/curl/releases/download/curl-8_20_0/curl-8.20.0.tar.gz",
-            .hash = "N-V-__8AAHM9RQHjzJo8Wn4dbGPqNOC21zZJJA9PcCj7FPF5",
+            // curl 8.21 with maintained Chrome transport profiles.
+            .url = "https://github.com/lexiforest/curl-chrome/archive/8c3a16628185f9b3f6043ab955c946d31f670c23.tar.gz",
+            .hash = "N-V-__8AAJfuEwGYBRuAckPmrYsuMNSFkPndmzjJCVu7TerY",
         },
         .sqlite3 = .{
             .url = "https://github.com/allyourcodebase/sqlite3/archive/7a615f5af79009cd733e3480658586d9b0d28b35.tar.gz",

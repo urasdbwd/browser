@@ -29,6 +29,7 @@ const Inspector = @import("Inspector.zig");
 const App = @import("../../App.zig");
 const Frame = @import("../Frame.zig");
 const Window = @import("../webapi/Window.zig");
+const CompatibilityInterfaces = @import("../webapi/CompatibilityInterfaces.zig");
 const WorkerGlobalScope = @import("../webapi/WorkerGlobalScope.zig");
 const SharedWorkerGlobalScope = @import("../webapi/SharedWorkerGlobalScope.zig");
 const DedicatedWorkerGlobalScope = @import("../webapi/DedicatedWorkerGlobalScope.zig");
@@ -414,6 +415,11 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context 
     // a v8 context, we can get our context out
     v8.v8__Context__SetAlignedPointerInEmbedderData(v8_context, 1, @ptrCast(context));
 
+    if (comptime is_frame) {
+        try installLateCompatibilityGlobals(isolate, v8_context, global_obj);
+        try normalizeChromeObject(isolate, v8_context);
+    }
+
     if (self.contexts.items.len >= MAX_CONTEXTS) {
         return error.TooManyContexts;
     }
@@ -423,6 +429,70 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context 
 
     return context;
 }
+
+fn installLateCompatibilityGlobals(
+    isolate: js.Isolate,
+    context: *const v8.Context,
+    global: *const v8.Object,
+) !void {
+    const shared_array_buffer = isolate.initStringHandle("SharedArrayBuffer");
+    var maybe_deleted: v8.MaybeBool = undefined;
+    v8.v8__Object__Delete(global, context, @ptrCast(shared_array_buffer), &maybe_deleted);
+
+    for (CompatibilityInterfaces.late_global_names) |name| {
+        const key = isolate.initStringHandle(name);
+        if (std.mem.eql(u8, name, "devicePixelRatio")) {
+            const value = v8.v8__Number__New(isolate.handle, 1) orelse return error.JsException;
+            var maybe_defined: v8.MaybeBool = undefined;
+            v8.v8__Object__DefineOwnProperty(global, context, @ptrCast(key), @ptrCast(value), v8.None, &maybe_defined);
+            if (!maybe_defined.has_value or !maybe_defined.value) return error.JsException;
+            continue;
+        }
+        var maybe_has: v8.MaybeBool = undefined;
+        v8.v8__Object__Has(global, context, @ptrCast(key), &maybe_has);
+        if (maybe_has.has_value and maybe_has.value) continue;
+
+        const function = v8.v8__Function__New__DEFAULT2(context, compatibilityInterfaceCallback, null) orelse
+            return error.JsException;
+        v8.v8__Function__SetName(function, key);
+
+        var maybe_defined: v8.MaybeBool = undefined;
+        v8.v8__Object__DefineOwnProperty(global, context, @ptrCast(key), @ptrCast(function), v8.DontEnum, &maybe_defined);
+        if (!maybe_defined.has_value or !maybe_defined.value) return error.JsException;
+    }
+}
+
+fn normalizeChromeObject(isolate: js.Isolate, context: *const v8.Context) !void {
+    v8.v8__Context__Enter(context);
+    defer v8.v8__Context__Exit(context);
+
+    const source =
+        \\Object.setPrototypeOf(chrome, Object.prototype);
+        \\for (const name of ["loadTimes", "csi"]) {
+        \\  const callback = chrome[name];
+        \\  const proxy = new Proxy(function() {}, {
+        \\    apply(_target, _receiver, args) { return Reflect.apply(callback, chrome, args); },
+        \\    construct(_target, args) { return Reflect.apply(callback, chrome, args); },
+        \\  });
+        \\  Object.defineProperty(proxy.prototype, "constructor", { value: proxy, writable: true, configurable: true });
+        \\  chrome[name] = proxy;
+        \\}
+        \\for (const name of ["app", "runtime"]) {
+        \\  const value = chrome[name];
+        \\  Object.defineProperty(chrome, name, { value, writable: true, enumerable: true, configurable: true });
+        \\}
+        \\Object.setPrototypeOf(chrome.runtime, Object.prototype);
+        \\for (const name of Object.getOwnPropertyNames(chrome.runtime)) {
+        \\  const value = chrome.runtime[name];
+        \\  Object.defineProperty(chrome.runtime, name, { value, writable: true, enumerable: true, configurable: true });
+        \\}
+    ;
+    const code = v8.v8__String__NewFromUtf8(isolate.handle, source.ptr, v8.kNormal, @intCast(source.len));
+    const script = v8.v8__Script__Compile(context, code, null) orelse return error.JsException;
+    _ = v8.v8__Script__Run(script, context) orelse return error.JsException;
+}
+
+fn compatibilityInterfaceCallback(_: ?*const v8.FunctionCallbackInfo) callconv(.c) void {}
 
 pub fn destroyContext(self: *Env, context: *Context) void {
     for (self.contexts.items, 0..) |ctx, i| {

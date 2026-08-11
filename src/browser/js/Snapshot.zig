@@ -22,6 +22,7 @@ const lp = @import("lightpanda");
 const js = @import("js.zig");
 const bridge = @import("bridge.zig");
 const reflect = @import("../reflect.zig");
+const CompatibilityInterfaces = @import("../webapi/CompatibilityInterfaces.zig");
 
 // Not ideal, but its children have special constructor rules (can be extended
 // can't be instantiated). And rather than coming up with a generic definition
@@ -249,6 +250,15 @@ fn createSnapshotContext(
     const global_template = v8.v8__FunctionTemplate__InstanceTemplate(js_global).?;
     v8.v8__ObjectTemplate__SetInternalFieldCount(global_template, comptime countInternalFields(GlobalScopeApi));
 
+    if (comptime realm == .window) {
+        const prototype = v8.v8__FunctionTemplate__PrototypeTemplate(js_global);
+        inline for (.{ .{ "TEMPORARY", 0 }, .{ "PERSISTENT", 1 } }) |property| {
+            const key = v8.v8__String__NewFromUtf8(isolate, property[0].ptr, v8.kNormal, @intCast(property[0].len));
+            const value = v8.v8__Integer__New(isolate, property[1]).?;
+            v8.v8__Template__Set(@ptrCast(prototype), key, @ptrCast(value), v8.ReadOnly + v8.DontDelete);
+        }
+    }
+
     // Set up named/indexed handlers for Window's global object (for named element access like window.myDiv)
     if (comptime std.mem.eql(u8, GlobalScopeApi.Meta.name, "Window")) {
         v8.v8__ObjectTemplate__SetNamedHandler(global_template, &.{
@@ -275,6 +285,58 @@ fn createSnapshotContext(
         });
     }
 
+    // Chromium installs its interface objects before the [Global] Window
+    // members, in descending interface-name order. Keep that observable order:
+    // bot challenges sample Object.getOwnPropertyNames(window).
+    inline for (0..8) |rank| {
+        inline for (ContextApis) |JsApi| {
+            if (comptime constructorPrefixRank(JsApi) == rank) {
+                setGlobalConstructor(
+                    isolate,
+                    global_template,
+                    templates[comptime bridge.JsApiLookup.getId(JsApi)],
+                    comptime constructorPrefixName(JsApi).?,
+                );
+            }
+        }
+    }
+    const ordered_apis = comptime orderedContextApis(ContextApis);
+    inline for (ordered_apis, 0..) |JsApi, i| {
+        if (@hasDecl(JsApi.Meta, "name") and
+            comptime isFirstInterfaceName(&ordered_apis, i) and
+                !@hasDecl(JsApi.Meta, "no_interface_object") and
+                !isPrefixOnlyInterface(JsApi.Meta.name) and
+                !isLateInterface(JsApi.Meta.name) and
+                !isHiddenInterface(JsApi.Meta.name) and
+                !isGlobalMemberName(JsApi.Meta.name))
+        {
+            setGlobalConstructor(
+                isolate,
+                global_template,
+                templates[comptime bridge.JsApiLookup.getId(JsApi)],
+                JsApi.Meta.name,
+            );
+            if (comptime realm == .window and std.mem.eql(u8, JsApi.Meta.name, "CSSAnimation")) {
+                const CSS = @import("../webapi/CSS.zig");
+                setGlobalConstructor(
+                    isolate,
+                    global_template,
+                    templates[comptime bridge.JsApiLookup.getId(CSS.JsApi)],
+                    "CSS",
+                );
+            }
+        }
+    }
+
+    if (comptime realm == .window) {
+        for (CompatibilityInterfaces.early_global_names) |name| {
+            const key = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
+            const placeholder = v8.v8__FunctionTemplate__New__DEFAULT(isolate);
+            v8.v8__FunctionTemplate__SetClassName(placeholder, key);
+            v8.v8__Template__Set(@ptrCast(global_template), key, @ptrCast(placeholder), v8.DontEnum);
+        }
+    }
+
     // Re-run attachClass, but specifically targetting the global (Window or WGS)
     // templates, so that all of these getters/functions which are already defined
     // on their prototype will now be defined directly on the object.
@@ -293,48 +355,34 @@ fn createSnapshotContext(
         attachClass(ScopeApi, true, isolate, templates[scope_index], global_template);
     }
 
-    const context = v8.v8__Context__New(isolate, global_template, null);
+    const context = v8.v8__Context__New(isolate, global_template, null) orelse return error.JsException;
     v8.v8__Context__Enter(context);
     defer v8.v8__Context__Exit(context);
 
     // Initialize embedder data to null so callbacks can detect snapshot creation
     v8.v8__Context__SetAlignedPointerInEmbedderData(context, 1, null);
 
-    const global_obj = v8.v8__Context__Global(context);
+    const global_obj = v8.v8__Context__Global(context) orelse return error.JsException;
 
-    // Attach constructors for this context's APIs to the global, and for any
-    // type with members tagged [Exposed=Window]/[Exposed=Worker], prune the
-    // ones that don't match this realm from the per-context Func.prototype.
+    if (comptime realm == .window) {
+        const code_str = comptime earlyGlobalRestoreScript();
+        const code = v8.v8__String__NewFromUtf8(isolate, code_str.ptr, v8.kNormal, @intCast(code_str.len));
+        const script = v8.v8__Script__Compile(context, code, null) orelse return error.ScriptCompileFailed;
+        _ = v8.v8__Script__Run(script, context) orelse return error.ScriptRunFailed;
+    }
+
+    // For any type with members tagged [Exposed=Window]/[Exposed=Worker], prune
+    // the ones that don't match this realm from the per-context Func.prototype.
     const prototype_key = v8.v8__String__NewFromUtf8(isolate, "prototype", v8.kNormal, 9);
 
     inline for (ContextApis) |JsApi| {
         @setEvalBranchQuota(10_000);
         const template_index = comptime bridge.JsApiLookup.getId(JsApi);
         const func = v8.v8__FunctionTemplate__GetFunction(templates[template_index], context);
-        // `no_interface_object` types exist only as instances (window.chrome,
-        // navigator.modelContext, ...). Real Chrome exposes no matching global
-        // constructor, and bot scanners diff Object.getOwnPropertyNames(window)
-        // against a reference list, so installing one is a fingerprint tell.
-        if (@hasDecl(JsApi.Meta, "name") and !@hasDecl(JsApi.Meta, "no_interface_object")) {
-            if (@hasDecl(JsApi.Meta, "constructor_alias")) {
-                const alias = JsApi.Meta.constructor_alias;
-                const v8_class_name = v8.v8__String__NewFromUtf8(isolate, alias.ptr, v8.kNormal, @intCast(alias.len));
-                var maybe_result: v8.MaybeBool = undefined;
-                v8.v8__Object__Set(global_obj, context, v8_class_name, func, &maybe_result);
-
-                const name = JsApi.Meta.name;
-                const illegal_class_name = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
-                var maybe_result2: v8.MaybeBool = undefined;
-                v8.v8__Object__DefineOwnProperty(global_obj, context, illegal_class_name, func, 0, &maybe_result2);
-            } else {
-                const name = JsApi.Meta.name;
-                const v8_class_name = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
-                var maybe_result: v8.MaybeBool = undefined;
-                // Web IDL: interface objects on the global are non-enumerable.
-                v8.v8__Object__DefineOwnProperty(global_obj, context, v8_class_name, func, v8.DontEnum, &maybe_result);
-            }
+        if (@hasDecl(JsApi.Meta, "name") and comptime std.mem.eql(u8, JsApi.Meta.name, "RTCPeerConnection")) {
+            const name = v8.v8__String__NewFromUtf8(isolate, JsApi.Meta.name.ptr, v8.kNormal, @intCast(JsApi.Meta.name.len));
+            v8.v8__Function__SetName(func, name);
         }
-
         // WebIDL [Exposed=...] gating. Members are installed on the shared
         // FunctionTemplate by attachClass; here we delete the ones that don't
         // match this realm from the per-context Func.prototype.
@@ -355,14 +403,8 @@ fn createSnapshotContext(
         }
     }
 
-    {
-        // Delete built-in console so we can inject our own
-        const console_key = v8.v8__String__NewFromUtf8(isolate, "console", v8.kNormal, 7);
-        var maybe_deleted: v8.MaybeBool = undefined;
-        v8.v8__Object__Delete(global_obj, context, console_key, &maybe_deleted);
-        if (maybe_deleted.value == false) {
-            return error.ConsoleDeleteError;
-        }
+    if (comptime realm == .window) {
+        try installOrderedLateGlobals(ContextApis, isolate, context, global_obj, templates);
     }
 
     // Set prototype chains on function objects
@@ -389,6 +431,205 @@ fn createSnapshotContext(
     }
 
     return v8.v8__SnapshotCreator__AddContext(snapshot_creator, context);
+}
+
+fn setGlobalConstructor(
+    isolate: *v8.Isolate,
+    global_template: *const v8.ObjectTemplate,
+    template: *const v8.FunctionTemplate,
+    comptime name: []const u8,
+) void {
+    const key = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
+    v8.v8__Template__Set(@ptrCast(global_template), key, @ptrCast(template), v8.DontEnum);
+}
+
+fn earlyGlobalRestoreScript() []const u8 {
+    @setEvalBranchQuota(100_000);
+    var names: []const u8 = "[";
+    for (CompatibilityInterfaces.early_global_names, 0..) |name, i| {
+        if (i > 0) names = names ++ ",";
+        names = names ++ "\"" ++ name ++ "\"";
+    }
+    return "(()=>{for(const name of " ++ names ++ "]){const current=Object.getOwnPropertyDescriptor(globalThis,name);if(current&&!current.configurable)continue;let owner=Object.getPrototypeOf(globalThis),descriptor;while(owner&&!(descriptor=Object.getOwnPropertyDescriptor(owner,name)))owner=Object.getPrototypeOf(owner);if(descriptor)Object.defineProperty(globalThis,name,descriptor)}})()";
+}
+
+fn installOrderedLateGlobals(
+    comptime ContextApis: []const type,
+    isolate: *v8.Isolate,
+    context: *const v8.Context,
+    global: *const v8.Object,
+    templates: []*const v8.FunctionTemplate,
+) !void {
+    inline for (.{ "Temporal", "SuppressedError", "DisposableStack", "AsyncDisposableStack", "Float16Array" }) |name| {
+        const key = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
+        const value = v8.v8__Object__Get(global, context, key) orelse return error.JsException;
+        var maybe_defined: v8.MaybeBool = undefined;
+        v8.v8__Object__DefineOwnProperty(global, context, key, value, v8.DontEnum, &maybe_defined);
+        if (!maybe_defined.has_value or !maybe_defined.value) return error.JsException;
+    }
+
+    const webassembly_key = v8.v8__String__NewFromUtf8(isolate, "WebAssembly", v8.kNormal, 11);
+    const webassembly = v8.v8__Object__Get(global, context, webassembly_key) orelse return error.JsException;
+    var maybe_deleted: v8.MaybeBool = undefined;
+    v8.v8__Object__Delete(global, context, webassembly_key, &maybe_deleted);
+    if (!maybe_deleted.has_value or !maybe_deleted.value) return error.JsException;
+
+    inline for (CompatibilityInterfaces.ordered_late_global_names) |name| {
+        const key = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
+        var value: ?*const v8.Value = null;
+        if (comptime std.mem.eql(u8, name, "WebAssembly")) value = webassembly;
+
+        inline for (ContextApis) |JsApi| {
+            if (@hasDecl(JsApi.Meta, "name") and
+                comptime isLateInterface(JsApi.Meta.name) and
+                    std.mem.eql(u8, name, JsApi.Meta.name))
+            {
+                value = @ptrCast(v8.v8__FunctionTemplate__GetFunction(
+                    templates[comptime bridge.JsApiLookup.getId(JsApi)],
+                    context,
+                ));
+            }
+        }
+
+        if (value == null) {
+            const placeholder = v8.v8__FunctionTemplate__New__DEFAULT(isolate);
+            v8.v8__FunctionTemplate__SetClassName(placeholder, key);
+            value = @ptrCast(v8.v8__FunctionTemplate__GetFunction(placeholder, context));
+        }
+
+        var maybe_defined: v8.MaybeBool = undefined;
+        v8.v8__Object__DefineOwnProperty(global, context, key, value.?, v8.DontEnum, &maybe_defined);
+        if (!maybe_defined.has_value or !maybe_defined.value) return error.JsException;
+    }
+
+    const code_str =
+        \\(() => {
+        \\  for (const name of ["chrome", "cookieStore"]) {
+        \\    let owner = Object.getPrototypeOf(globalThis), descriptor;
+        \\    while (owner && !(descriptor = Object.getOwnPropertyDescriptor(owner, name))) owner = Object.getPrototypeOf(owner);
+        \\    if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+        \\  }
+        \\  const reorderTail = (prototype, names) => {
+        \\    const descriptors = names.map(name => Object.getOwnPropertyDescriptor(prototype, name));
+        \\    for (const name of names) delete prototype[name];
+        \\    for (let i = 0; i < names.length; i++) Object.defineProperty(prototype, names[i], descriptors[i]);
+        \\  };
+        \\  const orderPrefix = (prototype, prefix) => {
+        \\    const names = Object.getOwnPropertyNames(prototype);
+        \\    const descriptors = new Map(names.map(name => [name, Object.getOwnPropertyDescriptor(prototype, name)]));
+        \\    for (const name of names) delete prototype[name];
+        \\    for (const name of prefix) Object.defineProperty(prototype, name, descriptors.get(name) || {configurable: true, enumerable: true, writable: true, value: null});
+        \\    for (const name of names) if (name !== "constructor" && !prefix.includes(name)) Object.defineProperty(prototype, name, descriptors.get(name));
+        \\    if (descriptors.has("constructor")) Object.defineProperty(prototype, "constructor", descriptors.get("constructor"));
+        \\  };
+        \\  reorderTail(HTMLIFrameElement.prototype, ["privateToken", "browsingTopics", "adAuctionHeaders", "sharedStorageWritable"]);
+        \\  reorderTail(XRView.prototype, ["projectionMatrix", "transform"]);
+        \\  orderPrefix(EncodedAudioChunk.prototype, ["type", "timestamp", "byteLength", "duration", "copyTo"]);
+        \\  orderPrefix(TextUpdateEvent.prototype, ["updateRangeStart", "updateRangeEnd", "text", "selectionStart", "selectionEnd"]);
+        \\  orderPrefix(CSSTransformValue.prototype, ["entries", "keys", "values", "forEach", "length", "is2D", "toMatrix"]);
+        \\  orderPrefix(RTCPeerConnection.prototype, ["localDescription", "currentLocalDescription", "pendingLocalDescription", "remoteDescription", "currentRemoteDescription", "pendingRemoteDescription", "signalingState", "iceGatheringState", "iceConnectionState", "connectionState", "canTrickleIceCandidates", "onnegotiationneeded"]);
+        \\  orderPrefix(OffscreenCanvasRenderingContext2D.prototype, ["canvas", "lang", "font", "textAlign", "textBaseline", "direction", "fontKerning", "fontStretch", "fontVariantCaps"]);
+        \\  orderPrefix(Document.prototype, ["implementation", "URL", "documentURI", "compatMode", "characterSet", "charset", "inputEncoding", "contentType", "doctype", "documentElement", "xmlEncoding", "xmlVersion", "xmlStandalone", "domain", "referrer", "cookie", "lastModified", "readyState", "title", "dir", "body", "head", "images", "embeds", "plugins", "links", "forms", "scripts", "currentScript", "defaultView", "designMode", "onreadystatechange", "anchors", "applets", "fgColor"]);
+        \\})()
+    ;
+    const code = v8.v8__String__NewFromUtf8(isolate, code_str.ptr, v8.kNormal, @intCast(code_str.len));
+    const script = v8.v8__Script__Compile(context, code, null) orelse return error.ScriptCompileFailed;
+    _ = v8.v8__Script__Run(script, context) orelse return error.ScriptRunFailed;
+}
+
+fn orderedContextApis(comptime apis: []const type) [apis.len]type {
+    @setEvalBranchQuota(10_000_000);
+    var ordered: [apis.len]type = undefined;
+    for (apis, 0..) |Api, i| {
+        ordered[i] = Api;
+        var j = i;
+        while (j > 0 and std.mem.order(u8, interfaceName(ordered[j - 1]), interfaceName(ordered[j])) == .lt) : (j -= 1) {
+            const previous = ordered[j - 1];
+            ordered[j - 1] = ordered[j];
+            ordered[j] = previous;
+        }
+    }
+    return ordered;
+}
+
+fn interfaceName(comptime JsApi: type) []const u8 {
+    return if (@hasDecl(JsApi.Meta, "name")) JsApi.Meta.name else "";
+}
+
+fn isFirstInterfaceName(comptime apis: []const type, comptime index: usize) bool {
+    if (index == 0) return true;
+    return !std.mem.eql(u8, interfaceName(apis[index - 1]), interfaceName(apis[index]));
+}
+
+fn constructorPrefixRank(comptime JsApi: type) ?usize {
+    const name = constructorPrefixName(JsApi) orelse return null;
+    const prefix = [_][]const u8{
+        "Option",
+        "Image",
+        "Audio",
+        "webkitURL",
+        "webkitRTCPeerConnection",
+        "webkitMediaStream",
+        "WebKitMutationObserver",
+        "WebKitCSSMatrix",
+    };
+    for (prefix, 0..) |candidate, i| {
+        if (std.mem.eql(u8, name, candidate)) return @intCast(i);
+    }
+    return null;
+}
+
+fn constructorPrefixName(comptime JsApi: type) ?[]const u8 {
+    if (@hasDecl(JsApi.Meta, "constructor_alias")) return JsApi.Meta.constructor_alias;
+    if (!@hasDecl(JsApi.Meta, "name")) return null;
+    return if (isPrefixOnlyInterface(JsApi.Meta.name)) JsApi.Meta.name else null;
+}
+
+fn isPrefixOnlyInterface(name: []const u8) bool {
+    return std.mem.eql(u8, name, "webkitURL") or
+        std.mem.eql(u8, name, "webkitMediaStream") or
+        std.mem.eql(u8, name, "WebKitMutationObserver") or
+        std.mem.eql(u8, name, "WebKitCSSMatrix");
+}
+
+fn isLateInterface(name: []const u8) bool {
+    const names = [_][]const u8{
+        "XSLTProcessor",
+        "XRView",
+        "XRLayer",
+        "XRCylinderLayer",
+        "XRCompositionLayer",
+        "SubtleCrypto",
+        "StorageManager",
+        "SharedWorker",
+        "RTCDataChannel",
+        "QuotaExceededError",
+        "Notification",
+        "MediaDevices",
+        "MediaDeviceInfo",
+        "DeviceOrientationEvent",
+        "DeviceMotionEvent",
+        "CryptoKey",
+        "CookieStore",
+        "CookieChangeEvent",
+        "BatteryManager",
+    };
+    for (names) |candidate| {
+        if (std.mem.eql(u8, name, candidate)) return true;
+    }
+    return false;
+}
+
+fn isHiddenInterface(name: []const u8) bool {
+    return std.mem.eql(u8, name, "WEBGL_lose_context") or
+        std.mem.eql(u8, name, "WEBGL_debug_renderer_info") or
+        std.mem.eql(u8, name, "MemoryInfo") or
+        std.mem.eql(u8, name, "ContentIndex") or
+        std.mem.eql(u8, name, "CSSStyleProperties");
+}
+
+fn isGlobalMemberName(name: []const u8) bool {
+    return name.len > 0 and std.ascii.isLower(name[0]);
 }
 
 fn hasGatedMember(comptime JsApi: type) bool {
@@ -771,6 +1012,12 @@ fn attachClass(comptime JsApi: type, comptime flatten: bool, isolate: *v8.Isolat
 
     inline for (declarations) |d| {
         const name: [:0]const u8 = d.name;
+        if (comptime flatten and @hasDecl(JsApi.Meta, "name") and
+            std.mem.eql(u8, JsApi.Meta.name, "Window") and
+            (std.mem.eql(u8, name, "chrome") or std.mem.eql(u8, name, "cookieStore")))
+        {
+            continue;
+        }
         const value = @field(JsApi, name);
         const definition = @TypeOf(value);
 
@@ -793,7 +1040,7 @@ fn attachClass(comptime JsApi: type, comptime flatten: bool, isolate: *v8.Isolat
                     // later in this function.
                     continue;
                 }
-                attachAccessorProperty(name, value, isolate, template, signature, define_on orelse prototype);
+                attachAccessorProperty(name, value, isolate, template, signature, define_on orelse member_template);
             },
             bridge.Function => {
                 if (value.wpt_only and wpt_extensions_enabled == false) {
@@ -801,7 +1048,7 @@ fn attachClass(comptime JsApi: type, comptime flatten: bool, isolate: *v8.Isolat
                 }
 
                 // For non-static functions, use the signature to validate the receiver
-                const func_signature = if (value.static) null else signature;
+                const func_signature = if (value.static or value.custom_brand_check) null else signature;
                 const function_template = v8.v8__FunctionTemplate__New__Config(isolate, &.{
                     .callback = value.func,
                     .length = value.arity,
@@ -901,10 +1148,12 @@ fn attachClass(comptime JsApi: type, comptime flatten: bool, isolate: *v8.Isolat
         v8.v8__ObjectTemplate__SetCallAsFunctionHandler(instance, JsApi.Meta.callable.func);
     }
 
-    if (@hasDecl(JsApi.Meta, "name")) {
+    if (@hasDecl(JsApi.Meta, "name") and !@hasDecl(JsApi.Meta, "no_to_string_tag")) {
         const js_name = v8.v8__Symbol__GetToStringTag(isolate);
         const js_value = v8.v8__String__NewFromUtf8(isolate, JsApi.Meta.name.ptr, v8.kNormal, @intCast(JsApi.Meta.name.len));
-        v8.v8__Template__Set(@ptrCast(instance), js_name, js_value, v8.ReadOnly + v8.DontDelete);
+        // Web IDL installs @@toStringTag on the interface prototype, not on
+        // every instance. It is non-writable/non-enumerable but configurable.
+        v8.v8__Template__Set(@ptrCast(prototype), js_name, js_value, v8.ReadOnly + v8.DontEnum);
     }
 
     if (comptime lp.IS_DEBUG) {
@@ -925,19 +1174,10 @@ fn attachClass(comptime JsApi: type, comptime flatten: bool, isolate: *v8.Isolat
     }
 }
 
-// The chain of interface types reachable from a [Global] interface via WebIDL
-// inheritance, e.g. Window -> [Window.JsApi, EventTarget.JsApi].
+// [Global] members are own properties. Inherited EventTarget methods stay on
+// the prototype, as they do in Chromium.
 fn globalScopeChain(comptime GlobalScopeApi: type) []const type {
-    comptime {
-        var chain: []const type = &[_]type{};
-        var JsApi = GlobalScopeApi;
-        while (true) {
-            chain = chain ++ &[_]type{JsApi};
-            const proto_index = protoIndexLookup(JsApi) orelse break;
-            JsApi = JsApis[proto_index];
-        }
-        return chain;
-    }
+    return &.{GlobalScopeApi};
 }
 
 // Every [LegacyUnforgeable] accessor. We collect this once so we don't need to

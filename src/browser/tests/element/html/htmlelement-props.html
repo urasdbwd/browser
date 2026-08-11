@@ -6,6 +6,16 @@
 <input id="i1" tabindex="5">
 <div id="d3">No tabindex</div>
 
+<script id="htmlVersion">
+  {
+    const html = document.documentElement;
+    testing.expectEqual('', html.version);
+    html.version = '4';
+    testing.expectEqual('4', html.version);
+    testing.expectEqual('4', html.getAttribute('version'));
+  }
+</script>
+
 <script id="hidden">
   {
     const d1 = document.getElementById('d1');

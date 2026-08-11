@@ -479,7 +479,7 @@ pub const RequestWriter = struct {
             }
             if (try request.getCookieString(transfer.arena.allocator())) |cookies| {
                 try jws.objectField("Cookie");
-                try jws.write(cookies[0 .. cookies.len - 1]);
+                try jws.write(cookies);
             }
             try jws.endObject();
         }
@@ -1137,4 +1137,41 @@ test "cdp.Network: worker requests emit network events" {
         .type = "Fetch",
         .request = .{ .url = api_url },
     }, .{ .session_id = "SID-NW" });
+}
+
+test "cdp.Network: request event reports the complete cookie value" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const cdp = ctx.cdp();
+    _ = try cdp.createBrowserContext();
+    var bc = &cdp.browser_context.?;
+    bc.id = "BID-NC";
+    bc.session_id = "SID-NC";
+    bc.target_id = "TID-NC-0000000".*;
+
+    try ctx.processMessage(.{ .id = 1, .method = "Network.enable" });
+    try ctx.expectSentResult(null, .{ .id = 1 });
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Network.setCookie",
+        .params = CdpStorage.CdpCookie{
+            .name = "token",
+            .value = "ends-in-Z",
+            .url = "http://127.0.0.1:9582/",
+        },
+    });
+    try ctx.expectSentResult(null, .{ .id = 2 });
+
+    const page_url = "http://127.0.0.1:9582/src/browser/tests/cdp/worker_network.html";
+    const page = try bc.session.createPage();
+    try page.navigate(page_url, .{});
+    try testing.waitForPage(bc);
+
+    try ctx.expectSentEvent("Network.requestWillBeSent", .{
+        .request = .{
+            .url = page_url,
+            .headers = .{ .Cookie = "token=ends-in-Z" },
+        },
+    }, .{ .session_id = "SID-NC" });
 }

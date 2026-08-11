@@ -54,6 +54,7 @@ const Timers = @import("Timers.zig");
 const Scheduler = @import("Scheduler.zig");
 const Notification = @import("../../Notification.zig");
 const Chrome = @import("Chrome.zig");
+const TrustedTypes = @import("TrustedTypes.zig");
 
 const log = lp.log;
 
@@ -75,6 +76,7 @@ _crypto: Crypto = .init,
 _console: Console = .init,
 _navigator: Navigator = .init,
 _chrome: Chrome = .{},
+_trusted_types: TrustedTypes.TrustedTypePolicyFactory = .{},
 _model_context: ModelContext = .init,
 _screen: *Screen,
 _visual_viewport: *VisualViewport,
@@ -265,6 +267,10 @@ pub fn getScheduler(self: *Window) *Scheduler {
     return &self._scheduler;
 }
 
+pub fn getTrustedTypes(self: *Window) *TrustedTypes.TrustedTypePolicyFactory {
+    return &self._trusted_types;
+}
+
 pub fn getModelContext(self: *Window) *ModelContext {
     return &self._model_context;
 }
@@ -339,6 +345,19 @@ pub fn getOrigin(self: *const Window) []const u8 {
 
 pub fn setOrigin(self: *Window, value: js.Value) void {
     self.replaceGlobalProperty(value, "origin");
+}
+
+/// Gates service workers, clipboard, credentials and PaymentRequest. Reporting
+/// a flat `false` on an https page made sites take their insecure-fallback
+/// path or refuse outright (Google Pay: "should be called in secure context").
+pub fn getIsSecureContext(self: *const Window) bool {
+    var frame = self._frame;
+    // An about:blank / srcdoc frame has no URL of its own — it inherits the
+    // parent's origin, and that origin's trustworthiness with it.
+    while (std.mem.startsWith(u8, frame.url, "about:")) {
+        frame = frame.parent orelse return false;
+    }
+    return URL.isPotentiallyTrustworthy(frame.url);
 }
 
 pub fn getSelection(self: *const Window) *Selection {
@@ -829,15 +848,30 @@ pub fn close(self: *Window) void {
 pub fn focus(_: *Window) void {}
 pub fn blur(_: *Window) void {}
 
-pub fn postMessage(self: *Window, message: js.Value, target_origin: ?[]const u8, transfer: ?[]const *MessagePort, frame: *Frame) !void {
+const PostMessageOptions = struct {
+    targetOrigin: []const u8 = "/",
+    transfer: []const *MessagePort = &.{},
+};
+
+const PostMessageTarget = union(enum) {
+    target_origin: []const u8,
+    options: PostMessageOptions,
+};
+
+pub fn postMessage(self: *Window, message: js.Value, target: ?PostMessageTarget, legacy_transfer: ?[]const *MessagePort, frame: *Frame) !void {
     const target_frame = self._frame;
     const source_window = target_frame.js.getIncumbent().window;
 
     // Origin should be the source window's origin (where the message came from)
     const origin = source_window.getOrigin();
 
+    const target_origin, const transfer = if (target) |value| switch (value) {
+        .target_origin => |target_origin| .{ target_origin, legacy_transfer orelse &.{} },
+        .options => |options| .{ options.targetOrigin, options.transfer },
+    } else .{ "/", legacy_transfer orelse &.{} };
+
     // Per spec an omitted targetOrigin defaults to "/" (sender's own origin).
-    if (!try targetOriginMatches(target_origin orelse "/", origin, self.getOrigin(), frame)) {
+    if (!try targetOriginMatches(target_origin, origin, self.getOrigin(), frame)) {
         return;
     }
 
@@ -874,7 +908,7 @@ pub fn postMessage(self: *Window, message: js.Value, target_origin: ?[]const u8,
         .frame = target_frame,
         .source = source_window,
         .origin = try arena.dupe(u8, origin),
-        .ports = if (transfer) |t| try arena.dupe(*MessagePort, t) else &.{},
+        .ports = try arena.dupe(*MessagePort, transfer),
     };
 
     try target_frame.js.scheduler.add(callback, PostMessageCallback.run, 0, .{
@@ -962,6 +996,21 @@ pub fn getFrame(self: *Window, idx: usize) !?*Window {
         frame.child_frames_sorted = true;
     }
     return frames[idx].window;
+}
+
+pub fn getNamedFrame(self: *Window, name: []const u8, frame: *Frame) !?Access {
+    if (self._detached or name.len == 0) {
+        return null;
+    }
+
+    for (self._frame.child_frames.items) |child| {
+        const iframe = child.iframe orelse continue;
+        const iframe_name = iframe.asElement().getAttributeSafe(comptime .wrap("name")) orelse child.window._name;
+        if (std.mem.eql(u8, iframe_name, name)) {
+            return Access.init(frame.window, child.window);
+        }
+    }
+    return null;
 }
 
 pub fn getFramesLength(self: *const Window) u32 {
@@ -1250,6 +1299,9 @@ pub const JsApi = struct {
         pub var class_id: bridge.ClassId = undefined;
     };
 
+    pub const TEMPORARY = bridge.property(0, .{ .template = false, .readonly = true });
+    pub const PERSISTENT = bridge.property(1, .{ .template = false, .readonly = true });
+
     pub const document = bridge.accessor(Window.getDocument, null, .{ .cache = .{ .internal = 1 }, .deletable = false });
     pub const console = bridge.accessor(Window.getConsole, Window.setConsole, .{});
 
@@ -1259,6 +1311,7 @@ pub const JsApi = struct {
     pub const parent = bridge.accessor(Window.getParent, Window.setParent, .{});
     pub const navigator = bridge.accessor(Window.getNavigator, null, .{});
     pub const chrome = bridge.accessor(Window.getChrome, null, .{});
+    pub const trustedTypes = bridge.accessor(Window.getTrustedTypes, null, .{});
     pub const scheduler = bridge.accessor(Window.getScheduler, null, .{});
     pub const screen = bridge.accessor(Window.getScreen, Window.setScreen, .{});
     pub const visualViewport = bridge.accessor(Window.getVisualViewport, Window.setVisualViewport, .{});
@@ -1294,8 +1347,6 @@ pub const JsApi = struct {
     pub const clearTimeout = bridge.function(Window.clearTimeout, .{});
     pub const setInterval = bridge.function(Window.setInterval, .{});
     pub const clearInterval = bridge.function(Window.clearInterval, .{});
-    pub const setImmediate = bridge.function(Window.setImmediate, .{});
-    pub const clearImmediate = bridge.function(Window.clearImmediate, .{});
     pub const requestAnimationFrame = bridge.function(Window.requestAnimationFrame, .{});
     pub const cancelAnimationFrame = bridge.function(Window.cancelAnimationFrame, .{});
     pub const requestIdleCallback = bridge.function(Window.requestIdleCallback, .{});
@@ -1313,6 +1364,7 @@ pub const JsApi = struct {
 
     pub const frames = bridge.accessor(Window.getWindow, Window.setFrames, .{});
     pub const index = bridge.indexed(Window.getFrame, null, .{ .null_as_undefined = true });
+    pub const named_index = bridge.namedIndexed(Window.getNamedFrame, null, null, null, null, .{ .null_as_undefined = true });
     pub const length = bridge.accessor(Window.getFramesLength, Window.setLength, .{});
     pub const scrollX = bridge.accessor(Window.getScrollX, Window.setScrollX, .{});
     pub const scrollY = bridge.accessor(Window.getScrollY, Window.setScrollY, .{});
@@ -1322,11 +1374,7 @@ pub const JsApi = struct {
     pub const scroll = bridge.function(Window.scrollTo, .{});
     pub const scrollBy = bridge.function(Window.scrollBy, .{});
 
-    // Return false since we don't have secure-context-only APIs implemented
-    // (webcam, geolocation, clipboard, etc.)
-    // This is safer and could help avoid processing errors by hinting at
-    // sites not to try to access those features
-    pub const isSecureContext = bridge.property(false, .{ .template = false });
+    pub const isSecureContext = bridge.accessor(Window.getIsSecureContext, null, .{});
 
     // [Replaceable] (CSSOM-View): the getter reads the page's runtime viewport
     // (overridable via Emulation.setDeviceMetricsOverride); the setter overwrites
@@ -1395,8 +1443,8 @@ pub const JsApi = struct {
 const CrossOriginWindow = struct {
     window: *Window,
 
-    pub fn postMessage(self: *CrossOriginWindow, message: js.Value, target_origin: ?[]const u8, transfer: ?[]const *MessagePort, frame: *Frame) !void {
-        return self.window.postMessage(message, target_origin, transfer, frame);
+    pub fn postMessage(self: *CrossOriginWindow, message: js.Value, target: ?PostMessageTarget, transfer: ?[]const *MessagePort, frame: *Frame) !void {
+        return self.window.postMessage(message, target, transfer, frame);
     }
 
     pub fn getTop(self: *CrossOriginWindow, frame: *Frame) ?Access {

@@ -56,9 +56,9 @@ pub const ResourceProfile = enum {
 /// --cdp-max-connections / --max-connections / --max-sessions bypasses this
 /// entirely.
 ///
-/// Measured with `bench/sessions.sh` (least-squares slope over N = 1,2,4,8,16
+/// Measured with `bench/sessions.sh` (least-squares slope over N = 1,2,4,8,16,32
 /// simultaneous CDP sessions in one process, each holding a 12k-node DOM), pi
-/// profile: 6.3 MiB/session, on a 23.8 MiB fixed intercept. The split by stage
+/// profile: 6.0 MiB/session, on a 23.3 MiB fixed intercept. The split by stage
 /// is 1.3 MiB for the isolate itself, +0.5 for an attached about:blank page,
 /// +4.5 for the DOM — V8 costs little per session because all isolates in the
 /// process share one IsolateGroup (read-only heap, pointer-compression cage
@@ -221,7 +221,7 @@ fn caPathValidator(
 
 /// Managed-mode Turnstile auto-click / token wait.
 pub const SolveCaptchas = enum {
-    /// On when `--stealth` is set; otherwise off.
+    /// On with the default Chrome-compatible identity; otherwise off.
     auto,
     on,
     off,
@@ -249,14 +249,14 @@ const CommonOptions = .{
     .{ .name = "web_bot_auth_keyid", .type = ?[]const u8 },
     .{ .name = "web_bot_auth_domain", .type = ?[]const u8 },
     .{ .name = "user_agent", .type = ?[]const u8 },
-    // Chrome-aligned identity for challenge widgets (Turnstile, bot scanners):
-    // Chrome UA, Sec-Ch-Ua brands, navigator.userAgentData, plus a random
-    // fingerprint seed unless --fingerprint pins one. Off by default — without
-    // it Lightpanda identifies honestly as Lightpanda.
+    // Retained as a no-op so existing invocations do not break now that the
+    // Chrome-compatible identity is the default.
     .{ .name = "stealth", .type = bool },
+    // Opt out of the default Chrome-compatible identity and identify honestly
+    // as Lightpanda.
+    .{ .name = "no_stealth", .type = bool },
     // Deterministic fingerprint seed. Same seed → same GPU/screen/hw identity.
-    // Alone activates the fingerprint profile; pair with --stealth for the
-    // Chrome UA too.
+    // The default identity uses a random seed unless this pins one.
     .{ .name = "fingerprint", .type = ?u64 },
     // Platform reported to JS: windows|macos|linux. Defaults to the host OS on
     // macOS, windows elsewhere.
@@ -268,7 +268,7 @@ const CommonOptions = .{
     // BCP-47 tag driving navigator.language / navigator.languages (e.g. "fr-FR").
     .{ .name = "locale", .type = ?[]const u8 },
     // Click managed Turnstile checkboxes and wait for a token after load.
-    // auto (default) = on when --stealth; on/off force either way.
+    // auto (default) = on unless --no-stealth; on/off force either way.
     .{ .name = "solve_captchas", .type = SolveCaptchas, .default = .auto },
     .{ .name = "block_private_networks", .type = bool },
     .{ .name = "block_cidrs", .type = ?[]const u8 },
@@ -504,7 +504,7 @@ command: RunMode,
 exec_name: []const u8,
 http_headers: HttpHeaders,
 /// Seed-derived device identity (GPU/screen/cores/memory). Always set; the
-/// stock profile when neither --stealth nor --fingerprint is given.
+/// stock profile when --no-stealth is set without --fingerprint.
 fingerprint_profile: Fingerprint.Profile = .stock,
 
 fn modeNeedsHttp(mode: Mode) bool {
@@ -526,14 +526,14 @@ pub fn init(allocator: Allocator, exec_name: []const u8, mode: Mode) !Config {
         .fingerprint_profile = .stock,
     };
     if (modeNeedsHttp(mode)) {
-        // Resolved first: the stealth User-Agent's OS token derives from it.
+        // Resolved first: the Chrome User-Agent's OS token derives from it.
         config.fingerprint_profile = resolveFingerprintProfile(&config);
         config.http_headers = try HttpHeaders.init(allocator, &config);
     }
     return config;
 }
 
-/// Build the profile from --stealth / --fingerprint / --fingerprint-platform.
+/// Build the profile from the identity and fingerprint options.
 fn resolveFingerprintProfile(config: *const Config) Fingerprint.Profile {
     const seed = config.fingerprintSeed();
     if (seed == null and !config.stealth()) return .stock;
@@ -831,18 +831,18 @@ pub fn userAgentSuffix(self: *const Config) ?[]const u8 {
 
 pub fn stealth(self: *const Config) bool {
     return switch (self.mode) {
-        inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.stealth,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| !opts.no_stealth,
         else => false,
     };
 }
 
-/// Auto-click managed Turnstile and wait for tokens. Defaults to on with --stealth.
+/// Auto-click managed Turnstile and wait for tokens with the default identity.
 pub fn solveCaptchas(self: *const Config) bool {
     return switch (self.mode) {
         inline .serve, .fetch, .render, .mcp, .agent => |opts| switch (opts.solve_captchas) {
             .on => true,
             .off => false,
-            .auto => opts.stealth,
+            .auto => !opts.no_stealth,
         },
         else => false,
     };
@@ -976,14 +976,13 @@ pub fn blockedUrlPatterns(self: *const Config) ?std.mem.SplitIterator(u8, .scala
     return std.mem.splitScalar(u8, patterns, ',');
 }
 
-// The pi defaults were 2, justified by memory. `bench/sessions.sh` refutes
-// that: a session costs 6.3 MiB marginal on the pi profile (23.8 MiB fixed),
-// so a 1 GB board affords well over a hundred before RAM binds. The real
-// constraint is CPU — 4 cores with v8ThreadPoolSize=1 — so 8 is chosen for
-// headroom on the mostly-idle sessions an agent workload produces, not from a
-// CPU measurement on real hardware. Lower it with --cdp-max-connections /
-// --max-connections if your pages are CPU-bound.
-const pi_max_sessions = 8;
+// Two ReleaseSmall runs sustained 32 simultaneous 12k-node loads at
+// 216.7-218.6 MiB RSS, 446-484 ms wall and 2.77-3.3 CPU-seconds total.
+// Keep that verified ceiling rather
+// than extrapolating to the 64-session run, which did not complete reliably.
+// memoryCappedSessions lowers it further on small boards; explicit flags still
+// let an operator choose a smaller cap for CPU-bound pages.
+const pi_max_sessions = 32;
 
 pub fn maxConnections(self: *const Config) u16 {
     return switch (self.mode) {
@@ -1227,17 +1226,22 @@ pub const HttpHeaders = struct {
         .{ .brand = "Lightpanda", .version = product_version },
     };
 
-    pub const stealth_chrome_version: [:0]const u8 = "131";
-    pub const stealth_ua_full_version: [:0]const u8 = "131.0.6778.86";
+    pub const stealth_chrome_version: [:0]const u8 = "151";
+    pub const stealth_ua_full_version: [:0]const u8 = "151.0.7922.77";
 
-    /// Chrome GREASE + Chromium + Google Chrome brands, used with --stealth.
+    /// Chrome GREASE + Chromium + Google Chrome brands used by default.
     pub const brands_stealth = [_]Brand{
-        .{ .brand = "Not/A)Brand", .version = "8" },
-        .{ .brand = "Chromium", .version = stealth_chrome_version },
+        .{ .brand = "Not=A?Brand", .version = "99" },
         .{ .brand = "Google Chrome", .version = stealth_chrome_version },
+        .{ .brand = "Chromium", .version = stealth_chrome_version },
+    };
+    pub const full_brands_stealth = [_]Brand{
+        .{ .brand = "Not=A?Brand", .version = "99.0.0.0" },
+        .{ .brand = "Google Chrome", .version = stealth_ua_full_version },
+        .{ .brand = "Chromium", .version = stealth_ua_full_version },
     };
 
-    /// Chrome-aligned UA for --stealth. The OS token has to agree with the
+    /// Chrome-aligned default UA. The OS token has to agree with the
     /// resolved fingerprint platform: a Windows UA next to a "MacIntel"
     /// navigator.platform is a louder tell than no stealth at all.
     pub fn stealthUserAgent(platform: Fingerprint.Platform) [:0]const u8 {
@@ -1266,6 +1270,29 @@ pub const HttpHeaders = struct {
 
     pub const sec_ch_ua: [:0]const u8 = secChUa(&brands);
     pub const sec_ch_ua_stealth: [:0]const u8 = secChUa(&brands_stealth);
+    pub const sec_ch_ua_full_version_list_stealth: [:0]const u8 = secChUa(&full_brands_stealth);
+    pub const sec_ch_ua_full_version_stealth: [:0]const u8 = "\"" ++ stealth_ua_full_version ++ "\"";
+
+    pub fn secChUaPlatformVersion(platform: Fingerprint.Platform) []const u8 {
+        return switch (platform) {
+            .windows => "\"15.0.0\"",
+            // The reduced User-Agent keeps its frozen 10_15_7 token, but
+            // UA-CH reports the actual OS generation. Chrome 150 cannot run
+            // on Catalina, so pairing it with 10.15.7 is self-contradictory.
+            .macos => "\"26.5.2\"",
+            .linux => "\"6.6.0\"",
+        };
+    }
+
+    pub const sec_ch_ua_arch: []const u8 = switch (builtin.cpu.arch) {
+        .x86, .x86_64 => "\"x86\"",
+        .aarch64, .aarch64_be, .arm, .armeb => "\"arm\"",
+        else => "\"\"",
+    };
+    pub const sec_ch_ua_bitness: []const u8 = switch (builtin.cpu.arch) {
+        .x86_64, .aarch64, .aarch64_be, .powerpc64, .powerpc64le, .riscv64 => "\"64\"",
+        else => "\"32\"",
+    };
 
     // Some bot-protection frontends (e.g. Akamai on canada.ca) RST the HTTP/2
     // stream when a client sends Accept-Encoding without Accept-Language,
@@ -1274,14 +1301,21 @@ pub const HttpHeaders = struct {
     pub const accept_language: [:0]const u8 = "en-US,en;q=0.9";
 
     // Document-navigation Accept value Chrome sends.
-    pub const navigation_accept: [:0]const u8 = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+    pub const navigation_accept: [:0]const u8 = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7";
+
+    pub const chrome_channel: []const u8 = "stable";
+    pub const chrome_copyright: []const u8 = "Copyright 2026 Google LLC. All Rights Reserved.";
+    pub const chrome_validation_macos_arm64: []const u8 = "Ujp3LPhx528Wqnzml3jZrVzknis=";
+    pub const chrome_client_data: []const u8 = "CJ6WywE=";
 
     user_agent: [:0]const u8, // User agent value (e.g. "Lightpanda/1.0")
     /// Sec-Ch-Ua header value (brand list), stealth-aware.
     sec_ch_ua_header: [:0]const u8,
+    /// Quoted low-entropy UA-CH platform value sent on every request.
+    sec_ch_ua_platform_header: []const u8,
     /// Brand list for navigator.userAgentData (same source as Sec-Ch-Ua).
     brand_list: []const Brand,
-    /// True when --stealth presents this process as Chrome.
+    /// True when this process presents itself as Chrome.
     stealth: bool = false,
     /// False when user_agent is a comptime literal rather than an allocation.
     user_agent_owned: bool = false,
@@ -1310,6 +1344,11 @@ pub const HttpHeaders = struct {
         return .{
             .user_agent = user_agent,
             .sec_ch_ua_header = if (is_stealth) sec_ch_ua_stealth else sec_ch_ua,
+            .sec_ch_ua_platform_header = switch (config.fingerprint_profile.platform) {
+                .windows => "\"Windows\"",
+                .macos => "\"macOS\"",
+                .linux => "\"Linux\"",
+            },
             .brand_list = if (is_stealth) &brands_stealth else &brands,
             .stealth = is_stealth,
             .user_agent_owned = owned,
@@ -1459,6 +1498,53 @@ test "Config: blockedUrlPatterns splits comma-separated patterns" {
     try std.testing.expectEqualStrings("*doubleclick*", patterns.next().?);
     try std.testing.expectEqualStrings("*://*/*.png", patterns.next().?);
     try std.testing.expectEqual(null, patterns.next());
+}
+
+test "Config: Chrome identity is default and --no-stealth opts out" {
+    var default_config = try Config.init(std.testing.allocator, "test", .{ .serve = .{} });
+    defer default_config.deinit(std.testing.allocator);
+
+    try std.testing.expect(default_config.stealth());
+    try std.testing.expect(default_config.solveCaptchas());
+    try std.testing.expect(std.mem.startsWith(u8, default_config.http_headers.user_agent, "Mozilla/5.0 ("));
+
+    var honest_config = try Config.init(std.testing.allocator, "test", .{ .serve = .{
+        .no_stealth = true,
+    } });
+    defer honest_config.deinit(std.testing.allocator);
+
+    try std.testing.expect(!honest_config.stealth());
+    try std.testing.expect(!honest_config.solveCaptchas());
+    try std.testing.expectEqualStrings("Lightpanda/1.0", honest_config.http_headers.user_agent);
+}
+
+test "Config: CLI accepts identity flags" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    {
+        const argv = [_][*:0]const u8{
+            "lightpanda",
+            "serve",
+            "--no-stealth",
+        };
+        var config = try parseArgs(std.testing.allocator, .{ .vector = &argv });
+        defer config.deinit(std.testing.allocator);
+
+        try std.testing.expect(!config.stealth());
+    }
+
+    // Keep the former opt-in accepted so existing scripts continue to start.
+    {
+        const argv = [_][*:0]const u8{
+            "lightpanda",
+            "serve",
+            "--stealth",
+        };
+        var config = try parseArgs(std.testing.allocator, .{ .vector = &argv });
+        defer config.deinit(std.testing.allocator);
+
+        try std.testing.expect(config.stealth());
+    }
 }
 
 test "Config: pi resource profile bounds expensive defaults" {

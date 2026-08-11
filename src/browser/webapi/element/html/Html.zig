@@ -17,6 +17,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const js = @import("../../../js/js.zig");
+const Frame = @import("../../../Frame.zig");
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
 const HtmlElement = @import("../Html.zig");
@@ -33,6 +34,14 @@ pub fn asNode(self: *Html) *Node {
     return self.asElement().asNode();
 }
 
+pub fn getVersion(self: *Html) []const u8 {
+    return self.asElement().getAttributeSafe(comptime .wrap("version")) orelse "";
+}
+
+pub fn setVersion(self: *Html, value: []const u8, frame: *Frame) !void {
+    try self.asElement().setAttributeSafe(comptime .wrap("version"), .wrap(value), frame);
+}
+
 pub const JsApi = struct {
     pub const bridge = js.Bridge(Html);
 
@@ -41,4 +50,6 @@ pub const JsApi = struct {
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
+
+    pub const version = bridge.accessor(Html.getVersion, Html.setVersion, .{});
 };

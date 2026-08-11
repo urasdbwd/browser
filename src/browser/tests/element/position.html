@@ -20,6 +20,20 @@
 }
 </script>
 
+<script id="unloadedImageDimensions">
+{
+  const image = document.createElement('img');
+  document.body.appendChild(image);
+  testing.expectEqual(0, image.clientWidth);
+  testing.expectEqual(0, image.clientHeight);
+
+  image.style.width = '5px';
+  image.style.height = '5px';
+  testing.expectEqual(5, image.clientWidth);
+  testing.expectEqual(5, image.clientHeight);
+}
+</script>
+
 <script id="scrollDimensions">
 {
   const test1 = $('#test1');

@@ -123,9 +123,10 @@ the CPU or memory cost of those rendering stages.
 ```
 
 The command defaults to the low-memory `pi` resource profile even on desktop
-hardware: one V8 isolate, a 64 MiB V8 heap limit, at most two connections and a
-4 MiB uncompressed snapshot cap. These are configurable defaults, and the heap
-limit is not a whole-process RSS cap. One-shot HTTP responses use negotiated
+hardware: one V8 isolate, a 64 MiB V8 heap limit, up to 32 memory-capped
+connections and a 4 MiB uncompressed snapshot cap. These are configurable
+defaults, and the heap limit is not a whole-process RSS cap. One-shot HTTP
+responses use negotiated
 Brotli quality 0 or gzip level 1 only when the body is large and compressible;
 live WebSocket snapshots are not application-compressed. Outbound private,
 loopback and link-local addresses are blocked by default; use
@@ -141,7 +142,11 @@ loopback and link-local addresses are blocked by default; use
     directResources: "auto",
     requireCredentialless: true,
   });
-  await renderer.render("https://example.com", { waitUntil: "done" });
+  await renderer.render("https://example.com", {
+    waitUntil: "done",
+    solveCaptchas: true,
+  });
+  console.log(renderer.turnstile); // "solved", "timeout" or "no_widget"
 </script>
 ```
 
@@ -160,6 +165,7 @@ user's browser renders successive script-free snapshots:
     requireCredentialless: true,
   });
   await browser.open("https://example.com");
+  await browser.solveCaptchas();
 </script>
 ```
 
@@ -195,6 +201,10 @@ generation-bound element IDs. Stale nodes fail instead of being retargeted
 through a CSS selector. Explicit API calls may still use selectors.
 Loaded nested frames are transported as script-free `srcdoc` documents; clicks
 and renderer-owned `animationend` timing route back to the owning server frame.
+That lets a user click a rendered CAPTCHA directly. Code can request the same
+local Turnstile interaction with `browser.solveCaptchas({ waitMs: 30000 })`;
+one-shot renders use `{ solveCaptchas: true }`. Both expose the outcome through
+the `turnstile` property and a `captcha` event. Turnstile is never outsourced.
 Same-page updates reconcile stable keyed elements in place instead of replacing
 the iframe. This preserves the client's native focus, selection, scroll,
 control, stylesheet, image/media decode and CSS animation state. Navigation and
@@ -224,7 +234,7 @@ Lightpanda decode or render them.
 | --- | --- |
 | `"off"` (default) | External subresources stay blocked. One client, one fingerprint. |
 | `"on"` | The viewer fetches stylesheets, images, fonts and media directly. |
-| `"auto"` | The server decides: off when it runs with `--stealth`, on otherwise. |
+| `"auto"` | The server decides: off by default, on with `--no-stealth`. |
 
 `true` and `false` are accepted as aliases for `"on"` and `"off"`.
 
@@ -235,9 +245,9 @@ bot detection reads that split as a strong signal, so turning this on silently
 undermines the stealth surface the rest of the browser maintains. It also
 exposes the client IP and network to requests the target page selects. `"auto"`
 exists to make that trade follow the deployment: an operator running without
-`--stealth` has no fingerprint to protect and gets the better-looking page,
-while a stealth deployment keeps the single-client profile. Note this is the
-inverse of `--solve_captchas auto`, which turns *on* under stealth.
+`--no-stealth` has no fingerprint to protect and gets the better-looking page,
+while the default Chrome-compatible identity keeps the single-client profile.
+Note this is the inverse of `--solve_captchas auto`, which is on by default.
 
 Direct mode requires a credentialless iframe unless
 `allowCredentialedResources: true` explicitly accepts sending browser
@@ -540,8 +550,9 @@ Worker loading enabled for web compatibility; use `--disable-subframes` or
 `--disable-workers` when a workload does not need them. It also reduces pooled
 arena retention from roughly 6 MiB to 448 KiB. Explicit numeric limits override
 the profile. CDP response-body capture is capped at 8 MiB and 256 entries per
-page lifecycle. MCP is capped at two V8-backed sessions, two simultaneous HTTP
-connections and 4 MiB request/response buffers per connection.
+page lifecycle. MCP defaults to up to 32 memory-capped V8-backed sessions and
+simultaneous HTTP connections, with 4 MiB request/response buffers per
+connection.
 
 Lightpanda is headless: it does not rasterize pixels or produce screenshots on
 the server. DOM and JavaScript run in the browser process; page data is

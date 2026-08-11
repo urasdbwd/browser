@@ -1,0 +1,11 @@
+<!DOCTYPE html>
+<!--
+reCAPTCHA rendered through the JS API rather than markup: no `data-sitekey`
+anywhere, so the only readable copy of the key is the `k=` parameter on the
+anchor frame's URL. The src merely *contains* "/recaptcha/" so it matches the
+same detection the real widget does while resolving to a local file.
+-->
+<title>recaptcha iframe fixture</title>
+<div id="host"></div>
+<iframe src="recaptcha/anchor.html?ar=1&k=6LcIframeKeyAAAAAExampleValue1234567890&co=aHR0cA"
+        width="304" height="78"></iframe>

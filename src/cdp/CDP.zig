@@ -418,6 +418,8 @@ fn dispatchCommand(command: *Command, method: []const u8) !void {
         },
         8 => switch (@as(u64, @bitCast(domain[0..8].*))) {
             asUint(u64, "Security") => return @import("domains/security.zig").processMessage(command),
+            asUint(u64, "Debugger") => return dispatchInspectorCommand(command),
+            asUint(u64, "Profiler") => return dispatchInspectorCommand(command),
             else => {},
         },
         9 => switch (@as(u72, @bitCast(domain[0..9].*))) {
@@ -438,6 +440,11 @@ fn dispatchCommand(command: *Command, method: []const u8) !void {
     }
 
     return error.UnknownDomain;
+}
+
+fn dispatchInspectorCommand(command: *Command) !void {
+    const browser_context = command.browser_context orelse return error.BrowserContextNotLoaded;
+    browser_context.callInspector(command.input.json);
 }
 
 fn isValidSessionId(self: *const CDP, input_session_id: []const u8) bool {
@@ -1153,6 +1160,11 @@ pub const BrowserContext = struct {
         sendInspectorMessage(@ptrCast(@alignCast(ctx)), msg) catch |err| {
             log.err(.cdp, "send inspector event", .{ .err = err });
         };
+    }
+
+    pub fn onInspectorPause(ctx: *anyopaque) bool {
+        const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        return self.cdp.browser.http_client.tickInspectorPause() catch false;
     }
 
     // This is hacky x 2. First, we create the JSON payload by gluing our

@@ -13,7 +13,7 @@ function resolveTarget(target) {
 // sees two different clients for one page load — Lightpanda's IP and TLS
 // fingerprint fetched the document, the viewer's browser fetches the assets.
 // Anything doing bot detection reads that split as a signal. "auto" hands the
-// call to the server, which resolves it against its own --stealth setting.
+// call to the server, which resolves it against its own identity setting.
 function resourcePolicyMode(value) {
   if (value === true) return "on";
   if (value === false || value == null) return "off";
@@ -130,6 +130,7 @@ export class LightpandaRenderer extends EventTarget {
   #sequence = 0;
   #lastRequest = null;
   #loadTimeoutMs;
+  turnstile = null;
 
   constructor(target, options = {}) {
     super();
@@ -169,9 +170,11 @@ export class LightpandaRenderer extends EventTarget {
       return Promise.reject(err);
     }
     const bounds = this.#target.getBoundingClientRect();
+    const solveCaptchas = options.solveCaptchas === true;
     const request = {
       url: source,
-      wait_ms: options.waitMs,
+      wait_ms: options.waitMs ?? (solveCaptchas ? 30_000 : undefined),
+      solve_captchas: solveCaptchas ? true : undefined,
       wait_until: options.waitUntil,
       wait_selector: options.waitSelector,
       width: Math.max(1, Math.round((options.width ?? bounds.width) || 1280)),
@@ -211,6 +214,13 @@ export class LightpandaRenderer extends EventTarget {
       if (!response.ok) {
         const detail = (await response.text()).slice(0, 512);
         throw new Error(`Lightpanda render failed (${response.status}): ${detail}`);
+      }
+
+      this.turnstile = response.headers?.get?.("x-lp-turnstile") ?? null;
+      if (this.turnstile !== null) {
+        this.dispatchEvent(new CustomEvent("captcha", {
+          detail: { turnstile: this.turnstile },
+        }));
       }
 
       const blob = await response.blob();
@@ -769,6 +779,7 @@ export class LightpandaVirtualBrowser extends EventTarget {
   #title = "";
   #canGoBack = false;
   #canGoForward = false;
+  turnstile = null;
 
   constructor(target, options = {}) {
     super();
@@ -2202,7 +2213,9 @@ export class LightpandaVirtualBrowser extends EventTarget {
         if (this.#socket === socket && socket.readyState <= WebSocket.OPEN) {
           socket.close(1002, "Lightpanda command timeout");
         }
-      }, this.#commandTimeoutMs);
+      }, type === "solve_captchas" && Number.isFinite(payload.wait_ms)
+        ? Math.max(this.#commandTimeoutMs, Math.min(payload.wait_ms + 1_000, 2_147_483_647))
+        : this.#commandTimeoutMs);
       this.#pending = pending;
       try {
         socket.send(JSON.stringify({ id, type, ...payload }));
@@ -2248,6 +2261,12 @@ export class LightpandaVirtualBrowser extends EventTarget {
         canGoForward: this.#canGoForward,
       },
     }));
+    if (response.turnstile !== null && response.turnstile !== undefined) {
+      this.turnstile = response.turnstile;
+      this.dispatchEvent(new CustomEvent("captcha", {
+        detail: { turnstile: this.turnstile },
+      }));
+    }
     if (response.snapshot) {
       this.#pollDelayMs = this.#snapshotPollDelay();
       this.dispatchEvent(new CustomEvent("snapshot", {
@@ -2381,6 +2400,16 @@ export class LightpandaVirtualBrowser extends EventTarget {
 
   click(selector) {
     return this.#enqueue("click", { selector });
+  }
+
+  solveCaptchas(options = {}) {
+    const waitMs = Number(options.waitMs ?? 30_000);
+    if (!Number.isFinite(waitMs) || waitMs <= 0) {
+      throw new TypeError("Lightpanda captcha waitMs must be a positive number");
+    }
+    return this.#enqueue("solve_captchas", {
+      wait_ms: Math.min(Math.round(waitMs), 0xffffffff),
+    });
   }
 
   fill(selector, value, options = {}) {

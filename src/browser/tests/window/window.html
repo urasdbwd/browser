@@ -210,12 +210,21 @@
   // Bot scanners (sannysoft, CreepJS) treat a missing window.chrome on a
   // Chrome-shaped browser as automation.
   testing.expectEqual('object', typeof window.chrome);
-  testing.expectEqual('object', typeof chrome.runtime);
+  testing.expectEqual('[object Object]', Object.prototype.toString.call(window.chrome));
+  testing.expectEqual(undefined, chrome.runtime);
   testing.expectEqual('function', typeof chrome.csi);
   testing.expectEqual('function', typeof chrome.loadTimes);
-  // Undefined outside an extension, as in real Chrome.
-  testing.expectEqual(undefined, chrome.runtime.id);
+  testing.expectEqual('loadTimes,csi,app', Object.keys(chrome).join(','));
   testing.expectEqual(false, chrome.app.isInstalled);
+  testing.expectEqual('isInstalled,getDetails,getIsInstalled,installState,runningState,InstallState,RunningState', Object.keys(chrome.app).join(','));
+  testing.expectEqual(null, chrome.app.getDetails());
+  testing.expectEqual(false, chrome.app.getIsInstalled());
+  testing.expectEqual('cannot_run', chrome.app.runningState());
+  testing.expectEqual('not_installed', chrome.app.InstallState.NOT_INSTALLED);
+  testing.expectEqual('running', chrome.app.RunningState.RUNNING);
+  testing.expectEqual('[object Object]', String(chrome.app));
+  testing.expectEqual(Object.prototype, Object.getPrototypeOf(chrome.app));
+  testing.expectEqual(chrome.app, chrome.app);
 </script>
 
 <script id=structuredClone>

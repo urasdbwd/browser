@@ -634,6 +634,7 @@ fn processLive(
 const RenderRequest = struct {
     url: []const u8,
     wait_ms: u32 = 5_000,
+    solve_captchas: bool = false,
     // Caps only the implicit "let the page settle" wait, which chases `.done`
     // (no macrotasks AND no network) -- a state many real pages never reach,
     // so without a cap every load burns the full wait_ms. Raise it for a page
@@ -649,6 +650,7 @@ const RenderRequest = struct {
 const PreparedRender = struct {
     url: [:0]const u8,
     wait_ms: u32,
+    solve_captchas: bool,
     settle_ms: ?u32,
     wait_until: ?lp.Config.WaitUntil,
     wait_selector: ?[:0]const u8,
@@ -703,6 +705,7 @@ fn prepareRender(
     return .{
         .url = canonical,
         .wait_ms = request.wait_ms,
+        .solve_captchas = request.solve_captchas,
         .settle_ms = request.settle_ms,
         .wait_until = request.wait_until,
         .wait_selector = selector,
@@ -722,13 +725,14 @@ fn processRender(
     browser.viewport_override = .{ .width = request.width, .height = request.height };
 
     // `lp.fetch` runs the solve itself when `--solve-captchas` is on (auto = on
-    // under `--stealth`), sharing the one wait budget with the page waits. It
+    // with the default identity), sharing the one wait budget with the page waits. It
     // only writes here when it ran, so the config decides whether we report.
     var turnstile: lp.Turnstile.Result = .no_widget;
 
     var urls = [_][:0]const u8{request.url};
     lp.fetch(self.app, browser, &urls, .{
         .turnstile = &turnstile,
+        .solve_captchas = request.solve_captchas,
         .wait_ms = @min(request.wait_ms, max_wait_ms),
         .settle_ms = request.settle_ms,
         .wait_until = request.wait_until,
@@ -754,7 +758,7 @@ fn processRender(
         };
         return;
     };
-    if (self.app.config.solveCaptchas()) {
+    if (request.solve_captchas or self.app.config.solveCaptchas()) {
         job.turnstile = @tagName(turnstile);
         lp.log.info(.app, "render turnstile", .{ .result = job.turnstile });
     }
@@ -1325,8 +1329,10 @@ fn respondBody(
     if (turnstile) |value| {
         headers[count] = .{ .name = "x-lp-turnstile", .value = value };
         count += 1;
-        // ponytail: not in access-control-expose-headers — the render API is
-        // server-to-server. Add it when a browser client needs to read this.
+        if (cors_value != null) {
+            headers[count] = .{ .name = "access-control-expose-headers", .value = "x-lp-turnstile" };
+            count += 1;
+        }
     }
 
     if (compression.encoding == .identity) {
@@ -1882,6 +1888,25 @@ test "render server: direct client resources are explicit" {
         .out = &output,
     };
     try std.testing.expect(prepareRender(testing.test_app.config, arena.allocator(), &job) == null);
+}
+
+test "render server: one-shot captcha solving is explicit" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var output_buffer: [1]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&output_buffer);
+
+    var job: Job = .{
+        .body = "{\"url\":\"https://example.com\",\"solve_captchas\":true,\"wait_ms\":30000}",
+        .out = &output,
+    };
+    const requested = prepareRender(testing.test_app.config, arena.allocator(), &job).?;
+    try std.testing.expect(requested.solve_captchas);
+    try std.testing.expectEqual(@as(u32, 30_000), requested.wait_ms);
+
+    job = .{ .body = "{\"url\":\"https://example.com\"}", .out = &output };
+    const default = prepareRender(testing.test_app.config, arena.allocator(), &job).?;
+    try std.testing.expect(!default.solve_captchas);
 }
 
 test "render server: websocket ticket is decoded and single use" {

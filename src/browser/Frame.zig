@@ -17,6 +17,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const lp = @import("lightpanda");
 
 const JS = @import("js/js.zig");
@@ -48,6 +49,7 @@ const Document = @import("webapi/Document.zig");
 const ShadowRoot = @import("webapi/ShadowRoot.zig");
 const Console = @import("webapi/Console.zig");
 const Performance = @import("webapi/Performance.zig");
+const device = @import("webapi/device.zig");
 const Screen = @import("webapi/Screen.zig");
 const VisualViewport = @import("webapi/VisualViewport.zig");
 const AbstractRange = @import("webapi/AbstractRange.zig");
@@ -824,15 +826,89 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
     {
         // Ours until submit; clean up if header setup fails.
         errdefer transfer.deinit();
-        try transfer.addHeader("Accept", lp.Config.HttpHeaders.navigation_accept, .{});
-        if (opts.header) |hdr| {
-            // Arrives pre-joined ("Name: Value"), e.g. from the CLI.
-            if (HttpClient.Header.parse(hdr)) |parsed| {
-                try transfer.addHeader(parsed.name, parsed.value, .{});
+        const config = self._session.browser.app.config;
+        const fetch_site = navigationFetchSite(self.origin, opts.initiator_origin);
+        const same_origin = std.mem.eql(u8, fetch_site, "same-origin");
+        const hostname = URL.getHostname(self.url);
+        const google_origin = std.mem.eql(u8, hostname, "google.com") or std.mem.endsWith(u8, hostname, ".google.com");
+
+        if (config.stealth()) {
+            transfer.clearRequestHeaders();
+            const headers = config.http_headers;
+            const noise_seed = config.fingerprint_profile.noise_seed;
+            var downlink_buf: [16]u8 = undefined;
+            var rtt_buf: [16]u8 = undefined;
+
+            if (same_origin) {
+                try transfer.addHeader("RTT", try std.fmt.bufPrint(&rtt_buf, "{d}", .{device.networkRtt(noise_seed)}), .{});
+                try transfer.addHeader("Downlink", try std.fmt.bufPrint(&downlink_buf, "{d}", .{device.networkDownlink(noise_seed)}), .{});
             }
-        }
-        if (opts.referer) |ref| {
-            try transfer.addHeader("Referer", ref, .{});
+            try transfer.addHeader("Sec-Ch-Ua", headers.sec_ch_ua_header, .{});
+            try transfer.addHeader("Sec-Ch-Ua-Mobile", "?0", .{});
+            if (same_origin) {
+                try transfer.addHeader("Sec-Ch-Ua-Full-Version", lp.Config.HttpHeaders.sec_ch_ua_full_version_stealth, .{});
+                try transfer.addHeader("Sec-Ch-Ua-Arch", lp.Config.HttpHeaders.sec_ch_ua_arch, .{});
+            }
+            try transfer.addHeader("Sec-Ch-Ua-Platform", headers.sec_ch_ua_platform_header, .{});
+            if (same_origin) {
+                try transfer.addHeader(
+                    "Sec-Ch-Ua-Platform-Version",
+                    lp.Config.HttpHeaders.secChUaPlatformVersion(config.fingerprint_profile.platform),
+                    .{},
+                );
+                try transfer.addHeader("Sec-Ch-Ua-Model", "\"\"", .{});
+                try transfer.addHeader("Sec-Ch-Ua-Bitness", lp.Config.HttpHeaders.sec_ch_ua_bitness, .{});
+                try transfer.addHeader("Sec-Ch-Ua-Wow64", "?0", .{});
+                try transfer.addHeader("Sec-Ch-Ua-Full-Version-List", lp.Config.HttpHeaders.sec_ch_ua_full_version_list_stealth, .{});
+                try transfer.addHeader("Sec-Ch-Ua-Form-Factors", "\"Desktop\"", .{});
+                try transfer.addHeader("Sec-Ch-Prefers-Color-Scheme", "dark", .{});
+            }
+            try transfer.addHeader("Upgrade-Insecure-Requests", "1", .{});
+            try transfer.addHeader("User-Agent", headers.user_agent, .{});
+            try transfer.addHeader("Accept", lp.Config.HttpHeaders.navigation_accept, .{});
+            if (google_origin and config.fingerprint_profile.platform == .macos and builtin.cpu.arch == .aarch64) {
+                try transfer.addHeader("X-Browser-Channel", lp.Config.HttpHeaders.chrome_channel, .{});
+                try transfer.addHeader("X-Browser-Year", "2026", .{});
+                try transfer.addHeader("X-Browser-Validation", lp.Config.HttpHeaders.chrome_validation_macos_arm64, .{});
+                try transfer.addHeader("X-Browser-Copyright", lp.Config.HttpHeaders.chrome_copyright, .{});
+                try transfer.addHeader("X-Client-Data", lp.Config.HttpHeaders.chrome_client_data, .{});
+            }
+            try transfer.addHeader("Sec-Fetch-Site", fetch_site, .{});
+            try transfer.addHeader("Sec-Fetch-Mode", "navigate", .{});
+            if (navigationHasUserActivation(opts)) {
+                try transfer.addHeader("Sec-Fetch-User", "?1", .{});
+            }
+            try transfer.addHeader("Sec-Fetch-Dest", "document", .{});
+            if (opts.referer) |ref| {
+                try transfer.addHeader("Referer", ref, .{});
+            }
+            if (opts.header) |hdr| {
+                if (HttpClient.Header.parse(hdr)) |parsed| {
+                    try transfer.addHeader(parsed.name, parsed.value, .{});
+                }
+            }
+            try transfer.addHeader("Accept-Encoding", "gzip, deflate, br", .{});
+            try transfer.addHeader("Accept-Language", lp.Config.HttpHeaders.accept_language, .{});
+            try transfer.addHeader("Priority", "u=0, i", .{});
+        } else {
+            try transfer.addHeader("Accept", lp.Config.HttpHeaders.navigation_accept, .{});
+            try transfer.addHeader("Upgrade-Insecure-Requests", "1", .{});
+            try transfer.addHeader("Sec-Fetch-Dest", "document", .{});
+            try transfer.addHeader("Sec-Fetch-Mode", "navigate", .{});
+            try transfer.addHeader("Sec-Fetch-Site", fetch_site, .{});
+            if (navigationHasUserActivation(opts)) {
+                try transfer.addHeader("Sec-Fetch-User", "?1", .{});
+            }
+            try transfer.addHeader("Priority", "u=0, i", .{});
+            if (opts.header) |hdr| {
+                // Arrives pre-joined ("Name: Value"), e.g. from the CLI.
+                if (HttpClient.Header.parse(hdr)) |parsed| {
+                    try transfer.addHeader(parsed.name, parsed.value, .{});
+                }
+            }
+            if (opts.referer) |ref| {
+                try transfer.addHeader("Referer", ref, .{});
+            }
         }
     }
 
@@ -1242,7 +1318,7 @@ fn _documentIsComplete(self: *Frame) !void {
     });
 
     // Scheduled (never blocking) managed-Turnstile solve, so CDP/MCP/agent get
-    // the same --stealth behaviour as the one-shot `fetch` path.
+    // the same default identity as the one-shot `fetch` path.
     Turnstile.AutoSolve.start(self);
 
     if (self._event_manager.hasDirectListeners(window_target, "pageshow", self.window._on_pageshow)) {
@@ -1274,6 +1350,14 @@ fn notifyParentLoadComplete(self: *Frame) void {
 
 fn frameHeaderDoneCallback(transfer: *HttpClient.Transfer) !HttpClient.Transfer.HeaderResult {
     var self: *Frame = @ptrCast(@alignCast(transfer.req.ctx));
+    self.window._performance.markResponseStart(transfer.start_time, .{
+        .name_lookup_micros = transfer.network_timing.name_lookup_micros,
+        .connect_micros = transfer.network_timing.connect_micros,
+        .app_connect_micros = transfer.network_timing.app_connect_micros,
+        .pre_transfer_micros = transfer.network_timing.pre_transfer_micros,
+        .start_transfer_micros = transfer.network_timing.start_transfer_micros,
+        .connection_reused = transfer._conn_reused,
+    });
 
     // Commit point for a pending root navigation. The session has been
     // holding the OLD page alive during the round-trip; now that response
@@ -1615,6 +1699,7 @@ fn frameDataCallback(transfer: *HttpClient.Transfer, data: []const u8) !void {
 
 fn frameDoneCallback(ctx: *anyopaque) !void {
     var self: *Frame = @ptrCast(@alignCast(ctx));
+    self.window._performance.markResponseEnd();
 
     if (comptime lp.IS_DEBUG) {
         log.debug(.frame, "navigate done", .{ .type = self._type, .url = self.url });
@@ -1872,6 +1957,13 @@ pub fn iframeAddedCallback(incumbent: *Frame, iframe: *IFrame) !void {
     new_frame.iframe = iframe;
     iframe._window = new_frame.window;
     errdefer iframe._window = null;
+
+    // A child browsing context starts with the iframe's name. Scripts such as
+    // reCAPTCHA use window.name and then resolve the peer with
+    // parent.frames[window.name].
+    if (iframe.asElement().getAttributeSafe(comptime .wrap("name"))) |name| {
+        new_frame.window._name = try new_frame.arena.dupe(u8, name);
+    }
 
     // on first load, dispatch frame_created event
     self._session.notification.dispatch(.frame_child_frame_created, &.{
@@ -3318,9 +3410,23 @@ pub const NavigateReason = enum {
     initialFrameNavigation,
 };
 
+fn navigationFetchSite(target_origin: ?[]const u8, initiator_origin: ?[]const u8) []const u8 {
+    const initiator = initiator_origin orelse return "none";
+    const target = target_origin orelse return "cross-site";
+    return if (std.mem.eql(u8, target, initiator)) "same-origin" else "cross-site";
+}
+
+fn navigationHasUserActivation(opts: NavigateOpts) bool {
+    return opts.user_activation orelse
+        (opts.reason == .address_bar or opts.reason == .anchor or opts.reason == .form);
+}
+
 pub const NavigateOpts = struct {
     cdp_id: ?i64 = null,
     reason: NavigateReason = .address_bar,
+    // Script-driven form submission is not user-activated. Input handling
+    // overrides this while preserving the legacy reason fallback elsewhere.
+    user_activation: ?bool = null,
     method: HttpClient.Method = .GET,
     body: ?[]const u8 = null,
     header: ?[:0]const u8 = null,
@@ -3369,6 +3475,24 @@ pub const QueuedNavigation = struct {
     is_about_blank: bool,
     navigation_type: NavigationType,
 };
+
+test "Frame: navigation fetch metadata follows the initiator" {
+    try testing.expectString("none", navigationFetchSite("https://example.com", null));
+    try testing.expectString(
+        "same-origin",
+        navigationFetchSite("https://example.com", "https://example.com"),
+    );
+    try testing.expectString(
+        "cross-site",
+        navigationFetchSite("https://example.com", "https://other.test"),
+    );
+    try testing.expect(navigationHasUserActivation(.{ .reason = .form }));
+    try testing.expect(!navigationHasUserActivation(.{ .reason = .form, .user_activation = false }));
+    try testing.expect(navigationHasUserActivation(.{ .reason = .form, .user_activation = true }));
+    try testing.expect(navigationHasUserActivation(.{ .reason = .anchor }));
+    try testing.expect(!navigationHasUserActivation(.{ .reason = .script }));
+    try testing.expect(navigationHasUserActivation(.{ .reason = .address_bar }));
+}
 
 /// Resolves a target attribute value (e.g., "_self", "_parent", "_top", or frame name)
 /// to the appropriateFrame to navigate.
@@ -3435,6 +3559,7 @@ fn findFrameByName(frame: *Frame, name: []const u8) ?*Frame {
 
 const SubmitFormOpts = struct {
     fire_event: bool = true,
+    user_activation: bool = false,
 };
 pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.Form, submit_opts: SubmitFormOpts) !void {
     const form = form_ orelse return;
@@ -3626,6 +3751,7 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
 
     var opts = NavigateOpts{
         .reason = .form,
+        .user_activation = submit_opts.user_activation,
         .kind = .{ .push = null },
     };
     if (is_post) {
@@ -3719,7 +3845,7 @@ test "WebApi: Frame" {
 }
 
 test "WebApi: Frames" {
-    try testing.htmlRunner("frames", .{});
+    try testing.htmlRunner("frames", .{ .timeout_ms = 5_000 });
 }
 
 test "WebApi: Frame Blob" {

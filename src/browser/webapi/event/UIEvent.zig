@@ -22,7 +22,9 @@ const js = @import("../../js/js.zig");
 const Frame = @import("../../Frame.zig");
 
 const Event = @import("../Event.zig");
+const EventTarget = @import("../EventTarget.zig");
 const Window = @import("../Window.zig");
+const InputDeviceCapabilities = @import("InputDeviceCapabilities.zig");
 
 const String = lp.String;
 
@@ -111,7 +113,14 @@ pub fn getDetail(self: *UIEvent) u32 {
     return self._detail;
 }
 
-// sourceCapabilities not implemented
+pub fn getSourceCapabilities(_: *const UIEvent) ?*InputDeviceCapabilities {
+    // Events constructed from script have no physical input device.
+    return null;
+}
+
+pub fn getPseudoTarget(_: *const UIEvent) ?*EventTarget {
+    return null;
+}
 
 pub fn getView(self: *UIEvent, frame: *Frame) ?*Window {
     if (self._view) |view| {
@@ -169,8 +178,10 @@ pub const JsApi = struct {
 
     pub const constructor = bridge.constructor(UIEvent.init, .{});
     pub const detail = bridge.accessor(UIEvent.getDetail, null, .{});
+    pub const sourceCapabilities = bridge.accessor(UIEvent.getSourceCapabilities, null, .{});
     pub const view = bridge.accessor(UIEvent.getView, null, .{});
     pub const which = bridge.accessor(UIEvent.getWhich, null, .{});
+    pub const pseudoTarget = bridge.accessor(UIEvent.getPseudoTarget, null, .{});
     pub const initUIEvent = bridge.function(UIEvent.initUIEvent, .{});
 };
 

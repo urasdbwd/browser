@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<!--
+Members Chrome ships that we claim to be. Each absence is counted directly by
+a detector: CreepJS scores noWebShare and noDownlinkMax toward its "like
+headless" percentage. Presence is the point — the values are quantized or
+meaningless by design.
+
+These are unconditional, not gated on the Chrome-compatible identity, which
+matters because the test suite opts out with --no-stealth.
+-->
+<title>navigator chrome surface</title>
+<script src="../testing.js"></script>
+
+<script id=navigator_web_share>
+{
+  testing.expectEqual("function", typeof navigator.share);
+  testing.expectEqual("function", typeof navigator.canShare);
+  testing.expectEqual(true, navigator.canShare({ title: "t" }));
+  testing.expectEqual(false, navigator.canShare());
+}
+</script>
+
+<script id=navigator_downlink_max>
+{
+  testing.expectEqual(true, "downlinkMax" in navigator.connection);
+  testing.expectEqual(Infinity, navigator.connection.downlinkMax);
+}
+</script>
+
+<script id=navigator_share_rejects_like_chrome type=module>
+{
+  // Chrome rejects share() with NotAllowedError absent a user gesture. We do
+  // the same, so callers reach the fallback branch they already have rather
+  // than waiting on a promise that never settles.
+  const state = await testing.async();
+  navigator.share({ title: "t", url: "https://example.com" })
+    .then(() => state.resolve("resolved"))
+    .catch((e) => state.resolve(e.name));
+  await state.done((name) => {
+    testing.expectEqual("NotAllowedError", name);
+  });
+}
+</script>

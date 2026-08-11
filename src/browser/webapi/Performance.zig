@@ -28,15 +28,18 @@ const Execution = js.Execution;
 const Allocator = std.mem.Allocator;
 
 pub fn registerTypes() []const type {
-    return &.{ Performance, Entry, Mark, Measure, PerformanceTiming, PerformanceNavigation };
+    return &.{ Performance, Entry, Mark, Measure, NavigationTiming, PerformanceTiming, PerformanceNavigation, MemoryInfo };
 }
 
 const Performance = @This();
 
 _time_origin: u64,
+_time_origin_epoch_ms: f64,
 _entries: std.ArrayList(*Entry) = .empty,
+_navigation_timing: ?*NavigationTiming = null,
 _timing: PerformanceTiming = .{},
 _navigation: PerformanceNavigation = .{},
+_memory: MemoryInfo = .{},
 _event_counts: EventCounts = .{},
 
 // Navigation milestones, in ms since `_time_origin`. 0 until they fire.
@@ -56,8 +59,11 @@ pub fn highResTimestamp() u64 {
 }
 
 pub fn init() Performance {
+    const epoch_ms = @as(f64, @floatFromInt(lp.datetime.microTimestamp(.real))) / 1000.0;
     return .{
         ._time_origin = highResTimestamp(),
+        ._time_origin_epoch_ms = @floor(epoch_ms * 10.0) / 10.0,
+        ._timing = .init(epoch_ms),
     };
 }
 
@@ -65,28 +71,68 @@ pub fn getTiming(self: *Performance) *PerformanceTiming {
     return &self._timing;
 }
 
+pub fn getMemory(self: *Performance) *MemoryInfo {
+    return &self._memory;
+}
+
 pub fn now(self: *const Performance) f64 {
     const current = highResTimestamp();
     const elapsed = current - self._time_origin;
-    // Return as milliseconds with microsecond precision
-    return @as(f64, @floatFromInt(elapsed)) / 1000.0;
+    // Chrome reduces the clock to 100-microsecond precision.
+    const milliseconds = @as(f64, @floatFromInt(elapsed)) / 1000.0;
+    return @floor(milliseconds * 10.0) / 10.0;
 }
 
 pub fn markDomContentLoaded(self: *Performance) void {
     if (self._dom_content_loaded == 0) {
         self._dom_content_loaded = self.now();
+        self._timing.markDomContentLoaded(self._time_origin_epoch_ms + self._dom_content_loaded);
     }
+}
+
+pub const NetworkTiming = struct {
+    name_lookup_micros: i64 = 0,
+    connect_micros: i64 = 0,
+    app_connect_micros: i64 = 0,
+    pre_transfer_micros: i64 = 0,
+    start_transfer_micros: i64 = 0,
+    connection_reused: bool = false,
+};
+
+pub fn markResponseStart(self: *Performance, transfer_start_micros: u64, timing: NetworkTiming) void {
+    var resolved_timing = timing;
+    // Synthetic responses (for example CDP Fetch.fulfillRequest) have no curl
+    // timing data. Keep their request phases at transfer start, but record the
+    // actual header-arrival time instead of collapsing responseStart onto
+    // navigationStart.
+    if (resolved_timing.start_transfer_micros == 0) {
+        resolved_timing.start_transfer_micros = if (transfer_start_micros == 0)
+            @intFromFloat(self.now() * 1000.0)
+        else
+            @intCast(highResTimestamp() -| transfer_start_micros);
+    }
+    const transfer_offset_micros = if (transfer_start_micros > self._time_origin)
+        transfer_start_micros - self._time_origin
+    else
+        0;
+    const transfer_epoch_ms = self._time_origin_epoch_ms +
+        @as(f64, @floatFromInt(transfer_offset_micros)) / 1000.0;
+    self._timing.markResponseStart(transfer_epoch_ms, resolved_timing);
+}
+
+pub fn markResponseEnd(self: *Performance) void {
+    self._timing.markResponseEnd(self._time_origin_epoch_ms, self.now());
 }
 
 pub fn markLoadEventEnd(self: *Performance) void {
     if (self._load_event_end == 0) {
         self._load_event_end = self.now();
+        self._timing.markLoadEventEnd(self._time_origin_epoch_ms + self._load_event_end);
     }
 }
 
 pub fn getTimeOrigin(self: *const Performance) f64 {
-    // Return as milliseconds
-    return @as(f64, @floatFromInt(self._time_origin)) / 1000.0;
+    return self._time_origin_epoch_ms;
 }
 
 pub fn getNavigation(self: *Performance) *PerformanceNavigation {
@@ -227,7 +273,21 @@ pub fn getEntries(self: *const Performance) []*Entry {
 }
 
 pub fn getEntriesByType(self: *const Performance, entry_type: []const u8, exec: *const Execution) ![]const *Entry {
+    if (std.mem.eql(u8, entry_type, "navigation")) {
+        const navigation = try @constCast(self).getNavigationTiming(exec);
+        const entries = try exec.local_arena.alloc(*Entry, 1);
+        entries[0] = navigation._proto;
+        return entries;
+    }
     return filterEntriesByType(exec.local_arena, self._entries.items, entry_type);
+}
+
+fn getNavigationTiming(self: *Performance, exec: *const Execution) !*NavigationTiming {
+    if (self._navigation_timing) |navigation| return navigation;
+
+    const navigation = try NavigationTiming.init(self, exec);
+    self._navigation_timing = navigation;
+    return navigation;
 }
 
 pub fn getEntriesByName(self: *const Performance, name: []const u8, entry_type: ?[]const u8, exec: *const Execution) ![]const *Entry {
@@ -380,6 +440,7 @@ pub const JsApi = struct {
     pub const timing = bridge.accessor(Performance.getTiming, null, .{ .exposed = .window });
     pub const navigation = bridge.accessor(Performance.getNavigation, null, .{ .exposed = .window });
     pub const eventCounts = bridge.accessor(Performance.getEventCounts, null, .{ .exposed = .window });
+    pub const memory = bridge.accessor(Performance.getMemory, null, .{ .exposed = .window });
 };
 
 pub const Entry = struct {
@@ -397,7 +458,7 @@ pub const Entry = struct {
         @"long-animation-frame",
         longtask,
         measure: *Measure,
-        navigation,
+        navigation: *NavigationTiming,
         paint,
         resource,
         taskattribution,
@@ -442,6 +503,20 @@ pub const Entry = struct {
         return self._start_time;
     }
 
+    pub fn toJSON(self: *const Entry) struct {
+        name: []const u8,
+        entryType: []const u8,
+        startTime: f64,
+        duration: f64,
+    } {
+        return .{
+            .name = self.getName(),
+            .entryType = self.getEntryType(),
+            .startTime = self.getStartTime(),
+            .duration = self.getDuration(),
+        };
+    }
+
     pub const JsApi = struct {
         pub const bridge = js.Bridge(Entry);
 
@@ -454,6 +529,7 @@ pub const Entry = struct {
         pub const duration = bridge.accessor(Entry.getDuration, null, .{});
         pub const entryType = bridge.accessor(Entry.getEntryType, null, .{});
         pub const startTime = bridge.accessor(Entry.getStartTime, null, .{});
+        pub const toJSON = bridge.function(Entry.toJSON, .{});
     };
 };
 
@@ -569,13 +645,459 @@ pub const Measure = struct {
     };
 };
 
+/// Navigation Timing Level 2 entry for the current document.
+pub const NavigationTiming = struct {
+    pub const Proto = Entry;
+
+    _proto: *Entry,
+    _performance: *Performance,
+
+    fn init(performance: *Performance, exec: *const Execution) !*NavigationTiming {
+        const navigation = try exec._factory.chained(.{
+            Entry{
+                ._duration = performance.now(),
+                ._type = undefined,
+                ._name = try exec.dupeString(exec.url.*),
+            },
+            NavigationTiming{
+                ._proto = undefined,
+                ._performance = performance,
+            },
+        });
+        navigation._proto._type = .{ .navigation = navigation };
+        return navigation;
+    }
+
+    fn relative(self: *const NavigationTiming, value: f64) f64 {
+        if (value == 0) return 0;
+        return value - self._performance._timing.navigation_start;
+    }
+
+    pub fn getDuration(self: *const NavigationTiming) f64 {
+        return self._performance.now();
+    }
+
+    pub fn getFetchStart(self: *const NavigationTiming) f64 {
+        return self.relative(self._performance._timing.fetch_start);
+    }
+
+    pub fn getDomainLookupStart(self: *const NavigationTiming) f64 {
+        return self.relative(self._performance._timing.domain_lookup_start);
+    }
+
+    pub fn getDomainLookupEnd(self: *const NavigationTiming) f64 {
+        return self.relative(self._performance._timing.domain_lookup_end);
+    }
+
+    pub fn getConnectStart(self: *const NavigationTiming) f64 {
+        return self.relative(self._performance._timing.connect_start);
+    }
+
+    pub fn getSecureConnectionStart(self: *const NavigationTiming) f64 {
+        return self.relative(self._performance._timing.secure_connection_start);
+    }
+
+    pub fn getConnectEnd(self: *const NavigationTiming) f64 {
+        return self.relative(self._performance._timing.connect_end);
+    }
+
+    pub fn getRequestStart(self: *const NavigationTiming) f64 {
+        return self.relative(self._performance._timing.request_start);
+    }
+
+    pub fn getResponseStart(self: *const NavigationTiming) f64 {
+        return self.relative(self._performance._timing.response_start);
+    }
+
+    pub fn getResponseEnd(self: *const NavigationTiming) f64 {
+        return self.relative(self._performance._timing.response_end);
+    }
+
+    pub fn getDomInteractive(self: *const NavigationTiming) f64 {
+        return self.relative(self._performance._timing.dom_interactive);
+    }
+
+    pub fn getDomContentLoadedEventStart(self: *const NavigationTiming) f64 {
+        return self.relative(self._performance._timing.dom_content_loaded_event_start);
+    }
+
+    pub fn getDomContentLoadedEventEnd(self: *const NavigationTiming) f64 {
+        return self.relative(self._performance._timing.dom_content_loaded_event_end);
+    }
+
+    pub fn getDomComplete(self: *const NavigationTiming) f64 {
+        return self.relative(self._performance._timing.dom_complete);
+    }
+
+    pub fn getLoadEventStart(self: *const NavigationTiming) f64 {
+        return self.relative(self._performance._timing.load_event_start);
+    }
+
+    pub fn getLoadEventEnd(self: *const NavigationTiming) f64 {
+        return self.relative(self._performance._timing.load_event_end);
+    }
+
+    pub fn toJSON(self: *const NavigationTiming) struct {
+        name: []const u8,
+        entryType: []const u8,
+        startTime: f64,
+        duration: f64,
+        initiatorType: []const u8,
+        deliveryType: []const u8,
+        nextHopProtocol: []const u8,
+        renderBlockingStatus: []const u8,
+        contentType: []const u8,
+        contentEncoding: []const u8,
+        workerStart: f64,
+        workerRouterEvaluationStart: f64,
+        workerCacheLookupStart: f64,
+        workerMatchedSourceType: []const u8,
+        workerFinalSourceType: []const u8,
+        redirectStart: f64,
+        redirectEnd: f64,
+        fetchStart: f64,
+        domainLookupStart: f64,
+        domainLookupEnd: f64,
+        connectStart: f64,
+        secureConnectionStart: f64,
+        connectEnd: f64,
+        requestStart: f64,
+        responseStart: f64,
+        firstInterimResponseStart: f64,
+        finalResponseHeadersStart: f64,
+        responseEnd: f64,
+        transferSize: u32,
+        encodedBodySize: u32,
+        decodedBodySize: u32,
+        responseStatus: u16,
+        serverTiming: [0]u8,
+        unloadEventStart: f64,
+        unloadEventEnd: f64,
+        domInteractive: f64,
+        domContentLoadedEventStart: f64,
+        domContentLoadedEventEnd: f64,
+        domComplete: f64,
+        loadEventStart: f64,
+        loadEventEnd: f64,
+        type: []const u8,
+        redirectCount: u32,
+        activationStart: f64,
+        criticalCHRestart: f64,
+        notRestoredReasons: ?u8,
+    } {
+        return .{
+            .name = self._proto.getName(),
+            .entryType = self._proto.getEntryType(),
+            .startTime = self._proto.getStartTime(),
+            .duration = self.getDuration(),
+            .initiatorType = "navigation",
+            .deliveryType = "",
+            .nextHopProtocol = "h2",
+            .renderBlockingStatus = "non-blocking",
+            .contentType = "text/html",
+            .contentEncoding = "",
+            .workerStart = 0,
+            .workerRouterEvaluationStart = 0,
+            .workerCacheLookupStart = 0,
+            .workerMatchedSourceType = "",
+            .workerFinalSourceType = "",
+            .redirectStart = 0,
+            .redirectEnd = 0,
+            .fetchStart = self.getFetchStart(),
+            .domainLookupStart = self.getDomainLookupStart(),
+            .domainLookupEnd = self.getDomainLookupEnd(),
+            .connectStart = self.getConnectStart(),
+            .secureConnectionStart = self.getSecureConnectionStart(),
+            .connectEnd = self.getConnectEnd(),
+            .requestStart = self.getRequestStart(),
+            .responseStart = self.getResponseStart(),
+            .firstInterimResponseStart = 0,
+            .finalResponseHeadersStart = 0,
+            .responseEnd = self.getResponseEnd(),
+            .transferSize = 0,
+            .encodedBodySize = 0,
+            .decodedBodySize = 0,
+            .responseStatus = 200,
+            .serverTiming = .{},
+            .unloadEventStart = 0,
+            .unloadEventEnd = 0,
+            .domInteractive = self.getDomInteractive(),
+            .domContentLoadedEventStart = self.getDomContentLoadedEventStart(),
+            .domContentLoadedEventEnd = self.getDomContentLoadedEventEnd(),
+            .domComplete = self.getDomComplete(),
+            .loadEventStart = self.getLoadEventStart(),
+            .loadEventEnd = self.getLoadEventEnd(),
+            .type = "navigate",
+            .redirectCount = 0,
+            .activationStart = 0,
+            .criticalCHRestart = 0,
+            .notRestoredReasons = null,
+        };
+    }
+
+    pub const JsApi = struct {
+        pub const bridge = js.Bridge(NavigationTiming);
+
+        pub const Meta = struct {
+            pub const name = "PerformanceNavigationTiming";
+            pub const prototype_chain = bridge.prototypeChain();
+            pub var class_id: bridge.ClassId = undefined;
+        };
+
+        pub const duration = bridge.accessor(NavigationTiming.getDuration, null, .{});
+        pub const @"type" = bridge.property("navigate", .{ .template = false, .readonly = true });
+        pub const redirectCount = bridge.property(0, .{ .template = false, .readonly = true });
+        pub const unloadEventStart = bridge.property(0.0, .{ .template = false, .readonly = true });
+        pub const unloadEventEnd = bridge.property(0.0, .{ .template = false, .readonly = true });
+        pub const redirectStart = bridge.property(0.0, .{ .template = false, .readonly = true });
+        pub const redirectEnd = bridge.property(0.0, .{ .template = false, .readonly = true });
+        pub const workerStart = bridge.property(0.0, .{ .template = false, .readonly = true });
+        pub const fetchStart = bridge.accessor(NavigationTiming.getFetchStart, null, .{});
+        pub const domainLookupStart = bridge.accessor(NavigationTiming.getDomainLookupStart, null, .{});
+        pub const domainLookupEnd = bridge.accessor(NavigationTiming.getDomainLookupEnd, null, .{});
+        pub const connectStart = bridge.accessor(NavigationTiming.getConnectStart, null, .{});
+        pub const secureConnectionStart = bridge.accessor(NavigationTiming.getSecureConnectionStart, null, .{});
+        pub const connectEnd = bridge.accessor(NavigationTiming.getConnectEnd, null, .{});
+        pub const requestStart = bridge.accessor(NavigationTiming.getRequestStart, null, .{});
+        pub const responseStart = bridge.accessor(NavigationTiming.getResponseStart, null, .{});
+        pub const responseEnd = bridge.accessor(NavigationTiming.getResponseEnd, null, .{});
+        pub const domInteractive = bridge.accessor(NavigationTiming.getDomInteractive, null, .{});
+        pub const domContentLoadedEventStart = bridge.accessor(NavigationTiming.getDomContentLoadedEventStart, null, .{});
+        pub const domContentLoadedEventEnd = bridge.accessor(NavigationTiming.getDomContentLoadedEventEnd, null, .{});
+        pub const domComplete = bridge.accessor(NavigationTiming.getDomComplete, null, .{});
+        pub const loadEventStart = bridge.accessor(NavigationTiming.getLoadEventStart, null, .{});
+        pub const loadEventEnd = bridge.accessor(NavigationTiming.getLoadEventEnd, null, .{});
+        pub const nextHopProtocol = bridge.property("h2", .{ .template = false, .readonly = true });
+        pub const transferSize = bridge.property(0, .{ .template = false, .readonly = true });
+        pub const encodedBodySize = bridge.property(0, .{ .template = false, .readonly = true });
+        pub const decodedBodySize = bridge.property(0, .{ .template = false, .readonly = true });
+        pub const toJSON = bridge.function(NavigationTiming.toJSON, .{});
+    };
+};
+
 /// PerformanceTiming — Navigation Timing Level 1 (legacy, but widely used).
 /// https://developer.mozilla.org/en-US/docs/Web/API/PerformanceTiming
-/// All properties return 0 as stub values; the object must not be undefined
-/// so that scripts accessing performance.timing.navigationStart don't crash.
-pub const PerformanceTiming = struct {
-    // Padding to avoid zero-size struct, which causes identity_map pointer collisions.
+/// Chrome-only `performance.memory`. Chrome quantizes these to 100 KB as a
+/// Spectre mitigation, so a fixed triple is realistic; what detectors actually
+/// flag is the property missing while the browser claims to be Chrome
+/// (sannysoft's CHR_MEMORY). Window-only — Chrome does not expose it to
+/// workers, and offering it there would be its own inconsistency.
+pub const MemoryInfo = struct {
+    // Padding to avoid zero-size struct pointer collisions.
     _pad: bool = false,
+
+    pub const JsApi = struct {
+        pub const bridge = js.Bridge(MemoryInfo);
+
+        pub const Meta = struct {
+            pub const name = "MemoryInfo";
+            pub const prototype_chain = bridge.prototypeChain();
+            pub var class_id: bridge.ClassId = undefined;
+            pub const empty_with_no_proto = true;
+        };
+
+        pub const jsHeapSizeLimit = bridge.property(2172649472.0, .{ .template = false, .readonly = true });
+        pub const totalJSHeapSize = bridge.property(10200000.0, .{ .template = false, .readonly = true });
+        pub const usedJSHeapSize = bridge.property(8300000.0, .{ .template = false, .readonly = true });
+    };
+};
+
+pub const PerformanceTiming = struct {
+    navigation_start: f64 = 0,
+    fetch_start: f64 = 0,
+    domain_lookup_start: f64 = 0,
+    domain_lookup_end: f64 = 0,
+    connect_start: f64 = 0,
+    connect_end: f64 = 0,
+    secure_connection_start: f64 = 0,
+    request_start: f64 = 0,
+    response_start: f64 = 0,
+    response_end: f64 = 0,
+    dom_loading: f64 = 0,
+    dom_interactive: f64 = 0,
+    dom_content_loaded_event_start: f64 = 0,
+    dom_content_loaded_event_end: f64 = 0,
+    dom_complete: f64 = 0,
+    load_event_start: f64 = 0,
+    load_event_end: f64 = 0,
+
+    fn init(epoch_ms: f64) PerformanceTiming {
+        const start = @floor(epoch_ms);
+        return .{
+            .navigation_start = start,
+            .fetch_start = start,
+        };
+    }
+
+    fn markResponseStart(self: *PerformanceTiming, transfer_epoch_ms: f64, timing: NetworkTiming) void {
+        if (self.response_start != 0) return;
+        const start = @floor(transfer_epoch_ms);
+        const phase = struct {
+            fn at(base: f64, micros: i64) f64 {
+                return @floor(base + @as(f64, @floatFromInt(@max(0, micros))) / 1000.0);
+            }
+        }.at;
+
+        const request_start = phase(transfer_epoch_ms, timing.pre_transfer_micros);
+        if (timing.connection_reused) {
+            self.domain_lookup_start = request_start;
+            self.domain_lookup_end = request_start;
+            self.connect_start = request_start;
+            self.secure_connection_start = request_start;
+            self.connect_end = request_start;
+        } else {
+            self.domain_lookup_start = start;
+            self.domain_lookup_end = phase(transfer_epoch_ms, timing.name_lookup_micros);
+            self.connect_start = self.domain_lookup_end;
+            self.secure_connection_start = phase(transfer_epoch_ms, timing.connect_micros);
+            const connect_end_micros = if (timing.app_connect_micros > 0)
+                timing.app_connect_micros
+            else
+                timing.connect_micros;
+            self.connect_end = phase(transfer_epoch_ms, connect_end_micros);
+        }
+        self.request_start = @max(request_start, self.connect_end);
+        self.response_start = @max(
+            phase(transfer_epoch_ms, timing.start_transfer_micros),
+            self.request_start,
+        );
+    }
+
+    fn markResponseEnd(self: *PerformanceTiming, epoch_ms: f64, elapsed_ms: f64) void {
+        const value = @floor(epoch_ms + elapsed_ms);
+        self.response_end = value;
+        self.dom_loading = value;
+    }
+
+    fn markDomContentLoaded(self: *PerformanceTiming, timestamp: f64) void {
+        const value = @floor(timestamp);
+        self.dom_interactive = value;
+        self.dom_content_loaded_event_start = value;
+        self.dom_content_loaded_event_end = value;
+    }
+
+    fn markLoadEventEnd(self: *PerformanceTiming, timestamp: f64) void {
+        const value = @floor(timestamp);
+        self.dom_complete = value;
+        self.load_event_start = value;
+        self.load_event_end = value;
+    }
+
+    pub fn getNavigationStart(self: *const PerformanceTiming) f64 {
+        return self.navigation_start;
+    }
+
+    pub fn getFetchStart(self: *const PerformanceTiming) f64 {
+        return self.fetch_start;
+    }
+
+    pub fn getDomainLookupStart(self: *const PerformanceTiming) f64 {
+        return self.domain_lookup_start;
+    }
+
+    pub fn getDomainLookupEnd(self: *const PerformanceTiming) f64 {
+        return self.domain_lookup_end;
+    }
+
+    pub fn getConnectStart(self: *const PerformanceTiming) f64 {
+        return self.connect_start;
+    }
+
+    pub fn getConnectEnd(self: *const PerformanceTiming) f64 {
+        return self.connect_end;
+    }
+
+    pub fn getSecureConnectionStart(self: *const PerformanceTiming) f64 {
+        return self.secure_connection_start;
+    }
+
+    pub fn getRequestStart(self: *const PerformanceTiming) f64 {
+        return self.request_start;
+    }
+
+    pub fn getResponseStart(self: *const PerformanceTiming) f64 {
+        return self.response_start;
+    }
+
+    pub fn getResponseEnd(self: *const PerformanceTiming) f64 {
+        return self.response_end;
+    }
+
+    pub fn getDomLoading(self: *const PerformanceTiming) f64 {
+        return self.dom_loading;
+    }
+
+    pub fn getDomInteractive(self: *const PerformanceTiming) f64 {
+        return self.dom_interactive;
+    }
+
+    pub fn getDomContentLoadedEventStart(self: *const PerformanceTiming) f64 {
+        return self.dom_content_loaded_event_start;
+    }
+
+    pub fn getDomContentLoadedEventEnd(self: *const PerformanceTiming) f64 {
+        return self.dom_content_loaded_event_end;
+    }
+
+    pub fn getDomComplete(self: *const PerformanceTiming) f64 {
+        return self.dom_complete;
+    }
+
+    pub fn getLoadEventStart(self: *const PerformanceTiming) f64 {
+        return self.load_event_start;
+    }
+
+    pub fn getLoadEventEnd(self: *const PerformanceTiming) f64 {
+        return self.load_event_end;
+    }
+
+    pub fn toJSON(self: *const PerformanceTiming) struct {
+        navigationStart: f64,
+        unloadEventStart: f64,
+        unloadEventEnd: f64,
+        redirectStart: f64,
+        redirectEnd: f64,
+        fetchStart: f64,
+        domainLookupStart: f64,
+        domainLookupEnd: f64,
+        connectStart: f64,
+        connectEnd: f64,
+        secureConnectionStart: f64,
+        requestStart: f64,
+        responseStart: f64,
+        responseEnd: f64,
+        domLoading: f64,
+        domInteractive: f64,
+        domContentLoadedEventStart: f64,
+        domContentLoadedEventEnd: f64,
+        domComplete: f64,
+        loadEventStart: f64,
+        loadEventEnd: f64,
+    } {
+        return .{
+            .navigationStart = self.navigation_start,
+            .unloadEventStart = 0,
+            .unloadEventEnd = 0,
+            .redirectStart = 0,
+            .redirectEnd = 0,
+            .fetchStart = self.fetch_start,
+            .domainLookupStart = self.domain_lookup_start,
+            .domainLookupEnd = self.domain_lookup_end,
+            .connectStart = self.connect_start,
+            .connectEnd = self.connect_end,
+            .secureConnectionStart = self.secure_connection_start,
+            .requestStart = self.request_start,
+            .responseStart = self.response_start,
+            .responseEnd = self.response_end,
+            .domLoading = self.dom_loading,
+            .domInteractive = self.dom_interactive,
+            .domContentLoadedEventStart = self.dom_content_loaded_event_start,
+            .domContentLoadedEventEnd = self.dom_content_loaded_event_end,
+            .domComplete = self.dom_complete,
+            .loadEventStart = self.load_event_start,
+            .loadEventEnd = self.load_event_end,
+        };
+    }
 
     pub const JsApi = struct {
         pub const bridge = js.Bridge(PerformanceTiming);
@@ -584,30 +1106,30 @@ pub const PerformanceTiming = struct {
             pub const name = "PerformanceTiming";
             pub const prototype_chain = bridge.prototypeChain();
             pub var class_id: bridge.ClassId = undefined;
-            pub const empty_with_no_proto = true;
         };
 
-        pub const navigationStart = bridge.property(0.0, .{ .template = false, .readonly = true });
+        pub const navigationStart = bridge.accessor(PerformanceTiming.getNavigationStart, null, .{});
         pub const unloadEventStart = bridge.property(0.0, .{ .template = false, .readonly = true });
         pub const unloadEventEnd = bridge.property(0.0, .{ .template = false, .readonly = true });
         pub const redirectStart = bridge.property(0.0, .{ .template = false, .readonly = true });
         pub const redirectEnd = bridge.property(0.0, .{ .template = false, .readonly = true });
-        pub const fetchStart = bridge.property(0.0, .{ .template = false, .readonly = true });
-        pub const domainLookupStart = bridge.property(0.0, .{ .template = false, .readonly = true });
-        pub const domainLookupEnd = bridge.property(0.0, .{ .template = false, .readonly = true });
-        pub const connectStart = bridge.property(0.0, .{ .template = false, .readonly = true });
-        pub const connectEnd = bridge.property(0.0, .{ .template = false, .readonly = true });
-        pub const secureConnectionStart = bridge.property(0.0, .{ .template = false, .readonly = true });
-        pub const requestStart = bridge.property(0.0, .{ .template = false, .readonly = true });
-        pub const responseStart = bridge.property(0.0, .{ .template = false, .readonly = true });
-        pub const responseEnd = bridge.property(0.0, .{ .template = false, .readonly = true });
-        pub const domLoading = bridge.property(0.0, .{ .template = false, .readonly = true });
-        pub const domInteractive = bridge.property(0.0, .{ .template = false, .readonly = true });
-        pub const domContentLoadedEventStart = bridge.property(0.0, .{ .template = false, .readonly = true });
-        pub const domContentLoadedEventEnd = bridge.property(0.0, .{ .template = false, .readonly = true });
-        pub const domComplete = bridge.property(0.0, .{ .template = false, .readonly = true });
-        pub const loadEventStart = bridge.property(0.0, .{ .template = false, .readonly = true });
-        pub const loadEventEnd = bridge.property(0.0, .{ .template = false, .readonly = true });
+        pub const fetchStart = bridge.accessor(PerformanceTiming.getFetchStart, null, .{});
+        pub const domainLookupStart = bridge.accessor(PerformanceTiming.getDomainLookupStart, null, .{});
+        pub const domainLookupEnd = bridge.accessor(PerformanceTiming.getDomainLookupEnd, null, .{});
+        pub const connectStart = bridge.accessor(PerformanceTiming.getConnectStart, null, .{});
+        pub const connectEnd = bridge.accessor(PerformanceTiming.getConnectEnd, null, .{});
+        pub const secureConnectionStart = bridge.accessor(PerformanceTiming.getSecureConnectionStart, null, .{});
+        pub const requestStart = bridge.accessor(PerformanceTiming.getRequestStart, null, .{});
+        pub const responseStart = bridge.accessor(PerformanceTiming.getResponseStart, null, .{});
+        pub const responseEnd = bridge.accessor(PerformanceTiming.getResponseEnd, null, .{});
+        pub const domLoading = bridge.accessor(PerformanceTiming.getDomLoading, null, .{});
+        pub const domInteractive = bridge.accessor(PerformanceTiming.getDomInteractive, null, .{});
+        pub const domContentLoadedEventStart = bridge.accessor(PerformanceTiming.getDomContentLoadedEventStart, null, .{});
+        pub const domContentLoadedEventEnd = bridge.accessor(PerformanceTiming.getDomContentLoadedEventEnd, null, .{});
+        pub const domComplete = bridge.accessor(PerformanceTiming.getDomComplete, null, .{});
+        pub const loadEventStart = bridge.accessor(PerformanceTiming.getLoadEventStart, null, .{});
+        pub const loadEventEnd = bridge.accessor(PerformanceTiming.getLoadEventEnd, null, .{});
+        pub const toJSON = bridge.function(PerformanceTiming.toJSON, .{});
     };
 };
 
@@ -618,6 +1140,13 @@ pub const PerformanceNavigation = struct {
     // Padding to avoid zero-size struct, which causes identity_map pointer collisions.
     _pad: bool = false,
 
+    pub fn toJSON(_: *const PerformanceNavigation) struct {
+        type: u32,
+        redirectCount: u32,
+    } {
+        return .{ .type = 0, .redirectCount = 0 };
+    }
+
     pub const JsApi = struct {
         pub const bridge = js.Bridge(PerformanceNavigation);
 
@@ -625,11 +1154,15 @@ pub const PerformanceNavigation = struct {
             pub const name = "PerformanceNavigation";
             pub const prototype_chain = bridge.prototypeChain();
             pub var class_id: bridge.ClassId = undefined;
-            pub const empty_with_no_proto = true;
         };
 
         pub const @"type" = bridge.property(0.0, .{ .template = false, .readonly = true });
         pub const redirectCount = bridge.property(0.0, .{ .template = false, .readonly = true });
+        pub const TYPE_NAVIGATE = bridge.property(0, .{ .template = false, .readonly = true });
+        pub const TYPE_RELOAD = bridge.property(1, .{ .template = false, .readonly = true });
+        pub const TYPE_BACK_FORWARD = bridge.property(2, .{ .template = false, .readonly = true });
+        pub const TYPE_RESERVED = bridge.property(255, .{ .template = false, .readonly = true });
+        pub const toJSON = bridge.function(PerformanceNavigation.toJSON, .{});
     };
 };
 

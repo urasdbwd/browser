@@ -1,0 +1,9 @@
+<!DOCTYPE html>
+<!--
+A `data-sitekey` attribute with no Turnstile anywhere. reCAPTCHA and hCaptcha
+both mark their containers this way, so treating the bare attribute as a
+Turnstile widget engaged the solver on something it can never drive and spent
+the entire wait budget before giving up.
+-->
+<title>sitekey but not turnstile</title>
+<div class="h-captcha" data-sitekey="10000000-ffff-ffff-ffff-000000000001"></div>

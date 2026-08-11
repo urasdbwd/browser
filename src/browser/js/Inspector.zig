@@ -211,6 +211,8 @@ pub const Session = struct {
     ctx: *anyopaque,
     onNotif: *const fn (ctx: *anyopaque, msg: []const u8) void,
     onResp: *const fn (ctx: *anyopaque, call_id: u32, msg: []const u8) void,
+    onPause: *const fn (ctx: *anyopaque) bool,
+    paused: bool,
 
     fn init(self: *Session, inspector: *Inspector, ctx: anytype) void {
         const Container = @typeInfo(@TypeOf(ctx)).pointer.child;
@@ -231,6 +233,8 @@ pub const Session = struct {
             .inspector = inspector,
             .onResp = Container.onInspectorResponse,
             .onNotif = Container.onInspectorEvent,
+            .onPause = Container.onInspectorPause,
+            .paused = false,
         };
     }
 
@@ -397,15 +401,19 @@ pub export fn v8_inspector__Client__IMPL__runMessageLoopOnPause(
     data: *anyopaque,
     context_group_id: c_int,
 ) callconv(.c) void {
-    _ = data;
     _ = context_group_id;
+    const inspector: *Inspector = @ptrCast(@alignCast(data));
+    const session = if (inspector.session) |*session| session else return;
+    session.paused = true;
+    while (session.paused and session.onPause(session.ctx)) {}
 }
 
 pub export fn v8_inspector__Client__IMPL__quitMessageLoopOnPause(
     _: *v8.InspectorClientImpl,
     data: *anyopaque,
 ) callconv(.c) void {
-    _ = data;
+    const inspector: *Inspector = @ptrCast(@alignCast(data));
+    if (inspector.session) |*session| session.paused = false;
 }
 
 pub export fn v8_inspector__Client__IMPL__runIfWaitingForDebugger(

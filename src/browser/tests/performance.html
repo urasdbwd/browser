@@ -287,7 +287,9 @@
     // navigationStart must be a number (sites access performance.timing.navigationStart)
     const timing = performance.timing;
     testing.expectEqual('number', typeof timing.navigationStart);
-    testing.expectEqual(0, timing.navigationStart);
+    testing.expectEqual(true, timing.navigationStart > 0);
+    testing.expectEqual(true, timing.navigationStart <= Date.now());
+    testing.expectEqual(true, timing.responseStart >= timing.requestStart);
   }
 </script>
 
@@ -359,7 +361,7 @@
   {
     // The most commonly used property — must be a number (not undefined)
     testing.expectEqual('number', typeof performance.timing.navigationStart);
-    testing.expectEqual(0, performance.timing.navigationStart);
+    testing.expectEqual(true, performance.timing.navigationStart > 0);
   }
 </script>
 
@@ -603,4 +605,19 @@
       testing.expectEqual(true, data.same_observer);
     });
   }
+</script>
+
+<script id=performance_memory>
+{
+  // Chrome-only. sannysoft's CHR_MEMORY row checks it while the browser
+  // claims to be Chrome, so the absence was the tell. Chrome quantizes these
+  // to 100KB as a Spectre mitigation, which is why fixed values are realistic.
+  testing.expectEqual(true, !!performance.memory);
+  testing.expectEqual("number", typeof performance.memory.jsHeapSizeLimit);
+  // A real heap reads used < total < limit; an all-zero triple would satisfy
+  // "the property exists" while still looking synthetic.
+  testing.expectEqual(true, performance.memory.usedJSHeapSize > 0);
+  testing.expectEqual(true, performance.memory.usedJSHeapSize < performance.memory.totalJSHeapSize);
+  testing.expectEqual(true, performance.memory.totalJSHeapSize < performance.memory.jsHeapSizeLimit);
+}
 </script>

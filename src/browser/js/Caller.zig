@@ -581,6 +581,9 @@ fn handleError(comptime T: type, comptime F: type, local: *const Local, err: any
         // The termination exception is pending; throwing here would replace
         // it with a catchable Error, letting the killed script keep running.
         error.ExecutionTerminated => return,
+        // The callback already returned a rejected Promise for a Web IDL brand
+        // check, so there is no synchronous exception left to translate.
+        error.PromiseBrandErrorHandled => return,
         else => {},
     }
 
@@ -801,6 +804,10 @@ pub const Function = struct {
         ce_reactions: bool = false,
         js_name: ?[:0]const u8 = null,
         unforgeable: bool = false,
+        // Promise-returning Web IDL operations reject on a bad receiver instead
+        // of throwing synchronously. Set this to the browser's operation-specific
+        // brand-check message.
+        promise_brand_error: ?[]const u8 = null,
 
         pub const Exposed = enum { both, window, worker };
 
@@ -895,7 +902,15 @@ pub const Function = struct {
             @field(args, "0") = @ptrCast(@alignCast(info.getData() orelse unreachable));
         } else {
             args = try getArgs(F, 1, local, info);
-            @field(args, "0") = try TaggedOpaque.fromJS(*T, info.getThis());
+            @field(args, "0") = TaggedOpaque.fromJS(*T, info.getThis()) catch |err| {
+                if (comptime opts.promise_brand_error) |message| {
+                    const resolver = js.PromiseResolver.init(local);
+                    resolver.rejectError("Web IDL brand check", .{ .type_error = message });
+                    info.getReturnValue().set(resolver.promise().toValue());
+                    return error.PromiseBrandErrorHandled;
+                }
+                return err;
+            };
         }
         const res = @call(.auto, func, args);
         const js_value = try local.zigValueToJs(res, .{

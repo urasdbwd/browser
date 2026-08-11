@@ -76,7 +76,7 @@ pub fn getHighEntropyValues(_: *const @This(), hints: []const []const u8, exec: 
         } else if (std.mem.eql(u8, hint, "wow64")) {
             _ = try values.set(hint, false, .{});
         } else if (std.mem.eql(u8, hint, "formFactors")) {
-            _ = try values.set(hint, [_][]const u8{}, .{});
+            _ = try values.set(hint, [_][]const u8{"Desktop"}, .{});
         }
     }
 
@@ -87,10 +87,8 @@ fn stealth(exec: *const Execution) bool {
     return exec.session.browser.app.config.http_headers.stealth;
 }
 
-// Under --stealth the brands already carry the Chrome version, so the same
-// list doubles as the full-version list.
 fn fullBrandList(exec: *const Execution) []const Brand {
-    return if (stealth(exec)) brandList(exec) else &Config.HttpHeaders.full_brands;
+    return if (stealth(exec)) &Config.HttpHeaders.full_brands_stealth else &Config.HttpHeaders.full_brands;
 }
 
 fn fullVersion(exec: *const Execution) []const u8 {
@@ -101,7 +99,7 @@ fn platformVersion(exec: *const Execution) []const u8 {
     if (!stealth(exec)) return "";
     return switch (exec.session.browser.app.config.fingerprint_profile.platform) {
         .windows => "15.0.0",
-        .macos => "10.15.7",
+        .macos => "26.5.2",
         .linux => "6.6.0",
     };
 }

@@ -60,6 +60,38 @@
 }
 </script>
 
+<script id=postMessageOptionsOverload type=module>
+// An object second argument selects WindowPostMessageOptions. Arrays are also
+// objects, so Chrome accepts the reCAPTCHA-style postMessage(message, [port])
+// call and applies the options defaults instead of parsing the array as a URL.
+{
+    const state = await testing.async();
+    const received = [];
+
+    window.addEventListener('message', (e) => {
+        if (!e.data.startsWith('options-')) return;
+        received.push([e.data, e.ports.length]);
+        if (received.length === 2) state.resolve();
+    });
+
+    const ignored = new MessageChannel();
+    window.postMessage('options-array', [ignored.port2]);
+
+    const transferred = new MessageChannel();
+    window.postMessage('options-object', {
+        targetOrigin: '*',
+        transfer: [transferred.port2],
+    });
+
+    await state.done(() => {
+        testing.expectEqual([
+            ['options-array', 0],
+            ['options-object', 1],
+        ], received);
+    });
+}
+</script>
+
 <script id=postMessageTargetOriginSyntaxError>
 // A targetOrigin that isn't a URL at all throws, rather than silently dropping.
 {

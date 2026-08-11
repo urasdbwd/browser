@@ -273,6 +273,9 @@ fn evalFeature(text: []const u8, viewport: Viewport) bool {
 }
 
 fn evalNameValue(name: []const u8, value: []const u8, viewport: Viewport) bool {
+    if (std.ascii.eqlIgnoreCase(name, "prefers-color-scheme")) {
+        return std.ascii.eqlIgnoreCase(value, "dark");
+    }
     if (name.len > 16) {
         return false;
     }
@@ -478,7 +481,8 @@ test "MediaQuery: bare 0 is valid" {
 test "MediaQuery: unknown feature is false" {
     const v = Viewport.default;
     try testing.expect(!matches("(monochrome)", v));
-    try testing.expect(!matches("(prefers-color-scheme: dark)", v));
+    try testing.expect(matches("(prefers-color-scheme: dark)", v));
+    try testing.expect(!matches("(prefers-color-scheme: light)", v));
     try testing.expect(!matches("(prefers-reduced-motion: reduce)", v));
     try testing.expect(!matches("(hover: hover)", v));
     try testing.expect(!matches("(color)", v));

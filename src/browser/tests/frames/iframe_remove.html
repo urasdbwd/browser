@@ -1,5 +1,20 @@
 <!DOCTYPE html>
 <script src="../testing.js"></script>
+<script>
+function waitForFrameCondition(predicate) {
+  return new Promise((resolve) => {
+    const deadline = performance.now() + 500;
+    const check = () => {
+      if (predicate() || performance.now() >= deadline) {
+        resolve();
+        return;
+      }
+      setTimeout(check, 5);
+    };
+    check();
+  });
+}
+</script>
 
 <script id=iframe_remove_retires_context type=module>
 {
@@ -14,7 +29,7 @@
   );
   iframe.contentDocument.close();
 
-  setTimeout(() => {
+  waitForFrameCondition(() => window.__removedFrameTicks > 0).then(() => {
     const before = window.__removedFrameTicks;
     iframe.remove();
     const settled = window.__removedFrameTicks;
@@ -64,7 +79,7 @@
         reinsertedHasFreshWindow,
       });
     }, 20);
-  }, 15);
+  });
 
   await state.done((value) => {
     testing.expectTrue(value.before > 0);
@@ -94,12 +109,12 @@
   );
   iframe.contentDocument.close();
 
-  setTimeout(() => {
+  waitForFrameCondition(() => iframe.contentWindow === null).then(() => {
     state.resolve({
       contentWindow: iframe.contentWindow,
       ticks: window.__selfRemovingFrameTicks,
     });
-  }, 20);
+  });
 
   await state.done((value) => {
     testing.expectEqual(null, value.contentWindow);
@@ -163,7 +178,7 @@
     '<script>setInterval(() => top.__nestedFrameTicks++, 1);<\/script>',
   );
   nested.contentDocument.close();
-  await new Promise((resolve) => setTimeout(resolve, 15));
+  await waitForFrameCondition(() => window.__nestedFrameTicks > 0);
   const started = window.__nestedFrameTicks > 0;
 
   loaded = nextOuterLoad();

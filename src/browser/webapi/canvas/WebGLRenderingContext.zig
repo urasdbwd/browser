@@ -19,8 +19,18 @@
 const std = @import("std");
 
 const js = @import("../../js/js.zig");
-const Frame = @import("../../Frame.zig");
 const Canvas = @import("../element/html/Canvas.zig");
+const OffscreenCanvas = @import("OffscreenCanvas.zig");
+
+/// Whichever canvas created the context — `.canvas` must report it, and a
+/// worker only ever has an OffscreenCanvas. Keeping both owners here is what
+/// lets the two threads agree about the GPU: a worker that could not get a
+/// WebGL context at all reported no GPU while the main thread reported a full
+/// vendor and renderer, and no real browser contradicts itself that way.
+pub const CanvasOwner = union(enum) {
+    canvas: *Canvas,
+    offscreen: *OffscreenCanvas,
+};
 
 pub fn registerTypes() []const type {
     return &.{
@@ -208,7 +218,7 @@ fn Context(comptime version: Version) type {
         const Self = @This();
 
         /// Parent canvas (spec requires .canvas).
-        _canvas: *Canvas,
+        _canvas: CanvasOwner,
         /// Seeded from the browser fingerprint profile when the context is
         /// created; drives readPixels / toDataURL so the GPU probe isn't an
         /// all-zero buffer.
@@ -237,7 +247,7 @@ fn Context(comptime version: Version) type {
             Canvas.fillFingerprintPixels(pixels, seed, if (width > 0) @intCast(width) else 1);
         }
 
-        pub fn getCanvas(self: *const Self) *Canvas {
+        pub fn getCanvas(self: *const Self) CanvasOwner {
             return self._canvas;
         }
 
@@ -298,16 +308,20 @@ fn Context(comptime version: Version) type {
             };
         }
 
-        pub fn getExtension(_: *const Self, name: []const u8, frame: *Frame) !?Extension {
+        // Takes the Execution rather than the Frame: a worker has no Frame, so
+        // asking for one panicked the moment an OffscreenCanvas context called
+        // getExtension. Only `_factory` was ever needed, and Execution carries
+        // it under the same name.
+        pub fn getExtension(_: *const Self, name: []const u8, exec: *const js.Execution) !?Extension {
             const tag = Extension.find(name) orelse return null;
 
             return switch (tag) {
                 .WEBGL_debug_renderer_info => {
-                    const info = try frame._factory.create(Extension.Type.WEBGL_debug_renderer_info{});
+                    const info = try exec._factory.create(Extension.Type.WEBGL_debug_renderer_info{});
                     return .{ .WEBGL_debug_renderer_info = info };
                 },
                 .WEBGL_lose_context => {
-                    const ctx = try frame._factory.create(Extension.Type.WEBGL_lose_context{});
+                    const ctx = try exec._factory.create(Extension.Type.WEBGL_lose_context{});
                     return .{ .WEBGL_lose_context = ctx };
                 },
                 inline else => |comptime_enum| @unionInit(Extension, @tagName(comptime_enum), {}),
@@ -486,4 +500,8 @@ fn Context(comptime version: Version) type {
 const testing = @import("../../../testing.zig");
 test "WebApi: WebGLRenderingContext" {
     try testing.htmlRunner("canvas/webgl_rendering_context.html", .{});
+}
+
+test "WebApi: WebGL agrees across threads" {
+    try testing.htmlRunner("webgl_worker.html", .{});
 }

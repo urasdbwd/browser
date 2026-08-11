@@ -156,9 +156,9 @@ pub fn handle(
         .is_element_enabled => isElementEnabled(session, route.element_id.?, out),
         .get_element_text => getElementText(session, arena, route.element_id.?, out),
         .get_element_css_value => getElementCssValue(session, arena, route.element_id.?, route.attribute_name.?, out),
-        .element_click => elementClick(session, route.element_id.?, out),
+        .element_click => elementClick(server, session, route.element_id.?, out),
         .element_clear => elementClear(session, route.element_id.?, out),
-        .element_send_keys => elementSendKeys(session, arena, route.element_id.?, body, out),
+        .element_send_keys => elementSendKeys(server, session, arena, route.element_id.?, body, out),
         .execute_sync => executeScript(server, session, arena, body, false, out),
         .execute_async => executeScript(server, session, arena, body, true, out),
         else => unreachable,
@@ -1373,8 +1373,9 @@ fn interactableElement(
     return .{ .element = element, .frame = frame };
 }
 
-fn elementClick(session: *Server.Session, id: []const u8, out: *std.Io.Writer) !std.http.Status {
+fn elementClick(server: *Server, session: *Server.Session, id: []const u8, out: *std.Io.Writer) !std.http.Status {
     const target = (try interactableElement(session, id, out)) orelse return .bad_request;
+    const frame_id = target.frame._frame_id;
     const rect = target.element.boundingClientRectValuesForVisible(target.frame);
     lp.actions.clickAt(
         target.element.asNode(),
@@ -1383,7 +1384,7 @@ fn elementClick(session: *Server.Session, id: []const u8, out: *std.Io.Writer) !
         .{},
         target.frame,
     ) catch |err| return sendError(out, .internal_server_error, "unknown error", @errorName(err));
-    return sendValue(out, @as(?u8, null));
+    return finishElementAction(server, session, frame_id, out);
 }
 
 fn elementClear(session: *Server.Session, id: []const u8, out: *std.Io.Writer) !std.http.Status {
@@ -1396,6 +1397,7 @@ fn elementClear(session: *Server.Session, id: []const u8, out: *std.Io.Writer) !
 }
 
 fn elementSendKeys(
+    server: *Server,
     session: *Server.Session,
     arena: Allocator,
     id: []const u8,
@@ -1408,6 +1410,7 @@ fn elementSendKeys(
     defer parsed.deinit();
 
     const target = (try interactableElement(session, id, out)) orelse return .bad_request;
+    const frame_id = target.frame._frame_id;
     target.element.focus(target.frame) catch |err|
         return sendError(out, .internal_server_error, "unknown error", @errorName(err));
 
@@ -1419,6 +1422,30 @@ fn elementSendKeys(
         if (!target.element.asNode().isConnected()) break;
         lp.actions.press(target.element.asNode(), webDriverKey(key), target.frame) catch |err|
             return sendError(out, .internal_server_error, "unknown error", @errorName(err));
+    }
+    return finishElementAction(server, session, frame_id, out);
+}
+
+fn finishElementAction(
+    server: *Server,
+    session: *Server.Session,
+    frame_id: u32,
+    out: *std.Io.Writer,
+) !std.http.Status {
+    const navigated = session.session.processQueuedNavigation() catch
+        return sendError(out, .internal_server_error, "unknown error", "Could not start action navigation");
+    if (!navigated) return sendValue(out, @as(?u8, null));
+
+    const until = server.webdriverPageLoadWait() orelse
+        return sendValue(out, @as(?u8, null));
+    const timeout: u32 = @intCast(@min(server.webdriverPageLoadTimeout() orelse std.math.maxInt(u32), std.math.maxInt(u32)));
+    var runner = session.session.runner(.{});
+    const condition = lp.Session.Runner.WaitCondition{ .frame_id = frame_id, .until = until };
+    var conditions = [_]lp.Session.Runner.WaitCondition{condition};
+    const result = runner.waitResult(timeout, &conditions) catch |err|
+        return sendError(out, .internal_server_error, "unknown error", @errorName(err));
+    if (result == .timeout) {
+        return sendError(out, .internal_server_error, "timeout", "Action navigation exceeded the session page load timeout");
     }
     return sendValue(out, @as(?u8, null));
 }
@@ -2016,6 +2043,37 @@ test "WebDriver: protocol session validates capabilities and preserves navigatio
     try testing.expect(std.mem.indexOf(u8, page_source, "<!DOCTYPE") == null);
     try testing.expect(std.mem.indexOf(u8, page_source, "id=\"after\"") != null);
     try testing.expect(std.mem.indexOf(u8, page_source, "before") == null);
+
+    // Element actions must drain a form navigation before returning. Without
+    // this, clients observed the old page indefinitely after Enter or click.
+    out.clearRetainingCapacity();
+    try testing.expectEqual(
+        .ok,
+        try handle(
+            server,
+            request_allocator,
+            .POST,
+            navigate_path,
+            "{\"url\":\"data:text/html,<form action='data:text/html,submitted'><input id='query' name='q'></form>\"}",
+            &out.writer,
+        ),
+    );
+    const query_id = try testFindWebDriverElement(server, request_allocator, session_id, null, "#query", &out, "css selector");
+    defer testing.allocator.free(query_id);
+    const send_keys_path = try std.fmt.allocPrint(
+        testing.allocator,
+        "/session/{s}/element/{s}/value",
+        .{ session_id, query_id },
+    );
+    defer testing.allocator.free(send_keys_path);
+    out.clearRetainingCapacity();
+    try testing.expectEqual(
+        .ok,
+        try handle(server, request_allocator, .POST, send_keys_path, "{\"text\":\"bob\\ue007\"}", &out.writer),
+    );
+    out.clearRetainingCapacity();
+    try testing.expectEqual(.ok, try handle(server, request_allocator, .GET, navigate_path, "", &out.writer));
+    try testing.expect(std.mem.indexOf(u8, out.writer.buffered(), "data:text/html,submitted?q=bob") != null);
 
     try active.session.cookie_jar.populateFromResponse("https://example.com/", "token=secret; Path=/");
     try testing.expectEqual(@as(usize, 1), active.session.cookie_jar.cookies.items.len);

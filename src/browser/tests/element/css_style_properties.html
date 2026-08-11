@@ -3,6 +3,23 @@
 
 <div id="test-div"></div>
 
+<script id="supportedPropertyReflection">
+{
+  const style = $('#test-div').style;
+  style.cssText = '';
+
+  let names = Object.getOwnPropertyNames(style);
+  testing.expectEqual(745, names.length);
+  testing.expectEqual('accentColor', names[0]);
+  testing.expectEqual('zoom', names[names.length - 1]);
+
+  style.color = 'red';
+  names = Object.getOwnPropertyNames(style);
+  testing.expectEqual('0', names[0]);
+  testing.expectEqual('accentColor', names[1]);
+}
+</script>
+
 <script id="camelCaseAccess">
 {
   const div = $('#test-div');

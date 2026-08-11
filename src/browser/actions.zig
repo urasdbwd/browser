@@ -128,12 +128,15 @@ pub fn press(node: ?*DOMNode, key: []const u8, frame: *Frame) !void {
         null;
     const target = if (target_el) |el| el.asEventTarget() else frame.document.asNode().asEventTarget();
     const canonical = canonicalKey(key);
+    var code_buf: [6]u8 = undefined;
+    const code = canonicalCode(canonical, &code_buf);
 
     const keydown_event: *KeyboardEvent = try .initTrusted(comptime .wrap("keydown"), .{
         .bubbles = true,
         .cancelable = true,
         .composed = true,
         .key = canonical,
+        .code = code,
     }, frame);
 
     frame._event_manager.dispatch(target, keydown_event.asEvent()) catch |err| {
@@ -141,11 +144,27 @@ pub fn press(node: ?*DOMNode, key: []const u8, frame: *Frame) !void {
         return error.ActionFailed;
     };
 
+    if (emitsKeypress(canonical)) {
+        const keypress_event: *KeyboardEvent = try .initTrusted(comptime .wrap("keypress"), .{
+            .bubbles = true,
+            .cancelable = true,
+            .composed = true,
+            .key = canonical,
+            .code = code,
+        }, frame);
+
+        frame._event_manager.dispatch(target, keypress_event.asEvent()) catch |err| {
+            lp.log.err(.app, "press keypress failed", .{ .err = err });
+            return error.ActionFailed;
+        };
+    }
+
     const keyup_event: *KeyboardEvent = try .initTrusted(comptime .wrap("keyup"), .{
         .bubbles = true,
         .cancelable = true,
         .composed = true,
         .key = canonical,
+        .code = code,
     }, frame);
 
     frame._event_manager.dispatch(target, keyup_event.asEvent()) catch |err| {
@@ -177,13 +196,16 @@ pub fn keyEvent(node: ?*DOMNode, ev: KeyEvent, frame: *Frame) !void {
     const target = if (target_el) |el| el.asEventTarget() else frame.document.asNode().asEventTarget();
     // Both fit the 12-byte SSO buffer, so this wrap allocates nothing.
     const typ: lp.String = if (ev.down) lp.String.wrap("keydown") else lp.String.wrap("keyup");
+    const canonical = canonicalKey(ev.key);
+    var code_buf: [6]u8 = undefined;
+    const code = if (ev.code.len > 0) ev.code else canonicalCode(canonical, &code_buf);
 
     const event: *KeyboardEvent = try .initTrusted(typ, .{
         .bubbles = true,
         .cancelable = true,
         .composed = true,
-        .key = canonicalKey(ev.key),
-        .code = ev.code,
+        .key = canonical,
+        .code = code,
         .location = ev.location,
         .repeat = ev.repeat,
         .altKey = ev.alt,
@@ -223,6 +245,54 @@ fn canonicalKey(key: []const u8) []const u8 {
         if (std.ascii.eqlIgnoreCase(key, a.in)) return a.out;
     }
     return key;
+}
+
+/// Infer the physical KeyboardEvent.code produced by a standard US keyboard.
+/// Automation clients often branch on `code`; leaving it empty makes a trusted
+/// event observably different from real input.
+fn canonicalCode(key: []const u8, buf: *[6]u8) []const u8 {
+    const named = [_]struct { key: []const u8, code: []const u8 }{
+        .{ .key = "Enter", .code = "Enter" },
+        .{ .key = "Tab", .code = "Tab" },
+        .{ .key = "Escape", .code = "Escape" },
+        .{ .key = "Backspace", .code = "Backspace" },
+        .{ .key = "Delete", .code = "Delete" },
+        .{ .key = "ArrowUp", .code = "ArrowUp" },
+        .{ .key = "ArrowDown", .code = "ArrowDown" },
+        .{ .key = "ArrowLeft", .code = "ArrowLeft" },
+        .{ .key = "ArrowRight", .code = "ArrowRight" },
+        .{ .key = " ", .code = "Space" },
+    };
+    for (named) |candidate| {
+        if (std.mem.eql(u8, key, candidate.key)) return candidate.code;
+    }
+
+    if (key.len == 1 and std.ascii.isAlphabetic(key[0])) {
+        @memcpy(buf[0..3], "Key");
+        buf[3] = std.ascii.toUpper(key[0]);
+        return buf[0..4];
+    }
+    if (key.len == 1 and std.ascii.isDigit(key[0])) {
+        @memcpy(buf[0..5], "Digit");
+        buf[5] = key[0];
+        return buf;
+    }
+    return "";
+}
+
+fn emitsKeypress(key: []const u8) bool {
+    if (std.mem.eql(u8, key, "Enter")) return true;
+    return (std.unicode.utf8CountCodepoints(key) catch return false) == 1;
+}
+
+test "actions: keyboard metadata matches real key events" {
+    var buf: [6]u8 = undefined;
+    try std.testing.expectEqualStrings("Enter", canonicalCode(canonicalKey("enter"), &buf));
+    try std.testing.expectEqualStrings("KeyB", canonicalCode("b", &buf));
+    try std.testing.expectEqualStrings("Digit7", canonicalCode("7", &buf));
+    try std.testing.expect(emitsKeypress("Enter"));
+    try std.testing.expect(emitsKeypress("b"));
+    try std.testing.expect(!emitsKeypress("Tab"));
 }
 
 pub fn selectOption(node: *DOMNode, value: []const u8, frame: *Frame) !void {

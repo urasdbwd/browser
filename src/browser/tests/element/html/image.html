@@ -52,6 +52,17 @@
 }
 </script>
 
+<script id="useMap">
+{
+    const img = document.createElement('img');
+
+    testing.expectEqual('', img.useMap);
+    img.useMap = '#diagram';
+    testing.expectEqual('#diagram', img.useMap);
+    testing.expectEqual('#diagram', img.getAttribute('usemap'));
+}
+</script>
+
 <script id="width_height_setters">
 {
     const img = document.createElement('img');

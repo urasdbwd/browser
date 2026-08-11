@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<script src="testing.js"></script>
+
+<script id=trusted_types>
+{
+  testing.expectEqual("object", typeof trustedTypes);
+  testing.expectEqual("function", typeof trustedTypes.createPolicy);
+  testing.expectEqual(null, trustedTypes.defaultPolicy);
+  testing.expectEqual("[object TrustedHTML]", Object.prototype.toString.call(trustedTypes.emptyHTML));
+  testing.expectEqual("[object TrustedScript]", Object.prototype.toString.call(trustedTypes.emptyScript));
+  testing.expectEqual(true, trustedTypes.emptyHTML === trustedTypes.emptyHTML);
+  testing.expectEqual(true, trustedTypes.emptyScript === trustedTypes.emptyScript);
+
+  const policy = trustedTypes.createPolicy("test", {
+    createHTML: value => `<b>${value}</b>`,
+    createScript: value => `(${value})`,
+    createScriptURL: value => `https://example.com/${value}`,
+  });
+
+  testing.expectEqual("test", String(policy.name));
+  const html = policy.createHTML("x");
+  const htmlBrand = Object.prototype.toString.call(html);
+  if (htmlBrand !== "[object TrustedHTML]") throw new Error(htmlBrand);
+  const htmlText = String(html);
+  if (htmlText !== "<b>x</b>") throw new Error("htmlText=" + htmlText);
+  const script = policy.createScript("1 + 2");
+  if (String(script) !== "(1 + 2)") throw new Error("script=" + script);
+  testing.expectEqual(3, eval(String(script)));
+  const scriptURL = policy.createScriptURL("a.js");
+  if (String(scriptURL) !== "https://example.com/a.js") throw new Error("scriptURL=" + scriptURL);
+}
+</script>

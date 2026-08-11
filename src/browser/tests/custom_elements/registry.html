@@ -5,6 +5,7 @@
     testing.expectEqual(true, window.customElements !== undefined);
     testing.expectEqual('function', typeof window.customElements.define);
     testing.expectEqual('function', typeof window.customElements.get);
+    testing.expectEqual(customElements, document.createElement('div').customElementRegistry);
 }
 
 {

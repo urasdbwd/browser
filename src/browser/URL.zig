@@ -224,6 +224,44 @@ pub fn isSecure(raw: [:0]const u8) bool {
     return std.mem.startsWith(u8, raw, "https:") or std.mem.startsWith(u8, raw, "wss:");
 }
 
+/// "Potentially trustworthy origin" — what `isSecureContext` reports and what
+/// gates service workers, clipboard, credentials and PaymentRequest.
+///
+/// Deliberately NOT `isSecure` above: that one answers "may a Secure cookie
+/// ride this request", where loopback must stay untrusted. Here loopback IS
+/// trustworthy (browsers treat http://localhost as secure so local dev works),
+/// so the two questions get two functions.
+/// https://w3c.github.io/webappsec-secure-contexts/
+pub fn isPotentiallyTrustworthy(raw: [:0]const u8) bool {
+    if (isSecure(raw)) return true;
+    // A local file has no network attacker to protect against.
+    if (std.mem.startsWith(u8, raw, "file:")) return true;
+
+    if (std.mem.startsWith(u8, raw, "http:") == false and
+        std.mem.startsWith(u8, raw, "ws:") == false) return false;
+
+    const host = getHostname(raw);
+    if (std.mem.eql(u8, host, "localhost")) return true;
+    if (std.mem.endsWith(u8, host, ".localhost")) return true;
+    if (std.mem.eql(u8, host, "127.0.0.1")) return true;
+    if (std.mem.eql(u8, host, "[::1]")) return true;
+    return false;
+}
+
+test "URL: secure contexts cover https and loopback but not plain http" {
+    try testing.expectEqual(true, isPotentiallyTrustworthy("https://example.com/x"));
+    try testing.expectEqual(true, isPotentiallyTrustworthy("wss://example.com/x"));
+    try testing.expectEqual(true, isPotentiallyTrustworthy("file:///tmp/x.html"));
+    try testing.expectEqual(true, isPotentiallyTrustworthy("http://localhost:3000/x"));
+    try testing.expectEqual(true, isPotentiallyTrustworthy("http://127.0.0.1:9582/x"));
+    try testing.expectEqual(false, isPotentiallyTrustworthy("http://example.com/x"));
+    try testing.expectEqual(false, isPotentiallyTrustworthy("about:blank"));
+
+    // Loopback is trustworthy for secure-context purposes but must NOT start
+    // carrying Secure cookies — the two helpers stay independent.
+    try testing.expectEqual(false, isSecure("http://localhost:3000/x"));
+}
+
 pub fn getHostname(raw: [:0]const u8) []const u8 {
     const host = getHost(raw);
     const port_sep = findPortSeparator(host) orelse return host;

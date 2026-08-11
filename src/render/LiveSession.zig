@@ -62,6 +62,7 @@ pub const Action = enum {
     back,
     forward,
     reload,
+    solve_captchas,
     click,
     animationend,
     fill,
@@ -130,7 +131,7 @@ pub const Target = struct {
 /// per-deployment call, not a default, which is why this is an explicit
 /// three-state option rather than a bool with a quiet answer.
 pub const DirectResources = enum {
-    /// Off when `--stealth` is set, on otherwise: an operator who is not hiding
+    /// Off by default, on with `--no-stealth`: an operator who is not hiding
     /// has no fingerprint split to lose. Note this is the *inverse* of
     /// `--solve_captchas auto`, which turns itself on under stealth.
     auto,
@@ -302,6 +303,7 @@ pub fn processParsed(
         .back => try live.traverse(.back, command, deadline),
         .forward => try live.traverse(.forward, command, deadline),
         .reload => try live.reload(arena, command, deadline),
+        .solve_captchas => try live.solveCaptchas(command, deadline),
         .click => try live.click(command, deadline),
         .animationend => try live.animationEnd(command, deadline),
         .fill => try live.fill(command, deadline),
@@ -539,6 +541,16 @@ fn click(self: *LiveSession, command: Command, deadline: std.Io.Timestamp) Proce
         lp.actions.click(element.asNode(), frame) catch |err| return mapActionError(err);
     }
     try self.finishAction(command.wait_ms, deadline);
+}
+
+fn solveCaptchas(self: *LiveSession, command: Command, deadline: std.Io.Timestamp) ProcessError!void {
+    const budget = @min(command.wait_ms, try remainingCommandMs(deadline));
+    if (budget == 0) return error.Timeout;
+
+    var runner = self.session.runner(.{});
+    const result = runner.solveTurnstile(budget) catch |err| return mapWaitError(err);
+    self.turnstile = @tagName(result);
+    lp.log.info(.app, "live captcha solve", .{ .result = self.turnstile, .budget_ms = budget });
 }
 
 fn animationEnd(self: *LiveSession, command: Command, deadline: std.Io.Timestamp) ProcessError!void {
@@ -883,7 +895,7 @@ fn canonicalURL(arena: std.mem.Allocator, raw: []const u8) ProcessError![:0]cons
 
 /// Blocking managed-Turnstile solve for a freshly navigated page, so the
 /// snapshot we ship is the post-solve DOM rather than the challenge page.
-/// Honours `--solve-captchas` (auto = on under `--stealth`) exactly as `fetch`
+/// Honours `--solve-captchas` (auto = on by default) exactly as `fetch`
 /// does. Returns the outcome tag, or null when solving is off.
 ///
 /// `started` is when the navigation began: the solve gets whatever is left of
@@ -1028,6 +1040,59 @@ test "live session: command parser reads action" {
         arena.allocator(),
         "{\"id\":13,\"type\":\"mouseover\"}",
     )).type);
+
+    const solve = try parseCommand(
+        arena.allocator(),
+        "{\"id\":14,\"type\":\"solve_captchas\",\"wait_ms\":30000}",
+    );
+    try std.testing.expectEqual(Action.solve_captchas, solve.type);
+    try std.testing.expectEqual(@as(u32, 30_000), solve.wait_ms);
+}
+
+test "live session: explicit renderer command solves Turnstile" {
+    var browser: lp.Browser = undefined;
+    try browser.init(testing.test_app, .{}, null);
+    defer browser.deinit();
+
+    var state: ?LiveSession = null;
+    defer if (state) |*live| live.deinit();
+    var arena_instance: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    const owner: u64 = 91;
+    const opened = try process(
+        &state,
+        testing.test_app,
+        &browser,
+        arena,
+        owner,
+        "{\"id\":1,\"type\":\"open\",\"url\":\"http://127.0.0.1:9582/src/browser/tests/turnstile/widget.html\",\"wait_until\":\"load\"}",
+        4_000,
+        &out.writer,
+    );
+    try std.testing.expect(opened.snapshot);
+    try std.testing.expect(opened.turnstile == null);
+    try std.testing.expect(!lp.Turnstile.hasToken(state.?.session));
+    out.clearRetainingCapacity();
+
+    const solved = try process(
+        &state,
+        testing.test_app,
+        &browser,
+        arena,
+        owner,
+        "{\"id\":2,\"type\":\"solve_captchas\",\"wait_ms\":3000}",
+        4_000,
+        &out.writer,
+    );
+    try std.testing.expectEqualStrings("solved", solved.turnstile.?);
+    try std.testing.expectEqualStrings(
+        "FAKE-TURNSTILE-TOKEN-0123456789",
+        lp.Turnstile.token(state.?.session).?,
+    );
 }
 
 test "live session: keyboard and pointer commands dispatch real events" {

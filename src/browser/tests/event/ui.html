@@ -60,6 +60,22 @@
   }
 </script>
 
+<script id=sourceCapabilities>
+  {
+    testing.expectEqual(null, document.createEvent('MouseEvent').sourceCapabilities);
+    testing.expectEqual(true, 'sourceCapabilities' in UIEvent.prototype);
+    testing.expectEqual(null, document.createEvent('MouseEvent').pseudoTarget);
+    testing.expectEqual(true, 'pseudoTarget' in UIEvent.prototype);
+
+    const defaults = new InputDeviceCapabilities();
+    testing.expectEqual(false, defaults.firesTouchEvents);
+    testing.expectEqual('[object InputDeviceCapabilities]', Object.prototype.toString.call(defaults));
+
+    const touch = new InputDeviceCapabilities({ firesTouchEvents: true });
+    testing.expectEqual(true, touch.firesTouchEvents);
+  }
+</script>
+
 <script id=initUIEvent>
   {
     const evt = document.createEvent('UIEvent');

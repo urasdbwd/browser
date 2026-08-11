@@ -267,6 +267,56 @@ test("identical in-flight renders share one fetch", async () => {
   }
 });
 
+test("one-shot render requests captcha solving and exposes its outcome", async () => {
+  const original = {
+    CustomEvent: globalThis.CustomEvent,
+    Element: globalThis.Element,
+    document: globalThis.document,
+    fetch: globalThis.fetch,
+  };
+  let requestBody = null;
+  globalThis.CustomEvent ??= class CustomEvent extends Event {
+    constructor(type, options = {}) {
+      super(type);
+      this.detail = options.detail;
+    }
+  };
+  globalThis.Element = FakeElement;
+  globalThis.document = {
+    baseURI: "https://client.test/",
+    createElement: () => new FakeIframe(),
+    querySelector: () => null,
+  };
+  globalThis.fetch = async (_endpoint, request) => {
+    requestBody = JSON.parse(request.body);
+    return {
+      ok: true,
+      headers: { get: (name) => name === "x-lp-turnstile" ? "solved" : null },
+      blob: async () => new Blob(["snapshot"]),
+    };
+  };
+
+  let renderer = null;
+  try {
+    const { LightpandaRenderer } = await loadRenderer();
+    renderer = new LightpandaRenderer(new FakeElement());
+    let outcome = null;
+    renderer.addEventListener("captcha", (event) => { outcome = event.detail.turnstile; });
+    await renderer.render("https://example.com/", { solveCaptchas: true });
+
+    assert.equal(requestBody.solve_captchas, true);
+    assert.equal(requestBody.wait_ms, 30_000);
+    assert.equal(renderer.turnstile, "solved");
+    assert.equal(outcome, "solved");
+  } finally {
+    renderer?.destroy();
+    globalThis.CustomEvent = original.CustomEvent;
+    globalThis.Element = original.Element;
+    globalThis.document = original.document;
+    globalThis.fetch = original.fetch;
+  }
+});
+
 test("successful reconnect emits once after the reopened snapshot is usable", async () => {
   const original = {
     CustomEvent: globalThis.CustomEvent,
@@ -329,6 +379,76 @@ test("successful reconnect emits once after the reopened snapshot is usable", as
     assert.deepEqual(lifecycle, ["reconnecting"]);
     await waitFor(() => lifecycle.includes("reconnect"));
     assert.deepEqual(lifecycle, ["reconnecting", "reconnect"]);
+  } finally {
+    browser?.destroy();
+    FakeWebSocket.onSend = null;
+    globalThis.CustomEvent = original.CustomEvent;
+    globalThis.Element = original.Element;
+    globalThis.WebSocket = original.WebSocket;
+    globalThis.document = original.document;
+    globalThis.fetch = original.fetch;
+  }
+});
+
+test("live renderer exposes an explicit captcha solve command", async () => {
+  const original = {
+    CustomEvent: globalThis.CustomEvent,
+    Element: globalThis.Element,
+    WebSocket: globalThis.WebSocket,
+    document: globalThis.document,
+    fetch: globalThis.fetch,
+  };
+  FakeWebSocket.instances = [];
+  globalThis.CustomEvent ??= class CustomEvent extends Event {
+    constructor(type, options = {}) {
+      super(type);
+      this.detail = options.detail;
+    }
+  };
+  globalThis.Element = FakeElement;
+  globalThis.WebSocket = FakeWebSocket;
+  globalThis.document = {
+    baseURI: "https://client.test/",
+    createElement: () => new FakeIframe(),
+    querySelector: () => null,
+  };
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ ticket: "t" }) });
+
+  const sent = [];
+  FakeWebSocket.onSend = (socket, command) => {
+    sent.push(command);
+    if (command.type === "open") return successfulSnapshot(socket, command, "Captcha");
+    queueMicrotask(() => socket.message(JSON.stringify({
+      id: command.id,
+      ok: true,
+      snapshot: false,
+      closed: false,
+      can_go_back: false,
+      can_go_forward: false,
+      target_version: null,
+      snapshot_encoding: null,
+      snapshot_bytes: 0,
+      turnstile: "solved",
+    })));
+  };
+
+  let browser = null;
+  try {
+    const { LightpandaVirtualBrowser } = await loadRenderer();
+    browser = new LightpandaVirtualBrowser(new FakeElement(), {
+      endpoint: "wss://renderer.test/v1/live",
+      pollInterval: 60_000,
+    });
+    await browser.open("https://example.com/");
+    let outcome = null;
+    browser.addEventListener("captcha", (event) => { outcome = event.detail.turnstile; });
+    const response = await browser.solveCaptchas({ waitMs: 12_000 });
+
+    const command = sent.find((value) => value.type === "solve_captchas");
+    assert.equal(command.wait_ms, 12_000);
+    assert.equal(response.turnstile, "solved");
+    assert.equal(browser.turnstile, "solved");
+    assert.equal(outcome, "solved");
   } finally {
     browser?.destroy();
     FakeWebSocket.onSend = null;

@@ -188,12 +188,20 @@ pub fn fingerprintSeed(self: *const CanvasRenderingContext2D) u64 {
 
 fn mix(self: *CanvasRenderingContext2D, v: u64) void {
     self._dirty = true;
+    self.mixSeed(v);
+}
+
+fn mixSeed(self: *CanvasRenderingContext2D, v: u64) void {
     self._fp_seed ^= v;
     self._fp_seed *%= 0x100000001b3;
 }
 
 fn mixF(self: *CanvasRenderingContext2D, f: f64) void {
     self.mix(@as(u64, @bitCast(f)));
+}
+
+fn mixSeedF(self: *CanvasRenderingContext2D, f: f64) void {
+    self.mixSeed(@as(u64, @bitCast(f)));
 }
 
 fn mixBytes(self: *CanvasRenderingContext2D, bytes: []const u8) void {
@@ -271,16 +279,20 @@ pub fn putImageData(self: *CanvasRenderingContext2D, data: *ImageData, dx: f64, 
 }
 
 pub fn drawImage(self: *CanvasRenderingContext2D, image: js.Value, dx: f64, dy: f64, dw: ?f64, dh: ?f64, a5: ?f64, a6: ?f64, a7: ?f64, a8: ?f64, frame: *Frame) void {
-    self.mixF(dx);
-    self.mixF(dy);
-    if (dw) |v| self.mixF(v);
-    if (dh) |v| self.mixF(v);
+    // The client renderer decodes image pixels. The server cannot know whether
+    // an image is opaque or fully transparent, so include the operation in
+    // the fingerprint seed without claiming made-up pixels in getImageData().
+    self.mixSeedF(dx);
+    self.mixSeedF(dy);
+    if (dw) |v| self.mixSeedF(v);
+    if (dh) |v| self.mixSeedF(v);
 
     // Reference the bitmap by URL and let the client re-fetch it from origin —
     // the pixels never touch the wire. Sources we cannot name (a canvas, a
     // video) are skipped rather than replayed as a blank.
     const img = image.toZig(*Image) catch return;
     const src = img.getSrc(frame) catch return;
+    self.mixBytes(src);
     // An inline data: URI is the bitmap, so replaying it would put the pixels on
     // the wire once per frame — exactly what naming images by URL avoids.
     if (src.len == 0 or src.len > max_image_src) return;

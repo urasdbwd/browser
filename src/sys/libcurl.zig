@@ -62,6 +62,8 @@ pub const CurlSockAddr = extern struct {
 };
 
 pub const CURL_SOCKET_BAD: c.curl_socket_t = c.CURL_SOCKET_BAD;
+pub const CURL_HTTP_VERSION_3: c_long = c.CURL_HTTP_VERSION_3;
+pub const CURL_HTTP_VERSION_3ONLY: c_long = c.CURL_HTTP_VERSION_3ONLY;
 
 pub const FreeCallback = fn (ptr: ?*anyopaque) void;
 pub const StrdupCallback = fn (str: [*:0]const u8) ?[*:0]u8;
@@ -205,6 +207,7 @@ pub const CurlOption = enum(c.CURLoption) {
     proxy_ssl_verify_host = c.CURLOPT_PROXY_SSL_VERIFYHOST,
     proxy_ssl_verify_peer = c.CURLOPT_PROXY_SSL_VERIFYPEER,
     accept_encoding = c.CURLOPT_ACCEPT_ENCODING,
+    http_version = c.CURLOPT_HTTP_VERSION,
     verbose = c.CURLOPT_VERBOSE,
     debug_function = c.CURLOPT_DEBUGFUNCTION,
     custom_request = c.CURLOPT_CUSTOMREQUEST,
@@ -241,6 +244,11 @@ pub const CurlInfo = enum(c.CURLINFO) {
     redirect_count = c.CURLINFO_REDIRECT_COUNT,
     response_code = c.CURLINFO_RESPONSE_CODE,
     connect_code = c.CURLINFO_HTTP_CONNECTCODE,
+    name_lookup_time_t = c.CURLINFO_NAMELOOKUP_TIME_T,
+    connect_time_t = c.CURLINFO_CONNECT_TIME_T,
+    app_connect_time_t = c.CURLINFO_APPCONNECT_TIME_T,
+    pre_transfer_time_t = c.CURLINFO_PRETRANSFER_TIME_T,
+    start_transfer_time_t = c.CURLINFO_STARTTRANSFER_TIME_T,
     total_time_t = c.CURLINFO_TOTAL_TIME_T,
     num_connects = c.CURLINFO_NUM_CONNECTS,
     conn_id = c.CURLINFO_CONN_ID,
@@ -586,6 +594,10 @@ pub fn curl_easy_reset(easy: *Curl) void {
     c.curl_easy_reset(easy);
 }
 
+pub fn curl_easy_impersonate(easy: *Curl, target: [*:0]const u8) Error!void {
+    try errorCheck(c.curl_easy_impersonate(easy, target, 0));
+}
+
 pub fn curl_easy_perform(easy: *Curl) Error!void {
     try errorCheck(c.curl_easy_perform(easy));
 }
@@ -611,6 +623,7 @@ pub fn curl_easy_setopt(easy: *Curl, comptime option: CurlOption, value: anytype
         .follow_location,
         .post_field_size,
         .connect_only,
+        .http_version,
         => @as(c_long, @intCast(value)),
 
         .url,
@@ -664,6 +677,11 @@ pub fn curl_easy_getinfo(easy: *Curl, comptime info: CurlInfo, out: anytype) Err
             const p: *c_long = out;
             break :blk c.curl_easy_getinfo(easy, inf, p);
         },
+        .name_lookup_time_t,
+        .connect_time_t,
+        .app_connect_time_t,
+        .pre_transfer_time_t,
+        .start_transfer_time_t,
         .total_time_t,
         .conn_id,
         => blk: {

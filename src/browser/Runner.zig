@@ -27,6 +27,7 @@ const HttpClient = @import("../network/HttpClient.zig");
 const Node = @import("webapi/Node.zig");
 const Selector = @import("webapi/selector/Selector.zig");
 const Turnstile = @import("Turnstile.zig");
+const CaptchaSolver = @import("CaptchaSolver.zig");
 
 const log = lp.log;
 
@@ -460,9 +461,14 @@ fn firstConditionError(conditions: []const WaitCondition) !void {
 /// Poll Turnstile widgets: wait for passive (always-pass) tokens first, then
 /// click managed interactive controls. Soft-fail if no token by timeout.
 ///
-/// Blocking — for the one-shot `fetch`/`render` paths that must hold the token
-/// before dumping. Long-lived paths (CDP, MCP, agent) use `Turnstile.AutoSolve`
-/// instead, which never parks the event loop.
+/// With a solver-service key in the environment, also hands reCAPTCHA v2 or
+/// hCaptcha to that service and writes its token back into the page. Turnstile
+/// always remains local and click-only. See `CaptchaSolver`.
+///
+/// Blocking — for one-shot `fetch`/`render` and explicit agent/MCP solve
+/// requests that must hold the token before continuing. Automatic solving in
+/// long-lived sessions uses `Turnstile.AutoSolve`, which never parks the event
+/// loop.
 pub fn solveTurnstile(self: *Runner, timeout_ms: u32) !Turnstile.Result {
     const session = self.session;
     const timer: std.Io.Timestamp = .now(lp.io, .boot);
@@ -473,6 +479,15 @@ pub fn solveTurnstile(self: *Runner, timeout_ms: u32) !Turnstile.Result {
     const passive_ms: u32 = @min(8_000, timeout_ms / 3);
     const click_interval_ms: u32 = 1_500;
     const max_clicks: u32 = 12;
+
+    // Solver service, if one is configured. Cleared after a failure so a bad
+    // key or an empty balance is not re-tried on every tick.
+    var solver_enabled = CaptchaSolver.credentials() != null;
+    var job: ?CaptchaSolver.Job = null;
+    defer if (job) |*j| j.deinit();
+    var last_poll_ms: u32 = 0;
+    // Outlives the frame arena, which a navigation mid-solve would reset.
+    const solver_arena = session.arena.allocator();
 
     while (true) {
         if (session.isCancelled()) {
@@ -493,6 +508,62 @@ pub fn solveTurnstile(self: *Runner, timeout_ms: u32) !Turnstile.Result {
 
         const has_widget = Turnstile.hasWidget(session);
         widget_seen = widget_seen or has_widget;
+
+        // A solver service runs alongside the clicking below, not instead of
+        // it: Turnstile stays local; the service only handles reCAPTCHA/hCaptcha.
+        if (solver_enabled) {
+            if (job) |*j| {
+                if (elapsed -| last_poll_ms >= CaptchaSolver.poll_interval_ms) {
+                    last_poll_ms = elapsed;
+                    if (j.poll()) |maybe_token| {
+                        if (maybe_token) |tok| {
+                            if (CaptchaSolver.inject(session, solver_arena, j.kind, tok) == false) {
+                                // A token with no field to land in is not a
+                                // solve: the page submits nothing.
+                                log.warn(.browser, "captcha token unplaceable", .{ .kind = @tagName(j.kind) });
+                                return .timeout;
+                            }
+                            log.info(.browser, "captcha solved by service", .{
+                                .elapsed_ms = elapsed,
+                                .kind = @tagName(j.kind),
+                            });
+                            return .{ .solved = tok };
+                        }
+                    } else |err| {
+                        log.warn(.browser, "captcha service poll", .{ .err = err });
+                        j.deinit();
+                        job = null;
+                        solver_enabled = false;
+                    }
+                }
+            } else if (CaptchaSolver.detect(session, solver_arena)) |widget| {
+                const creds = CaptchaSolver.credentialsFor(widget.kind) orelse {
+                    log.warn(.browser, "no configured captcha service supports widget", .{
+                        .kind = @tagName(widget.kind),
+                    });
+                    solver_enabled = false;
+                    continue;
+                };
+                // Counts as a widget even when Turnstile detection missed it,
+                // or the loop below would call the page ordinary and bail out
+                // before the service ever answers.
+                widget_seen = true;
+                job = CaptchaSolver.Job.init(solver_arena, creds, widget.kind);
+                job.?.start(widget) catch |err| {
+                    log.warn(.browser, "captcha service createTask", .{ .err = err });
+                    job.?.deinit();
+                    job = null;
+                    solver_enabled = false;
+                };
+                if (job != null) {
+                    last_poll_ms = elapsed;
+                    log.info(.browser, "captcha handed to service", .{
+                        .provider = @tagName(creds.provider),
+                        .kind = @tagName(widget.kind),
+                    });
+                }
+            }
+        }
 
         // After passive window, click challenge UI occasionally (not every tick).
         if (elapsed >= passive_ms and click_count < max_clicks) {
@@ -694,6 +765,21 @@ test "Runner: solveTurnstile returns no_widget promptly" {
     var runner = page.session.runner(.{});
     const started: std.Io.Timestamp = .now(lp.io, .boot);
     // A 30s budget must not be spent on a page that has no challenge.
+    try testing.expectString("no_widget", @tagName(try runner.solveTurnstile(30_000)));
+    const elapsed = started.untilNow(lp.io, .boot).toMilliseconds();
+
+    try testing.expectEqual(false, Turnstile.hasWidget(page.session));
+    try testing.expectEqual(true, elapsed < 2_000);
+}
+
+test "Runner: solveTurnstile ignores a non-Turnstile data-sitekey" {
+    const page = try testing.pageTest("turnstile/sitekey_only.html", .{});
+    defer page.close();
+
+    var runner = page.session.runner(.{});
+    const started: std.Io.Timestamp = .now(lp.io, .boot);
+    // reCAPTCHA/hCaptcha containers carry data-sitekey too. Matching it cost
+    // every such page the whole budget for a token that could never arrive.
     try testing.expectString("no_widget", @tagName(try runner.solveTurnstile(30_000)));
     const elapsed = started.untilNow(lp.io, .boot).toMilliseconds();
 

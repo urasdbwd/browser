@@ -36,9 +36,10 @@
 <script id=stealth_chrome_outer>
 {
   testing.expectEqual(true, typeof window.chrome === "object" && window.chrome !== null);
-  testing.expectEqual(true, typeof window.chrome.runtime === "object" && window.chrome.runtime !== null);
+  testing.expectEqual(undefined, window.chrome.runtime);
   testing.expectEqual(true, typeof window.chrome.csi === "function");
   testing.expectEqual(true, typeof window.chrome.loadTimes === "function");
+  testing.expectEqual("loadTimes,csi,app", Object.keys(window.chrome).join(","));
   testing.expectEqual(true, window.outerWidth > 0);
   testing.expectEqual(true, window.outerHeight > 0);
   testing.expectEqual(true, window.outerHeight >= window.innerHeight);
@@ -147,7 +148,7 @@
     testing.expectEqual(false, globals.has(leaked));
   }
   // ...while the instances they back still work.
-  testing.expectEqual("object", typeof window.chrome.runtime);
+  testing.expectEqual(undefined, window.chrome.runtime);
   testing.expectEqual("object", typeof console);
   testing.expectEqual("function", typeof console.log);
   testing.expectEqual("function", typeof CSS.escape);
@@ -170,6 +171,11 @@
   testing.expectEqual(true, lt.commitLoadTime >= lt.requestTime);
   testing.expectEqual(true, lt.finishDocumentLoadTime >= lt.commitLoadTime);
   testing.expectEqual(true, lt.finishLoadTime >= lt.finishDocumentLoadTime);
+  testing.expectEqual(0, lt.firstPaintTime);
+  testing.expectEqual(true, lt.wasFetchedViaSpdy);
+  testing.expectEqual(true, lt.wasNpnNegotiated);
+  testing.expectEqual("h3", lt.npnNegotiatedProtocol);
+  testing.expectEqual("h3", lt.connectionInfo);
   // loadTimes is in seconds, csi in milliseconds.
   testing.expectEqual(true, Math.abs(lt.requestTime * 1000 - csi.startE) < 1000);
 }

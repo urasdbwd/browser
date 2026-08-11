@@ -169,6 +169,7 @@ pub const Function = struct {
     wpt_only: bool = false,
     js_name: ?[:0]const u8 = null,
     exposed: Caller.Function.Opts.Exposed = .both,
+    custom_brand_check: bool = false,
     cache: ?Caller.Function.Opts.Caching = null,
     func: *const fn (?*const v8.FunctionCallbackInfo) callconv(.c) void,
 
@@ -179,6 +180,7 @@ pub const Function = struct {
             .wpt_only = opts.wpt_only,
             .js_name = opts.js_name,
             .exposed = opts.exposed,
+            .custom_brand_check = opts.promise_brand_error != null,
             // Non-static methods receive `self` as their first param; static
             // methods don't, so don't skip the first param for them.
             .arity = getArity(@TypeOf(func), if (opts.static) 0 else 1),
@@ -656,11 +658,33 @@ pub fn unknownWindowPropertyCallback(c_name: ?*const v8.Name, handle: ?*const v8
         return js.Intercepted.no;
     };
 
-    // Only Page contexts have document.getElementById lookup
+    // Only Page contexts have Window named-property lookup. A callback can be
+    // entered from another same-origin context (child code reading
+    // parent.frames[name]), so resolve the receiver instead of assuming the
+    // current context owns the Window being accessed.
     switch (local.ctx.global) {
         .frame => |frame| {
-            const document = frame.document;
-            if (document.getElementById(property, frame)) |el| {
+            const target_window = blk: {
+                const target = @import("TaggedOpaque.zig").fromJS(@TypeOf(frame.window), (Caller.PropertyCallbackInfo{ .handle = handle.? }).getThis()) catch break :blk frame.window;
+                break :blk target;
+            };
+            const target_frame = target_window._frame;
+
+            // Window named properties expose child browsing contexts by name.
+            // Check them before elements, matching the HTML named access order.
+            for (target_frame.child_frames.items) |child| {
+                const iframe = child.iframe orelse continue;
+                const iframe_name = iframe.asElement().getAttributeSafe(comptime .wrap("name")) orelse child.window._name;
+                if (std.mem.eql(u8, iframe_name, property)) {
+                    const js_val = local.zigValueToJs(child.window, .{}) catch return js.Intercepted.no;
+                    var pc = Caller.PropertyCallbackInfo{ .handle = handle.? };
+                    pc.getReturnValue().set(js_val);
+                    return js.Intercepted.yes;
+                }
+            }
+
+            const document = target_frame.document;
+            if (document.getElementById(property, target_frame)) |el| {
                 const js_val = local.zigValueToJs(el, .{}) catch return js.Intercepted.no;
                 var pc = Caller.PropertyCallbackInfo{ .handle = handle.? };
                 pc.getReturnValue().set(js_val);
@@ -882,6 +906,7 @@ pub const JsApiLookup = struct {
     ///    const index_id = types.getId(@TypeOf(res));
     ///
     pub const Enum = blk: {
+        @setEvalBranchQuota(100_000);
         var names: [JsApis.len][:0]const u8 = undefined;
         for (JsApis, 0..) |JsApi, i| {
             names[i] = @typeName(JsApi);
@@ -977,6 +1002,7 @@ pub const PageJsApis = flattenTypes(&.{
     @import("../webapi/DOMPoint.zig"),
     @import("../webapi/DOMParser.zig"),
     @import("../webapi/XMLSerializer.zig"),
+    @import("../webapi/CompatibilityInterfaces.zig"),
     @import("../webapi/AbstractRange.zig"),
     @import("../webapi/Range.zig"),
     @import("../webapi/StaticRange.zig"),
@@ -1127,6 +1153,7 @@ pub const PageJsApis = flattenTypes(&.{
     @import("../webapi/event/GamepadEvent.zig"),
     @import("../webapi/event/DeviceOrientationEvent.zig"),
     @import("../webapi/event/TouchEvent.zig"),
+    @import("../webapi/event/InputDeviceCapabilities.zig"),
     @import("../webapi/event/UIEvent.zig"),
     @import("../webapi/event/MouseEvent.zig"),
     @import("../webapi/event/PointerEvent.zig"),
@@ -1184,7 +1211,9 @@ pub const PageJsApis = flattenTypes(&.{
     @import("../webapi/Performance.zig"),
     @import("../webapi/EventCounts.zig"),
     @import("../webapi/PluginArray.zig"),
+    @import("../webapi/ContentIndex.zig"),
     @import("../webapi/Chrome.zig"),
+    @import("../webapi/TrustedTypes.zig"),
     @import("../webapi/MediaDevices.zig"),
     @import("../webapi/device.zig"),
     @import("../webapi/net/RTCPeerConnection.zig"),

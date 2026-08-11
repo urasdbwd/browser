@@ -388,9 +388,11 @@ pub fn getUserAgent(self: *const Client) [:0]const u8 {
 // Sec-CH-UA ahead of User-Agent and trails with Accept-Language, so this is
 // built in Chrome's order rather than a convenient one. (libcurl still places
 // its own generated Host/Accept/Accept-Encoding itself.)
-pub fn baselineHeaders(self: *const Client) [3]http.Header {
+pub fn baselineHeaders(self: *const Client) [5]http.Header {
     return .{
         .{ .name = "Sec-Ch-Ua", .value = self.network.config.http_headers.sec_ch_ua_header },
+        .{ .name = "Sec-Ch-Ua-Mobile", .value = "?0" },
+        .{ .name = "Sec-Ch-Ua-Platform", .value = self.network.config.http_headers.sec_ch_ua_platform_header },
         .{ .name = "User-Agent", .value = self.getUserAgent() },
         // Omitting Accept-Language triggers bot-protection on some CDNs
         // (Akamai) when Accept-Encoding is present.
@@ -522,7 +524,7 @@ pub fn activity(self: *const Client) Activity {
 //                refs to page / session / V8 state; dispatching a
 //                command that frees that state would UAF on unwind.
 //                Cherry-pick only Fetch interception responses
-const DrainMode = enum { all, sync_wait };
+const DrainMode = enum { all, sync_wait, inspector_pause };
 
 // One-shot convenience: create and submit in a single call.
 pub fn request(self: *Client, req: Request, owner: ?*Owner) anyerror!void {
@@ -581,7 +583,7 @@ pub fn newRequest(self: *Client, req: Request, owner: ?*Owner) anyerror!*Transfe
             .client = self,
             .arena = arena,
             .id = self.incrReqId(),
-            .start_time = lp.datetime.timestamp(.boot),
+            .start_time = 0,
             // owner is set AFTER we've actually appended to the owner list,
             // so transfer.deinit's `if (self.owner)` branch only fires when
             // we're truly linked. Otherwise we'd try to remove a node from
@@ -617,6 +619,12 @@ pub fn tickSync(self: *Client, timeout_ms: u32) !void {
         return error.SyncWaitInterrupted;
     }
     _ = try self._tick(timeout_ms, .sync_wait);
+}
+
+pub fn tickInspectorPause(self: *Client) !bool {
+    const count = try self.drainInbox(.inspector_pause);
+    if (count == 0) lp.io.sleep(.fromMilliseconds(1), .awake) catch {};
+    return true;
 }
 
 fn hasPendingTeardown(self: *Client) bool {
@@ -670,7 +678,7 @@ pub fn _tick(self: *Client, timeout_ms: u32, mode: DrainMode) !bool {
     _ = self.dispatchCompleted(mode);
 
     // dispatch CDP commands
-    try self.drainInbox(mode);
+    _ = try self.drainInbox(mode);
 
     if (comptime lp.IS_DEBUG) {
         if (waited == false) {
@@ -1269,13 +1277,16 @@ fn makeRequest(self: *Client, conn: *http.Connection, transfer: *Transfer) anyer
 // so the worker loop can tear down the connection. Called from tick
 // only — NOT from perform, because perform recurses through
 // processOneMessage's redirect path.
-fn drainInbox(self: *Client, mode: DrainMode) !void {
-    const cdp = self.cdp orelse return;
+fn drainInbox(self: *Client, mode: DrainMode) !usize {
+    const cdp = self.cdp orelse return 0;
+    var count: usize = 0;
     while (true) {
         const msg = switch (mode) {
             .all => self.inbox.pop(),
             .sync_wait => self.inbox.popIf(allowDuringSyncWait),
-        } orelse return;
+            .inspector_pause => self.inbox.popIf(allowDuringInspectorPause),
+        } orelse return count;
+        count += 1;
 
         defer msg.deinit();
 
@@ -1317,6 +1328,14 @@ fn allowDuringSyncWait(msg: *Inbox.Message) bool {
     return switch (msg.payload) {
         .ping, .close, .disconnect => true,
         .cdp => |c| isFetchInterceptionMethod(c.input.method),
+    };
+}
+
+fn allowDuringInspectorPause(msg: *Inbox.Message) bool {
+    return switch (msg.payload) {
+        .ping, .close, .disconnect => true,
+        .cdp => |c| std.mem.startsWith(u8, c.input.method, "Debugger.") or
+            std.mem.startsWith(u8, c.input.method, "Runtime."),
     };
 }
 
@@ -1913,6 +1932,8 @@ pub const Transfer = struct {
 
     start_time: u64,
 
+    network_timing: http.Connection.NetworkTiming = .{},
+
     _notified_fail: bool = false,
 
     // Set when conn is temporarily detached from transfer during redirect
@@ -2441,6 +2462,7 @@ pub const Transfer = struct {
         const conn_id = conn.getConnId() catch -1;
         self._conn_id = if (conn_id < 0) 0 else conn_id + 1;
         self._conn_reused = conn.isConnReused() catch false;
+        self.network_timing = conn.getNetworkTiming() catch .{};
 
         const arena = self.arena;
 
@@ -2476,6 +2498,7 @@ pub const Transfer = struct {
     fn configureConn(self: *Transfer, conn: *http.Connection) anyerror!void {
         const client = self.client;
         const req = &self.req;
+        self.start_time = lp.datetime.microTimestamp(.boot);
 
         // Set callbacks and per-client settings on the pooled connection.
         try conn.setWriteCallback(Transfer.dataCallback);
@@ -2496,7 +2519,13 @@ pub const Transfer = struct {
         // accumulate duplicates.
         conn.clearHeaders();
         const arena = self.arena.allocator();
+        const cookies = try self.req.getCookieString(arena);
+        var cookie_is_header = false;
         for (self.req_headers.items) |hdr| {
+            if (!cookie_is_header and cookies != null and std.ascii.eqlIgnoreCase(hdr.name, "Priority")) {
+                try conn.addHeader(arena, "Cookie", cookies.?);
+                cookie_is_header = true;
+            }
             try conn.addHeader(arena, hdr.name, hdr.value);
         }
         if (req.body != null) {
@@ -2513,8 +2542,10 @@ pub const Transfer = struct {
         try conn.commitHeaders();
 
         // Add cookies from cookie jar.
-        if (try self.req.getCookieString(self.arena.allocator())) |cookies| {
-            try conn.setCookies(@ptrCast(cookies.ptr));
+        if (!cookie_is_header) {
+            if (cookies) |value| {
+                try conn.setCookies(@ptrCast(value.ptr));
+            }
         }
 
         conn.transport = .{ .http = self };
@@ -2548,6 +2579,7 @@ pub const Transfer = struct {
             .buffer = self.res.buffer,
             .stream = .{ .spare = self.res.stream.spare },
         };
+        self.network_timing = .{};
     }
 
     fn buildResponseHeader(self: *Transfer, conn: *const http.Connection) !void {
@@ -2699,6 +2731,10 @@ pub const Transfer = struct {
             .value = try arena.dupe(u8, value),
             .source = opts.source,
         });
+    }
+
+    pub fn clearRequestHeaders(self: *Transfer) void {
+        self.req_headers.clearRetainingCapacity();
     }
 
     // Adds, replacing every existing header with the same case-insensitive name

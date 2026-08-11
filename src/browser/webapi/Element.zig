@@ -26,6 +26,7 @@ const StyleManager = @import("../StyleManager.zig");
 const reflect = @import("../reflect.zig");
 
 const CSS = @import("CSS.zig");
+const CustomElementRegistry = @import("CustomElementRegistry.zig");
 const Node = @import("Node.zig");
 const ShadowRoot = @import("ShadowRoot.zig");
 const EventTarget = @import("EventTarget.zig");
@@ -796,6 +797,10 @@ pub fn getAssignedSlot(self: *Element, frame: *Frame) ?*Html.Slot {
     return slotting.findSlot(self.asNode(), true, frame);
 }
 
+pub fn getCustomElementRegistry(_: *Element, frame: *Frame) *CustomElementRegistry {
+    return frame.window.getCustomElements();
+}
+
 // Whether this element may host a shadow root
 fn isValidShadowHost(self: *const Element) bool {
     if (self._namespace != .html) {
@@ -1283,11 +1288,19 @@ pub fn checkVisibility(self: *Element, opts_: ?CheckVisibilityOpts, frame: *Fram
 pub fn getElementDimensions(self: *Element, frame: *Frame) struct { width: f64, height: f64 } {
     var width: f64 = 5.0;
     var height: f64 = 5.0;
+    var width_set = false;
+    var height_set = false;
 
     if (self.getStyle(frame)) |style| {
         const decl = style.asCSSStyleDeclaration();
-        width = CSS.parseDimensionViewport(decl.getPropertyValue("width", frame), frame) orelse 5.0;
-        height = CSS.parseDimensionViewport(decl.getPropertyValue("height", frame), frame) orelse 5.0;
+        if (CSS.parseDimensionViewport(decl.getPropertyValue("width", frame), frame)) |value| {
+            width = value;
+            width_set = true;
+        }
+        if (CSS.parseDimensionViewport(decl.getPropertyValue("height", frame), frame)) |value| {
+            height = value;
+            height_set = true;
+        }
     }
 
     if (width == 5.0 or height == 5.0) {
@@ -1303,9 +1316,18 @@ pub fn getElementDimensions(self: *Element, frame: *Frame) struct { width: f64, 
         } else if (tag == .img or tag == .iframe) {
             if (self.getAttributeSafe(comptime .wrap("width"))) |w| {
                 width = std.fmt.parseFloat(f64, w) catch width;
+                width_set = true;
             }
             if (self.getAttributeSafe(comptime .wrap("height"))) |h| {
                 height = std.fmt.parseFloat(f64, h) catch height;
+                height_set = true;
+            }
+            // An unloaded image without intrinsic or CSS dimensions has a
+            // zero-sized box in Chrome. The generic 5px fallback is observable
+            // here and is used by bot challenges.
+            if (tag == .img) {
+                if (!width_set) width = 0.0;
+                if (!height_set) height = 0.0;
             }
         }
     }
@@ -2311,7 +2333,6 @@ pub const JsApi = struct {
     pub const className = bridge.accessor(Element.getClassName, Element.setClassName, .{ .ce_reactions = true });
     pub const classList = bridge.accessor(Element.getClassList, Element.setClassList, .{ .ce_reactions = true });
     pub const dataset = bridge.accessor(Element.getDataset, null, .{});
-    pub const style = bridge.accessor(Element.getOrCreateStyle, Element.setStyle, .{});
     pub const attributes = bridge.accessor(Element.getAttributeNamedNodeMap, null, .{});
     pub const hasAttribute = bridge.function(Element.hasAttribute, .{});
     pub const hasAttributeNS = bridge.function(Element.hasAttributeNS, .{});
@@ -2326,6 +2347,7 @@ pub const JsApi = struct {
     pub const removeAttributeNode = bridge.function(Element.removeAttributeNode, .{ .ce_reactions = true });
     pub const shadowRoot = bridge.accessor(Element.getShadowRoot, null, .{});
     pub const assignedSlot = bridge.accessor(Element.getAssignedSlot, null, .{});
+    pub const customElementRegistry = bridge.accessor(Element.getCustomElementRegistry, null, .{});
     pub const attachShadow = bridge.function(_attachShadow, .{});
     pub const insertAdjacentHTML = bridge.function(Element.insertAdjacentHTML, .{ .ce_reactions = true });
     pub const setHTMLUnsafe = bridge.function(Element.setHTMLUnsafe, .{ .ce_reactions = true });

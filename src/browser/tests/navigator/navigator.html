@@ -1,7 +1,24 @@
 <!DOCTYPE html>
 <script src="../testing.js"></script>
 
+<script id=pluginMimeIdentity>
+  {
+    testing.expectEqual(false, navigator.plugins[0][0] === navigator.mimeTypes[0]);
+    testing.expectEqual(false, navigator.plugins[0][0] === navigator.plugins[1][0]);
+    testing.expectEqual(true, navigator.plugins[0][0].enabledPlugin === navigator.plugins[0]);
+    testing.expectEqual(true, navigator.plugins[1][0].enabledPlugin === navigator.plugins[1]);
+    testing.expectEqual(true, navigator.mimeTypes[0].enabledPlugin === navigator.plugins[0]);
+  }
+</script>
+
 <script id=navigator>
+  testing.expectEqual(false, Object.hasOwn(navigator, Symbol.toStringTag));
+  const toStringTag = Object.getOwnPropertyDescriptor(Navigator.prototype, Symbol.toStringTag);
+  testing.expectEqual('Navigator', toStringTag.value);
+  testing.expectEqual(false, toStringTag.writable);
+  testing.expectEqual(false, toStringTag.enumerable);
+  testing.expectEqual(true, toStringTag.configurable);
+
   // Navigator should be accessible from window
   testing.expectEqual(navigator, window.navigator);
   testing.expectEqual(true, navigator.userAgent.length > 0);
@@ -84,6 +101,23 @@
       testing.expectEqual('notifications', status.name);
     });
   }
+
+  {
+    const query = Permissions.prototype.query;
+    let promise;
+    try {
+      promise = query.call({ name: "not Permissions" }, { name: "notifications" });
+    } catch (error) {
+      testing.fail(`Permissions.query brand check threw synchronously: ${error}`);
+    }
+    try {
+      await promise;
+      testing.fail("Permissions.query accepted an invalid receiver");
+    } catch (error) {
+      testing.expectTrue(error instanceof TypeError);
+      testing.expectEqual("Failed to execute 'query' on 'Permissions': Illegal invocation", error.message);
+    }
+  }
 </script>
 
 <script id=permission_query_unknown type=module>
@@ -126,12 +160,26 @@
   // navigator.plugins is a classic headless tell.
   testing.expectEqual(5, navigator.plugins.length);
   testing.expectEqual('PDF Viewer', navigator.plugins[0].name);
+  testing.expectEqual(2, [...navigator.plugins[0]].length);
+  testing.expectEqual(navigator.plugins[0][0], [...navigator.plugins[0]][0]);
   let count = 0;
   for (const _ of navigator.plugins) count++;
   testing.expectEqual(navigator.plugins.length, count);
   testing.expectEqual(2, navigator.mimeTypes.length);
   testing.expectEqual('application/pdf', navigator.mimeTypes[0].type);
   testing.expectEqual('PDF Viewer', navigator.mimeTypes[0].enabledPlugin.name);
+  testing.expectEqual(5, Object.keys({...navigator.plugins}).length);
+  testing.expectEqual(2, Object.keys({...navigator.mimeTypes}).length);
+  testing.expectEqual('0,1,2,3,4', Object.keys(navigator.plugins).join(','));
+  testing.expectEqual('0,1', Object.keys(navigator.plugins[0]).join(','));
+  testing.expectEqual('0,1', Object.keys(navigator.mimeTypes).join(','));
+  const namedPlugin = Object.getOwnPropertyDescriptor(navigator.plugins, 'PDF Viewer');
+  testing.expectEqual(false, namedPlugin.enumerable);
+  testing.expectEqual(false, namedPlugin.writable);
+  const namedMime = Object.getOwnPropertyDescriptor(navigator.mimeTypes, 'application/pdf');
+  testing.expectEqual(false, namedMime.enumerable);
+  testing.expectEqual(false, namedMime.writable);
+  testing.expectEqual(true, 'ContentIndex' in window);
 }
 </script>
 
@@ -211,7 +259,8 @@
 
     await state.done(() => {
       testing.expectEqual(true, Array.isArray(v.formFactors));
-      testing.expectEqual(0, v.formFactors.length);
+      testing.expectEqual(1, v.formFactors.length);
+      testing.expectEqual('Desktop', v.formFactors[0]);
       testing.expectEqual('1.0', v.uaFullVersion);
       testing.expectEqual(false, v.wow64);
       testing.expectEqual(false, 'architecture' in v);

@@ -527,6 +527,7 @@ test "tests:beforeAll" {
 
     test_config = try Config.init(test_allocator, "test", .{ .serve = .{
         .insecure_disable_tls_host_verification = true,
+        .no_stealth = true,
         .user_agent_suffix = "internal-tester",
         .ws_max_concurrent = 50,
     } });
@@ -699,6 +700,78 @@ fn corsRequestHeader(req: *std.http.Server.Request, name: []const u8) ?[]const u
 
 fn testHTTPHandler(req: *std.http.Server.Request) !void {
     const path = req.head.target;
+
+    // Solver-service stand-ins for `CaptchaSolver`. Each vendor segment
+    // replays the exact envelope its real API returns: the three services
+    // share the Anti-Captcha protocol but disagree on the JSON *type* of a
+    // task id and on which key holds the solved token, which is precisely
+    // what the one client has to stay compatible with.
+    if (std.mem.startsWith(u8, path, "/captcha/")) {
+        const json_headers = [_]std.http.Header{
+            .{ .name = "Content-Type", .value = "application/json" },
+        };
+        const rest = path["/captcha/".len..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse
+            return req.respond("", .{ .status = .not_found });
+        const vendor = rest[0..slash];
+        const action = rest[slash + 1 ..];
+
+        if (std.mem.eql(u8, vendor, "badkey")) {
+            return req.respond(
+                \\{"errorId":1,"errorCode":"ERROR_KEY_DOES_NOT_EXIST","errorDescription":"Account authorization key not found in the system"}
+            , .{ .extra_headers = &json_headers });
+        }
+
+        // CapSolver issues uuid strings; Anti-Captcha and 2Captcha integers.
+        const uuid_ids = std.mem.eql(u8, vendor, "capsolver");
+        const uuid_task = "6f4e2b1a-9c33-4d21-8b70-2f5a1e0d7c48";
+
+        if (std.mem.eql(u8, action, "createTask")) {
+            return req.respond(if (uuid_ids)
+                "{\"errorId\":0,\"taskId\":\"" ++ uuid_task ++ "\"}"
+            else
+                "{\"errorId\":0,\"taskId\":75190409079}", .{ .extra_headers = &json_headers });
+        }
+
+        if (std.mem.eql(u8, action, "getTaskResult")) {
+            var body_buf: [4096]u8 = undefined;
+            const body = if (req.head.method.requestHasBody())
+                try req.readerExpectNone(&body_buf).allocRemaining(arena_allocator, .limited(body_buf.len))
+            else
+                "";
+            // The id must go back out as the same JSON type it came in as: a
+            // uuid quoted, an integer bare. Re-sending an integer id as a
+            // string is the compatibility break this endpoint exists to catch,
+            // and the real services answer it with exactly this error.
+            const expected = if (uuid_ids)
+                "\"taskId\":\"" ++ uuid_task ++ "\""
+            else
+                "\"taskId\":75190409079";
+            if (std.mem.indexOf(u8, body, expected) == null) {
+                return req.respond(
+                    \\{"errorId":16,"errorCode":"ERROR_NO_SUCH_CAPCHA_ID","errorDescription":"taskId lost its JSON type in the round trip"}
+                , .{ .extra_headers = &json_headers });
+            }
+
+            if (std.mem.eql(u8, vendor, "pending")) {
+                return req.respond(
+                    \\{"errorId":0,"status":"processing"}
+                , .{ .extra_headers = &json_headers });
+            }
+
+            // Anti-Captcha returns reCAPTCHA tokens under gRecaptchaResponse;
+            // the other two use `token` for every captcha type.
+            return req.respond(if (std.mem.eql(u8, vendor, "anticaptcha"))
+                \\{"errorId":0,"status":"ready","solution":{"gRecaptchaResponse":"ANTICAPTCHA-TOKEN-0001"}}
+            else if (uuid_ids)
+                \\{"errorId":0,"status":"ready","solution":{"token":"CAPSOLVER-TOKEN-0002"}}
+            else
+                \\{"errorId":0,"status":"ready","solution":{"token":"TWOCAPTCHA-TOKEN-0003"}}
+            , .{ .extra_headers = &json_headers });
+        }
+
+        return req.respond("", .{ .status = .not_found });
+    }
 
     if (std.mem.eql(u8, path, "/xhr")) {
         return req.respond("1234567890" ** 10, .{

@@ -86,6 +86,10 @@ pub const driver_guidance =
     \\- After a navigation, treat the user's follow-up questions as being
     \\  about the currently-loaded page unless they explicitly point
     \\  elsewhere.
+    \\- If a page exposes a Turnstile, reCAPTCHA, or hCaptcha widget, call
+    \\  `solveCaptchas` once before declaring the page blocked. Do not loop it:
+    \\  service solves are billed. A full-page Cloudflare interstitial is not
+    \\  a supported widget; report that limitation literally.
     \\
     \\Page loading: `goto` and url-reads return at the `load` event — a fast
     \\snapshot. Content rendered by post-load JavaScript (feeds, search results,
@@ -564,8 +568,8 @@ pub const Tool = enum {
                 ),
             },
             .solveCaptchas => .{
-                .description = "Drive a managed Cloudflare Turnstile challenge on the current page: click the challenge checkbox and wait for a token. Only useful when a read shows a Turnstile widget or an interstitial \"Verifying you are human\" page — it does nothing on ordinary pages and returns promptly there. Does NOT solve image/visual puzzles.",
-                .summary = "Solve a managed Cloudflare Turnstile challenge",
+                .description = "Solve a CAPTCHA widget on the current page. Managed Cloudflare Turnstile is always handled locally by clicking its widget and waiting for a token. CAPSOLVER_API_KEY adds outsourced reCAPTCHA v2; TWOCAPTCHA_API_KEY or ANTICAPTCHA_API_KEY also adds hCaptcha. Writes a service token into the page and fires its declared callback. Returns promptly on ordinary pages. Does not clear a full-page \"Verifying you are human\" interstitial.",
+                .summary = "Solve a supported CAPTCHA widget",
                 .input_schema = minify(
                     \\{
                     \\  "type": "object",
@@ -1752,7 +1756,7 @@ fn execWaitForState(arena: std.mem.Allocator, session: *lp.Session, arguments: ?
 // Unlike the CDP command (which arms a scheduler task so the shared loop keeps
 // serving), a tool call IS the unit of work for MCP/agent — the caller is
 // waiting on this one result, so it blocks like `waitForState` does. Bounded by
-// `timeout`, and `solveTurnstile` bails out early on a page with no widget.
+// `timeout`, and the runner bails out early on a page with no supported widget.
 fn execSolveCaptchas(arena: std.mem.Allocator, session: *lp.Session, arguments: ?std.json.Value) ToolError![]const u8 {
     const Params = struct {
         timeout: ?u32 = null,
@@ -1772,7 +1776,7 @@ fn execSolveCaptchas(arena: std.mem.Allocator, session: *lp.Session, arguments: 
     return switch (result) {
         .solved => "Captcha solved: token acquired.",
         .no_widget => "No captcha on this page: nothing to solve.",
-        .timeout => "Captcha not solved before the timeout. The widget may need a visual puzzle this browser cannot solve, or a longer timeout.",
+        .timeout => "Captcha not solved before the timeout. Configure a supported solver-service key for visual challenges, or retry with a longer timeout.",
     };
 }
 

@@ -196,7 +196,12 @@ pub fn hasWidget(session: *Session) bool {
 fn frameHasWidget(frame: *Frame) bool {
     if (isChallengeFrame(frame)) return true;
     if (queryOne(frame, ".cf-turnstile") != null) return true;
-    if (queryOne(frame, "[data-sitekey]") != null) return true;
+    // Deliberately NOT a bare `[data-sitekey]`: reCAPTCHA and hCaptcha use that
+    // same attribute, but every click target and the token poll below are
+    // Cloudflare-shaped, so matching it engaged the solver on widgets it can
+    // never drive and burned the whole wait budget before reporting `.timeout`.
+    // Turnstile's implicit render requires `.cf-turnstile`, and its explicit
+    // one produces the iframe matched below, so nothing real is lost.
     if (queryOne(frame, "iframe[src*='turnstile']") != null) return true;
     if (queryOne(frame, "iframe[src*='challenges.cloudflare.com']") != null) return true;
     for (frame.child_frames.items) |child| {
@@ -223,7 +228,7 @@ pub const AutoSolve = struct {
     pub const default_timeout_ms: u32 = 30_000;
 
     /// Arm the solver for a freshly loaded main frame. No-op unless
-    /// `--solve-captchas` (or `--stealth`) is on.
+    /// `--solve-captchas` is on (the default unless `--no-stealth` is used).
     pub fn start(frame: *Frame) void {
         if (frame._session.browser.app.config.solveCaptchas() == false) return;
         arm(frame, default_timeout_ms);

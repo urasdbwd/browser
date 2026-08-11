@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<!--
+reCAPTCHA v2-shaped page. Never talks to Google: the container carries the
+sitekey and callback name a real widget would, and the response textarea is
+already present because the real widget creates it at render time.
+-->
+<title>recaptcha fixture</title>
+<div class="g-recaptcha"
+     data-sitekey="6Le-wvkSAAAAAPBMRTvw0Q4Muexq9bi0DJwx_mJ-"
+     data-callback="onCaptchaSolved"></div>
+<textarea id="g-recaptcha-response" name="g-recaptcha-response" style="display:none"></textarea>
+<script>
+  // A site that gates its submit button on the callback rather than on the
+  // hidden field. Injection has to reach both.
+  window.__captcha_callback = null;
+  function onCaptchaSolved(token) {
+    window.__captcha_callback = token;
+  }
+</script>

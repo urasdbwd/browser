@@ -1,5 +1,15 @@
 <!DOCTYPE html>
 <script src="../testing.js"></script>
+
+<script id=offsetCoordinates>
+  {
+    const evt = new MouseEvent('click', { clientX: 12, clientY: 34 });
+    testing.expectEqual(12, evt.offsetX);
+    testing.expectEqual(34, evt.offsetY);
+    testing.expectEqual(true, !!Object.getOwnPropertyDescriptor(MouseEvent.prototype, 'offsetX').get);
+    testing.expectEqual(true, !!Object.getOwnPropertyDescriptor(MouseEvent.prototype, 'offsetY').get);
+  }
+</script>
 <script id=default>
   let event = new MouseEvent('click');
   testing.expectEqual('click', event.type);

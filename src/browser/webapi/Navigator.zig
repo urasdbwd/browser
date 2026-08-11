@@ -87,13 +87,7 @@ pub fn getAppVersion(self: *const Navigator, exec: *const Execution) ![]const u8
     if (!std.mem.startsWith(u8, user_agent, "Mozilla/5.0 (")) {
         return "";
     }
-
-    const trail = user_agent[prefix.len..];
-    if (std.mem.startsWith(u8, trail, "5.0 (Windows")) {
-        return "5.0 (Windows)";
-    }
-    const separator = std.mem.indexOfScalar(u8, trail, ';') orelse return trail;
-    return std.mem.concat(exec.js.local.?.call_arena, u8, &.{ trail[0..separator], ")" });
+    return user_agent[prefix.len..];
 }
 
 pub fn getLanguage(_: *const Navigator, exec: *const Execution) []const u8 {
@@ -219,6 +213,25 @@ pub fn getGamepads(_: *const Navigator) [4]?u8 {
     return .{ null, null, null, null };
 }
 
+/// Web Share. Chrome desktop ships both members, and their absence is a
+/// headless tell in its own right (CreepJS counts `noWebShare`).
+///
+/// `share` rejects rather than pretending to have opened a share sheet: with
+/// no transient user activation that is exactly what Chrome does, so callers
+/// take the same fallback branch they take on a real desktop.
+pub fn canShare(_: *const Navigator, data: ?js.Value) bool {
+    const value = data orelse return false;
+    return value.isObject();
+}
+
+pub fn share(self: *const Navigator, data: ?js.Value, exec: *const Execution) js.Promise {
+    const local = exec.js.local.?;
+    if (self.canShare(data) == false) {
+        return local.rejectPromise(.{ .type_error = "Invalid share data" });
+    }
+    return local.rejectPromise(.{ .dom_exception = .{ .err = error.NotAllowedError } });
+}
+
 pub fn getModelContext(_: *const Navigator, frame: *Frame) *ModelContext {
     return &frame.window._model_context;
 }
@@ -320,7 +333,13 @@ pub const JsApi = struct {
     pub const globalPrivacyControl = bridge.accessor(Navigator.getGlobalPrivacyControl, null, .{});
 
     pub const javaEnabled = bridge.function(Navigator.javaEnabled, .{ .exposed = .window });
-    pub const sendBeacon = bridge.function(Navigator.sendBeacon, .{ .exposed = .window, .noop = true });
+    pub const share = bridge.function(Navigator.share, .{ .exposed = .window });
+    pub const canShare = bridge.function(Navigator.canShare, .{ .exposed = .window });
+    // Not `.noop`: that returns undefined, and callers branch on the boolean
+    // (`if (!navigator.sendBeacon(...)) fallbackToSyncXHR()`), so a missing
+    // return value sends them down a fallback path for a beacon that was in
+    // fact accepted.
+    pub const sendBeacon = bridge.function(Navigator.sendBeacon, .{ .exposed = .window });
     pub const permissions = bridge.accessor(Navigator.getPermissions, null, .{});
     pub const storage = bridge.accessor(Navigator.getStorage, null, .{});
     pub const userAgentData = bridge.accessor(Navigator.getUserAgentData, null, .{});

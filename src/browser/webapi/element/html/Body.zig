@@ -93,6 +93,18 @@ pub fn setOnScroll(self: *Body, setter: ?Window.FunctionSetter, frame: *Frame) !
     self.reflectedWindow(frame)._on_scroll = Window.getFunctionFromSetter(setter);
 }
 
+fn getEmpty(_: *const Body) []const u8 {
+    return "";
+}
+
+fn setValue(_: *Body, _: js.Value) void {}
+
+fn getNullEvent(_: *const Body) ?js.Function.Global {
+    return null;
+}
+
+fn setNullEvent(_: *Body, _: ?Window.FunctionSetter) void {}
+
 pub const JsApi = struct {
     pub const bridge = js.Bridge(Body);
 
@@ -102,12 +114,36 @@ pub const JsApi = struct {
         pub var class_id: bridge.ClassId = undefined;
     };
 
-    pub const onblur = bridge.accessor(getOnBlur, setOnBlur, .{ .null_as_undefined = false });
-    pub const onerror = bridge.accessor(getOnError, setOnError, .{ .null_as_undefined = false });
-    pub const onfocus = bridge.accessor(getOnFocus, setOnFocus, .{ .null_as_undefined = false });
-    pub const onload = bridge.accessor(getOnLoad, setOnLoad, .{ .null_as_undefined = false });
-    pub const onresize = bridge.accessor(getOnResize, setOnResize, .{ .null_as_undefined = false });
-    pub const onscroll = bridge.accessor(getOnScroll, setOnScroll, .{ .null_as_undefined = false });
+    pub const text = bridge.accessor(Body.getEmpty, Body.setValue, .{});
+    pub const link = bridge.accessor(Body.getEmpty, Body.setValue, .{});
+    pub const vLink = bridge.accessor(Body.getEmpty, Body.setValue, .{});
+    pub const aLink = bridge.accessor(Body.getEmpty, Body.setValue, .{});
+    pub const bgColor = bridge.accessor(Body.getEmpty, Body.setValue, .{});
+    pub const background = bridge.accessor(Body.getEmpty, Body.setValue, .{});
+    pub const onblur = bridge.accessor(Body.getOnBlur, Body.setOnBlur, .{ .null_as_undefined = false });
+    pub const onerror = bridge.accessor(Body.getOnError, Body.setOnError, .{ .null_as_undefined = false });
+    pub const onfocus = bridge.accessor(Body.getOnFocus, Body.setOnFocus, .{ .null_as_undefined = false });
+    pub const onload = bridge.accessor(Body.getOnLoad, Body.setOnLoad, .{ .null_as_undefined = false });
+    pub const onresize = bridge.accessor(Body.getOnResize, Body.setOnResize, .{ .null_as_undefined = false });
+    pub const onscroll = bridge.accessor(Body.getOnScroll, Body.setOnScroll, .{ .null_as_undefined = false });
+    pub const onafterprint = bridge.accessor(Body.getNullEvent, Body.setNullEvent, .{});
+    pub const onbeforeprint = bridge.accessor(Body.getNullEvent, Body.setNullEvent, .{});
+    pub const onbeforeunload = bridge.accessor(Body.getNullEvent, Body.setNullEvent, .{});
+    pub const onhashchange = bridge.accessor(Body.getNullEvent, Body.setNullEvent, .{});
+    pub const onlanguagechange = bridge.accessor(Body.getNullEvent, Body.setNullEvent, .{});
+    pub const onmessage = bridge.accessor(Body.getNullEvent, Body.setNullEvent, .{});
+    pub const onmessageerror = bridge.accessor(Body.getNullEvent, Body.setNullEvent, .{});
+    pub const onoffline = bridge.accessor(Body.getNullEvent, Body.setNullEvent, .{});
+    pub const ononline = bridge.accessor(Body.getNullEvent, Body.setNullEvent, .{});
+    pub const onpagehide = bridge.accessor(Body.getNullEvent, Body.setNullEvent, .{});
+    pub const onpageshow = bridge.accessor(Body.getNullEvent, Body.setNullEvent, .{});
+    pub const onpopstate = bridge.accessor(Body.getNullEvent, Body.setNullEvent, .{});
+    pub const onrejectionhandled = bridge.accessor(Body.getNullEvent, Body.setNullEvent, .{});
+    pub const onstorage = bridge.accessor(Body.getNullEvent, Body.setNullEvent, .{});
+    pub const onunhandledrejection = bridge.accessor(Body.getNullEvent, Body.setNullEvent, .{});
+    pub const onunload = bridge.accessor(Body.getNullEvent, Body.setNullEvent, .{});
+    pub const ongamepadconnected = bridge.accessor(Body.getNullEvent, Body.setNullEvent, .{});
+    pub const ongamepaddisconnected = bridge.accessor(Body.getNullEvent, Body.setNullEvent, .{});
 };
 
 pub const Build = struct {

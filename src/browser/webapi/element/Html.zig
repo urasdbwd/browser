@@ -26,6 +26,7 @@ const Factory = @import("../../Factory.zig");
 const Frame = @import("../../Frame.zig");
 const Node = @import("../Node.zig");
 const Element = @import("../Element.zig");
+const CSSStyleProperties = @import("../css/CSSStyleProperties.zig");
 const global_event_handlers = @import("../global_event_handlers.zig");
 
 const popover = @import("popover.zig");
@@ -1803,6 +1804,14 @@ pub const JsApi = struct {
 
     pub const constructor = bridge.constructor(HtmlElement.construct, .{ .new_target = true });
     pub const upgrade_constructor = bridge.constructor(HtmlElement.upgradeConstruct, .{});
+
+    pub const style = bridge.accessor(_style, _setStyle, .{});
+    fn _style(self: *HtmlElement, frame: *Frame) !*CSSStyleProperties {
+        return self.asElement().getOrCreateStyle(frame);
+    }
+    fn _setStyle(self: *HtmlElement, value: []const u8, frame: *Frame) !void {
+        return self.asElement().setStyle(value, frame);
+    }
 
     pub const innerText = bridge.accessor(_innerText, _setInnerText, .{ .ce_reactions = true });
     fn _innerText(self: *HtmlElement, frame: *Frame) ![]const u8 {

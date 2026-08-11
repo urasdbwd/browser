@@ -23,6 +23,7 @@ const Frame = @import("../../Frame.zig");
 
 const Node = @import("../Node.zig");
 const Element = @import("../Element.zig");
+const CSSStyleProperties = @import("../css/CSSStyleProperties.zig");
 const Factory = @import("../../Factory.zig");
 const AnimatedString = @import("../svg/AnimatedString.zig");
 pub const Generic = @import("svg/Generic.zig");
@@ -149,6 +150,14 @@ pub const JsApi = struct {
     pub const className = bridge.accessor(_className, null, .{});
     fn _className(self: *Svg, frame: *Frame) !*AnimatedString {
         return AnimatedString.getOrCreate(self.asElement(), .class, frame);
+    }
+
+    pub const style = bridge.accessor(_style, _setStyle, .{});
+    fn _style(self: *Svg, frame: *Frame) !*CSSStyleProperties {
+        return self.asElement().getOrCreateStyle(frame);
+    }
+    fn _setStyle(self: *Svg, value: []const u8, frame: *Frame) !void {
+        return self.asElement().setStyle(value, frame);
     }
 
     pub const ownerSVGElement = bridge.accessor(Svg.getOwnerSvgElement, null, .{});

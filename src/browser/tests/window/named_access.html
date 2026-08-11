@@ -5,12 +5,19 @@
 <div id=testDiv></div>
 <span id=mySpan></span>
 <p id=paragraph></p>
+<iframe name=namedFrame></iframe>
 
 <script id=named_access_global>
   testing.expectEqual('i', i.id);
   testing.expectEqual('testDiv',testDiv.id);
   testing.expectEqual('mySpan', mySpan.id);
   testing.expectEqual('paragraph', paragraph.id);
+</script>
+
+<script id=named_access_frame>
+  testing.expectEqual('namedFrame', namedFrame.name);
+  testing.expectEqual(namedFrame, frames.namedFrame);
+  testing.expectEqual(namedFrame, namedFrame.eval('parent.frames.namedFrame'));
 </script>
 
 <script id=named_access_window>

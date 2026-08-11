@@ -326,6 +326,12 @@ pub fn getLocation(self: *WorkerGlobalScope) *WorkerLocation {
     return &self._location;
 }
 
+/// A worker's secure context follows the script it was loaded from, which is
+/// same-origin with the parent frame by construction.
+pub fn getIsSecureContext(self: *const WorkerGlobalScope) bool {
+    return URL.isPotentiallyTrustworthy(self._location._url);
+}
+
 pub fn getCookieStore(self: *WorkerGlobalScope) !*CookieStore {
     if (self._cookie_store) |cs| return cs;
     const cs = try self._factory.eventTargetWithAllocator(self.arena, CookieStore{ ._proto = undefined });
@@ -639,6 +645,5 @@ pub const JsApi = struct {
     pub const setInterval = bridge.function(WorkerGlobalScope.setInterval, .{});
     pub const clearInterval = bridge.function(WorkerGlobalScope.clearInterval, .{});
 
-    // Return false since workers don't have secure-context-only APIs
-    pub const isSecureContext = bridge.property(false, .{ .template = false });
+    pub const isSecureContext = bridge.accessor(WorkerGlobalScope.getIsSecureContext, null, .{});
 };

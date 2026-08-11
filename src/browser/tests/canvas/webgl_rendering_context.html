@@ -131,7 +131,7 @@
   ctx.readPixels(2, 3, 4, 4, RGBA, ctx.UNSIGNED_BYTE, c);
   testing.expectEqual(false, a.join() === c.join());
 
-  // Without --stealth / --fingerprint there is no profile and toDataURL keeps
+  // With --no-stealth and no --fingerprint there is no profile and toDataURL keeps
   // the honest "data:," (see Canvas.toDataURL); with a profile it is a real
   // PNG, never a blank one. Either way it has to be stable across calls.
   const url = element.toDataURL();

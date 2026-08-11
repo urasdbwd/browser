@@ -22,7 +22,7 @@ test -x "$BIN" || { echo "no such binary: $BIN" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "python3 required" >&2; exit 1; }
 
 exec python3 - "$BIN" "$COUNTS" <<'PY'
-import base64, json, os, re, socket, struct, subprocess, sys, tempfile, threading, time
+import base64, json, os, re, resource, socket, struct, subprocess, sys, tempfile, threading, time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 BIN, COUNTS = sys.argv[1], [int(c) for c in sys.argv[2].split()]
@@ -188,6 +188,8 @@ next_port = [9600 + (os.getpid() % 150)]
 
 def measure(n):
     """Peak steady-state RSS of one server hosting n concurrent loaded sessions."""
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu_before = usage.ru_utime + usage.ru_stime
     # A fresh port per measurement: the previous server's listener can still be
     # in TIME_WAIT when the next one starts.
     port = next_port[0]
@@ -215,10 +217,12 @@ def measure(n):
             except Exception as e:  # noqa: BLE001 - reported, not swallowed
                 errs.append(e)
         threads = [threading.Thread(target=run, args=(i,)) for i in range(n)]
+        load_started = time.perf_counter()
         for t in threads:
             t.start()
         for t in threads:
             t.join()
+        load_ms = (time.perf_counter() - load_started) * 1000
         if errs:
             raise errs[0]
 
@@ -226,7 +230,7 @@ def measure(n):
         loaded = rss_mib(srv.pid)
         for ws in sessions:
             ws.s.close()
-        return idle, loaded
+        result = idle, loaded, load_ms
     finally:
         srv.terminate()
         try:
@@ -234,14 +238,20 @@ def measure(n):
         except subprocess.TimeoutExpired:
             srv.kill()
 
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu_ms = (usage.ru_utime + usage.ru_stime - cpu_before) * 1000
+    return result + (cpu_ms,)
+
 
 print("binary        %s" % BIN)
-print("%8s %10s %10s %12s" % ("sessions", "idle MiB", "RSS MiB", "delta MiB"))
+print("%8s %10s %10s %12s %10s %10s" %
+      ("sessions", "idle MiB", "RSS MiB", "delta MiB", "load ms", "CPU ms"))
 pts = []
 for n in COUNTS:
-    idle, loaded = measure(n)
+    idle, loaded, load_ms, cpu_ms = measure(n)
     pts.append((n, loaded))
-    print("%8d %10.1f %10.1f %12.1f" % (n, idle, loaded, loaded - idle))
+    print("%8d %10.1f %10.1f %12.1f %10.0f %10.0f" %
+          (n, idle, loaded, loaded - idle, load_ms, cpu_ms))
 
 # Least-squares fit over all points: RSS = fixed + marginal * sessions. The
 # slope is the number that decides how many sessions fit; the intercept is what

@@ -147,6 +147,85 @@ pub fn asEventTarget(self: *Document) *@import("EventTarget.zig") {
     return self._proto.asEventTarget();
 }
 
+pub fn getBody(self: *Document) ?*Element.Html.Body {
+    const html = self.is(HTMLDocument) orelse return null;
+    return html.getBody();
+}
+
+pub fn setBody(self: *Document, value: []const u8, frame: *Frame) !void {
+    const html = self.is(HTMLDocument) orelse return error.HierarchyError;
+    return html.setBody(value, frame);
+}
+
+pub fn getCurrentScript(self: *const Document) ?*Element.Html.Script {
+    return self._current_script;
+}
+
+pub fn getHead(self: *Document) ?*Element {
+    const html = self.is(HTMLDocument) orelse return null;
+    return html.getHead();
+}
+
+pub fn getTitle(self: *Document, frame: *Frame) ![]const u8 {
+    const html = self.is(HTMLDocument) orelse return "";
+    return html.getTitle(frame);
+}
+
+pub fn setTitle(self: *Document, value: []const u8, frame: *Frame) !void {
+    const html = self.is(HTMLDocument) orelse return;
+    return html.setTitle(value, frame);
+}
+
+pub fn getDir(self: *Document) []const u8 {
+    const html = self.is(HTMLDocument) orelse return "";
+    return html.getDir();
+}
+
+pub fn setDir(self: *Document, value: []const u8, frame: *Frame) !void {
+    const html = self.is(HTMLDocument) orelse return;
+    return html.setDir(value, frame);
+}
+
+pub fn getImages(self: *Document, frame: *Frame) !collections.NodeLive(.tag) {
+    const html = self.is(HTMLDocument) orelse return collections.NodeLive(.tag).init(self.asNode(), .img, frame);
+    return html.getImages(frame);
+}
+
+pub fn getScripts(self: *Document, frame: *Frame) !collections.NodeLive(.tag) {
+    const html = self.is(HTMLDocument) orelse return collections.NodeLive(.tag).init(self.asNode(), .script, frame);
+    return html.getScripts(frame);
+}
+
+pub fn getLinks(self: *Document, frame: *Frame) !collections.NodeLive(.links) {
+    const html = self.is(HTMLDocument) orelse return collections.NodeLive(.links).init(self.asNode(), {}, frame);
+    return html.getLinks(frame);
+}
+
+pub fn getAnchors(self: *Document, frame: *Frame) !collections.NodeLive(.anchors) {
+    const html = self.is(HTMLDocument) orelse return collections.NodeLive(.anchors).init(self.asNode(), {}, frame);
+    return html.getAnchors(frame);
+}
+
+pub fn getForms(self: *Document, frame: *Frame) !collections.NodeLive(.tag) {
+    const html = self.is(HTMLDocument) orelse return collections.NodeLive(.tag).init(self.asNode(), .form, frame);
+    return html.getForms(frame);
+}
+
+pub fn getEmbeds(self: *Document, frame: *Frame) !collections.NodeLive(.tag) {
+    const html = self.is(HTMLDocument) orelse return collections.NodeLive(.tag).init(self.asNode(), .embed, frame);
+    return html.getEmbeds(frame);
+}
+
+pub fn getApplets(self: *Document, frame: *Frame) !*collections.HTMLCollection {
+    const html = self.is(HTMLDocument) orelse return frame._factory.create(collections.HTMLCollection{ ._data = .empty });
+    return html.getApplets(frame);
+}
+
+pub fn getAll(self: *Document, frame: *Frame) !*collections.HTMLAllCollection {
+    const html = self.is(HTMLDocument) orelse return frame._factory.create(collections.HTMLAllCollection.init(self.asNode(), frame));
+    return html.getAll(frame);
+}
+
 pub fn getURL(self: *const Document, frame: *const Frame) [:0]const u8 {
     return self._url orelse (self._frame orelse frame).url;
 }
@@ -1516,6 +1595,20 @@ pub const JsApi = struct {
     pub const location = bridge.accessor(Document.getLocation, Document.setLocation, .{});
     pub const documentURI = bridge.accessor(Document.getURL, null, .{});
     pub const documentElement = bridge.accessor(Document.getDocumentElement, null, .{});
+    pub const dir = bridge.accessor(Document.getDir, Document.setDir, .{ .ce_reactions = true });
+    pub const head = bridge.accessor(Document.getHead, null, .{});
+    pub const body = bridge.accessor(Document.getBody, Document.setBody, .{ .ce_reactions = true });
+    pub const title = bridge.accessor(Document.getTitle, Document.setTitle, .{ .ce_reactions = true });
+    pub const images = bridge.accessor(Document.getImages, null, .{});
+    pub const scripts = bridge.accessor(Document.getScripts, null, .{});
+    pub const links = bridge.accessor(Document.getLinks, null, .{});
+    pub const anchors = bridge.accessor(Document.getAnchors, null, .{});
+    pub const forms = bridge.accessor(Document.getForms, null, .{});
+    pub const embeds = bridge.accessor(Document.getEmbeds, null, .{});
+    pub const plugins = bridge.accessor(Document.getEmbeds, null, .{});
+    pub const applets = bridge.accessor(Document.getApplets, null, .{});
+    pub const currentScript = bridge.accessor(Document.getCurrentScript, null, .{});
+    pub const all = bridge.accessor(Document.getAll, null, .{});
     pub const scrollingElement = bridge.accessor(Document.getDocumentElement, null, .{});
     pub const children = bridge.accessor(Document.getChildren, null, .{});
     pub const readyState = bridge.accessor(Document.getReadyState, null, .{});
@@ -1577,8 +1670,16 @@ pub const JsApi = struct {
     pub const lastElementChild = bridge.accessor(Document.getLastElementChild, null, .{});
     pub const childElementCount = bridge.accessor(Document.getChildElementCount, null, .{});
     pub const adoptedStyleSheets = bridge.accessor(Document.getAdoptedStyleSheets, Document.setAdoptedStyleSheets, .{});
-    pub const hidden = bridge.property(false, .{ .template = false, .readonly = true });
-    pub const visibilityState = bridge.property("visible", .{ .template = false, .readonly = true });
+    pub const hidden = bridge.accessor(struct {
+        fn get(_: *const Document) bool {
+            return false;
+        }
+    }.get, null, .{});
+    pub const visibilityState = bridge.accessor(struct {
+        fn get(_: *const Document) []const u8 {
+            return "visible";
+        }
+    }.get, null, .{});
     pub const defaultView = bridge.accessor(struct {
         fn defaultView(self: *const Document) ?*@import("Window.zig") {
             const frame = self._frame orelse return null;
@@ -1587,7 +1688,11 @@ pub const JsApi = struct {
     }.defaultView, null, .{});
     pub const hasFocus = bridge.function(Document.hasFocus, .{});
 
-    pub const prerendering = bridge.property(false, .{ .template = false });
+    pub const prerendering = bridge.accessor(struct {
+        fn get(_: *const Document) bool {
+            return false;
+        }
+    }.get, null, .{});
     pub const characterSet = bridge.accessor(getCharacterSet, null, .{});
     pub const charset = bridge.accessor(getCharacterSet, null, .{});
     pub const inputEncoding = bridge.accessor(getCharacterSet, null, .{});
@@ -1596,7 +1701,11 @@ pub const JsApi = struct {
     fn getCharacterSet(self: *const Document) []const u8 {
         return self.getCharset();
     }
-    pub const referrer = bridge.property("", .{ .template = false });
+    pub const referrer = bridge.accessor(struct {
+        fn get(_: *const Document) []const u8 {
+            return "";
+        }
+    }.get, null, .{});
 
     // Generates a getter/setter pair backed by the frame's attribute-listener
     // map, like onclick above, for other document event handler properties.

@@ -116,7 +116,7 @@ fn configureLoading(cmd: *CDP.Command) !void {
 // for completion the way you'd poll for any async page state, e.g.
 // `Runtime.evaluate` on the token input, or `LP.waitForSelector`.
 //
-// With `--stealth` / `--solve-captchas` this already runs automatically after
+// With the default identity / `--solve-captchas` this runs automatically after
 // every navigation (see `Frame` load); the command is the explicit opt-in for
 // clients that leave the flag off.
 fn solveCaptchas(cmd: anytype) !void {

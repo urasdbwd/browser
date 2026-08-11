@@ -23,7 +23,7 @@ const js = @import("../js/js.zig");
 /// plugins and two MIME types on every desktop build; an empty navigator.plugins
 /// is one of the oldest headless tells there is.
 pub fn registerTypes() []const type {
-    return &.{ PluginArray, Plugin, MimeTypeArray, MimeType, PluginArray.Iterator, MimeTypeArray.Iterator };
+    return &.{ PluginArray, Plugin, MimeTypeArray, MimeType, PluginArray.Iterator, Plugin.Iterator, MimeTypeArray.Iterator };
 }
 
 const plugin_defs = [_]PluginDef{
@@ -76,10 +76,32 @@ fn mimesStorage() *[mime_defs.len]MimeType {
             for (&arr, mime_defs, 0..) |*m, def, i| {
                 m.* = .{
                     ._index = i,
+                    ._plugin_index = 0,
                     ._type = def.type_name,
                     ._suffixes = def.suffixes,
                     ._description = def.description,
                 };
+            }
+            break :blk arr;
+        };
+    };
+    return &S.storage;
+}
+
+fn pluginMimesStorage() *[plugin_defs.len * mime_defs.len]MimeType {
+    const S = struct {
+        var storage: [plugin_defs.len * mime_defs.len]MimeType = blk: {
+            var arr: [plugin_defs.len * mime_defs.len]MimeType = undefined;
+            for (0..plugin_defs.len) |plugin_index| {
+                for (mime_defs, 0..) |def, mime_index| {
+                    arr[plugin_index * mime_defs.len + mime_index] = .{
+                        ._index = mime_index,
+                        ._plugin_index = plugin_index,
+                        ._type = def.type_name,
+                        ._suffixes = def.suffixes,
+                        ._description = def.description,
+                    };
+                }
             }
             break :blk arr;
         };
@@ -137,8 +159,8 @@ pub const PluginArray = struct {
 
         pub const length = bridge.accessor(PluginArray.getLength, null, .{});
         pub const refresh = bridge.function(PluginArray.refresh, .{});
-        pub const @"[int]" = bridge.indexed(PluginArray.getAtIndex, null, .{ .null_as_undefined = true });
-        pub const @"[str]" = bridge.namedIndexed(PluginArray.getByName, null, null, null, null, .{ .null_as_undefined = true });
+        pub const @"[int]" = bridge.indexedReadWrite(PluginArray.getAtIndex, null, null, queryIndex, getIndexes, .{ .null_as_undefined = true });
+        pub const @"[str]" = bridge.namedIndexed(PluginArray.getByName, null, null, getNames, queryName, .{ .null_as_undefined = true });
         pub const item = bridge.function(_item, .{});
         fn _item(self: *const PluginArray, index: i32) ?*Plugin {
             if (index < 0) return null;
@@ -146,6 +168,28 @@ pub const PluginArray = struct {
         }
         pub const namedItem = bridge.function(PluginArray.getByName, .{});
         pub const symbol_iterator = bridge.iterator(PluginArray.iterator, .{});
+
+        fn getIndexes(_: *const PluginArray, exec: *const js.Execution) !js.Array {
+            return indexArray(plugin_defs.len, exec);
+        }
+
+        fn getNames(_: *const PluginArray, exec: *const js.Execution) !js.Array {
+            var arr = exec.js.local.?.newArray(plugin_defs.len);
+            for (plugin_defs, 0..) |plugin, i| {
+                _ = try arr.set(@intCast(i), plugin.name, .{});
+            }
+            return arr;
+        }
+
+        fn queryName(self: *const PluginArray, key: []const u8) !u32 {
+            if (self.getByName(key) != null) return js.v8.ReadOnly | js.v8.DontEnum;
+            return error.NotHandled;
+        }
+
+        fn queryIndex(_: *const PluginArray, index: u32) !u32 {
+            if (index < plugin_defs.len) return js.v8.ReadOnly;
+            return error.NotHandled;
+        }
     };
 };
 
@@ -171,18 +215,34 @@ pub const Plugin = struct {
         return self._description;
     }
 
-    pub fn getAtIndex(_: *const Plugin, index: usize) ?*MimeType {
-        const storage = mimesStorage();
-        if (index >= storage.len) return null;
-        return &storage[index];
+    pub fn getAtIndex(self: *const Plugin, index: usize) ?*MimeType {
+        if (index >= mime_defs.len) return null;
+        return &pluginMimesStorage()[self._index * mime_defs.len + index];
     }
 
-    pub fn getByName(_: *const Plugin, name: []const u8) ?*MimeType {
-        for (mimesStorage()) |*m| {
+    pub fn getByName(self: *const Plugin, name: []const u8) ?*MimeType {
+        const start = self._index * mime_defs.len;
+        for (pluginMimesStorage()[start .. start + mime_defs.len]) |*m| {
             if (std.mem.eql(u8, m._type, name)) return m;
         }
         return null;
     }
+
+    pub fn iterator(self: *Plugin, exec: *const js.Execution) !*Iterator {
+        return Iterator.init(.{ .index = 0, .plugin = self }, exec);
+    }
+
+    const GenericIterator = @import("collections/iterator.zig").Entry;
+    pub const Iterator = GenericIterator(struct {
+        index: u32,
+        plugin: *Plugin,
+
+        pub fn next(self: *@This(), _: *const js.Execution) ?*MimeType {
+            const mime = self.plugin.getAtIndex(self.index) orelse return null;
+            self.index += 1;
+            return mime;
+        }
+    }, null);
 
     pub const JsApi = struct {
         pub const bridge = js.Bridge(Plugin);
@@ -196,14 +256,37 @@ pub const Plugin = struct {
         pub const filename = bridge.accessor(Plugin.getFilename, null, .{});
         pub const description = bridge.accessor(Plugin.getDescription, null, .{});
         pub const length = bridge.accessor(Plugin.getLength, null, .{});
-        pub const @"[int]" = bridge.indexed(Plugin.getAtIndex, null, .{ .null_as_undefined = true });
-        pub const @"[str]" = bridge.namedIndexed(Plugin.getByName, null, null, null, null, .{ .null_as_undefined = true });
+        pub const @"[int]" = bridge.indexedReadWrite(Plugin.getAtIndex, null, null, queryIndex, getIndexes, .{ .null_as_undefined = true });
+        pub const @"[str]" = bridge.namedIndexed(Plugin.getByName, null, null, getNames, queryName, .{ .null_as_undefined = true });
         pub const item = bridge.function(_item, .{});
         fn _item(self: *const Plugin, index: i32) ?*MimeType {
             if (index < 0) return null;
             return self.getAtIndex(@intCast(index));
         }
         pub const namedItem = bridge.function(Plugin.getByName, .{});
+        pub const symbol_iterator = bridge.iterator(Plugin.iterator, .{});
+
+        fn getIndexes(_: *const Plugin, exec: *const js.Execution) !js.Array {
+            return indexArray(mime_defs.len, exec);
+        }
+
+        fn getNames(_: *const Plugin, exec: *const js.Execution) !js.Array {
+            var arr = exec.js.local.?.newArray(mime_defs.len);
+            for (mime_defs, 0..) |mime, i| {
+                _ = try arr.set(@intCast(i), mime.type_name, .{});
+            }
+            return arr;
+        }
+
+        fn queryName(self: *const Plugin, key: []const u8) !u32 {
+            if (self.getByName(key) != null) return js.v8.ReadOnly | js.v8.DontEnum;
+            return error.NotHandled;
+        }
+
+        fn queryIndex(_: *const Plugin, index: u32) !u32 {
+            if (index < mime_defs.len) return js.v8.ReadOnly;
+            return error.NotHandled;
+        }
     };
 };
 
@@ -253,8 +336,8 @@ pub const MimeTypeArray = struct {
         };
 
         pub const length = bridge.accessor(MimeTypeArray.getLength, null, .{});
-        pub const @"[int]" = bridge.indexed(MimeTypeArray.getAtIndex, null, .{ .null_as_undefined = true });
-        pub const @"[str]" = bridge.namedIndexed(MimeTypeArray.getByName, null, null, null, null, .{ .null_as_undefined = true });
+        pub const @"[int]" = bridge.indexedReadWrite(MimeTypeArray.getAtIndex, null, null, queryIndex, getIndexes, .{ .null_as_undefined = true });
+        pub const @"[str]" = bridge.namedIndexed(MimeTypeArray.getByName, null, null, getNames, queryName, .{ .null_as_undefined = true });
         pub const item = bridge.function(_item, .{});
         fn _item(self: *const MimeTypeArray, index: i32) ?*MimeType {
             if (index < 0) return null;
@@ -262,11 +345,42 @@ pub const MimeTypeArray = struct {
         }
         pub const namedItem = bridge.function(MimeTypeArray.getByName, .{});
         pub const symbol_iterator = bridge.iterator(MimeTypeArray.iterator, .{});
+
+        fn getIndexes(_: *const MimeTypeArray, exec: *const js.Execution) !js.Array {
+            return indexArray(mime_defs.len, exec);
+        }
+
+        fn getNames(_: *const MimeTypeArray, exec: *const js.Execution) !js.Array {
+            var arr = exec.js.local.?.newArray(mime_defs.len);
+            for (mime_defs, 0..) |mime, i| {
+                _ = try arr.set(@intCast(i), mime.type_name, .{});
+            }
+            return arr;
+        }
+
+        fn queryName(self: *const MimeTypeArray, key: []const u8) !u32 {
+            if (self.getByName(key) != null) return js.v8.ReadOnly | js.v8.DontEnum;
+            return error.NotHandled;
+        }
+
+        fn queryIndex(_: *const MimeTypeArray, index: u32) !u32 {
+            if (index < mime_defs.len) return js.v8.ReadOnly;
+            return error.NotHandled;
+        }
     };
 };
 
+fn indexArray(len: u32, exec: *const js.Execution) !js.Array {
+    var arr = exec.js.local.?.newArray(len);
+    for (0..len) |i| {
+        _ = try arr.set(@intCast(i), i, .{});
+    }
+    return arr;
+}
+
 pub const MimeType = struct {
     _index: usize,
+    _plugin_index: usize,
     _type: []const u8,
     _suffixes: []const u8,
     _description: []const u8,
@@ -283,9 +397,9 @@ pub const MimeType = struct {
         return self._description;
     }
 
-    pub fn getEnabledPlugin(_: *const MimeType) ?*Plugin {
+    pub fn getEnabledPlugin(self: *const MimeType) ?*Plugin {
         const storage = pluginsStorage();
-        return if (storage.len == 0) null else &storage[0];
+        return &storage[self._plugin_index];
     }
 
     pub const JsApi = struct {
