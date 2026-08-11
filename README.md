@@ -132,6 +132,23 @@ live WebSocket snapshots are not application-compressed. Outbound private,
 loopback and link-local addresses are blocked by default; use
 `--allow-private-networks` only for a trusted local target.
 
+For max concurrency of independent live virtual browsers, run one lean
+`render` process per live user/session with the `slot` profile:
+
+```console
+./lightpanda render --port 9223 --cors-origin http://localhost:5173 \
+  --resource-profile slot
+```
+
+`slot` keeps the same lean V8 flags and 64 MiB heap as `pi` (lowering the heap
+further does not reduce RSS after `--optimize-for-size`, and risks OOM on
+common SPAs), but budgets the process for a single live slot: 1 render worker,
+2 HTTP connections (live WebSocket plus ticket/healthz headroom) and a 2 MiB
+uncompressed snapshot cap. Idle and client timeouts stay at the pi values.
+Architecture remains one live session per process — do not share a slot process
+across users. While that live session owns the browser, one-shot
+`POST /v1/render` answers 409.
+
 ```html
 <div id="preview" style="height: 720px"></div>
 <script type="module">
@@ -221,7 +238,8 @@ The server owns one V8 isolate and one live session. A second live connection
 cannot take ownership while that session is active; its commands are rejected.
 Reopening on the owning connection, or submitting a valid `POST /v1/render`,
 closes the live session. Run one `render` process per independently concurrent
-user. If an established live WebSocket drops, the client keeps the last painted
+user; for T3/agent pools prefer `--resource-profile slot` so each process stays
+cheap. If an established live WebSocket drops, the client keeps the last painted
 snapshot inert and reopens the Lightpanda session with bounded backoff.
 
 Remote visual resources are blocked by default: the render CSP allows only
@@ -553,6 +571,15 @@ the profile. CDP response-body capture is capped at 8 MiB and 256 entries per
 page lifecycle. MCP defaults to up to 32 memory-capped V8-backed sessions and
 simultaneous HTTP connections, with 4 MiB request/response buffers per
 connection.
+
+A third profile, `slot`, is for many concurrent one-live-session processes
+(especially `lightpanda render`). It inherits `pi`'s lean V8 settings and
+tightens process concurrency to 1 render worker, 2 connections and a 2 MiB
+snapshot cap:
+
+```bash
+./zig-out/bin/lightpanda render --resource-profile slot --cors-origin https://app.example
+```
 
 Lightpanda is headless: it does not rasterize pixels or produce screenshots on
 the server. DOM and JavaScript run in the browser process; page data is

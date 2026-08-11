@@ -45,9 +45,15 @@ const Config = @This();
 /// lower retained memory and bounded major defaults; clients can still opt
 /// individual features back in through LP.configureLoading after a CDP
 /// session is created.
+///
+/// `slot` keeps the same lean V8 flags and heap floor as `pi`, but concurrency
+/// defaults assume one live virtual-browser process rather than a shared
+/// multi-session server. Use it when scaling out with many one-session
+/// processes (T3 / agent pools).
 pub const ResourceProfile = enum {
     standard,
     pi,
+    slot,
 };
 
 /// Marginal RSS a concurrent `serve` session adds to the process. Deriving the
@@ -573,6 +579,15 @@ pub fn resourceProfile(self: *const Config) ResourceProfile {
     };
 }
 
+/// `pi` and `slot` share the lean V8/network defaults. `slot` additionally
+/// tightens process-level concurrency for dedicated one-session processes.
+pub fn leanProfile(self: *const Config) bool {
+    return switch (self.resourceProfile()) {
+        .pi, .slot => true,
+        .standard => false,
+    };
+}
+
 /// Render-handoff mode deliberately leaves CSS parsing, layout and paint to
 /// the attached real browser.
 pub fn clientSideRendering(self: *const Config) bool {
@@ -612,9 +627,9 @@ pub fn disableWorkers(self: *const Config) bool {
 pub fn watchdogMs(self: *const Config) ?u32 {
     return switch (self.mode) {
         inline .serve, .fetch, .render, .mcp, .agent => |opts| {
-            var default_ms: u32 = if (self.resourceProfile() == .pi) 10_000 else 30_000;
-            // A managed Turnstile solve runs for tens of seconds; the `pi`
-            // profile's 10s default would kill it mid-flight. Raise the floor
+            var default_ms: u32 = if (self.leanProfile()) 10_000 else 30_000;
+            // A managed Turnstile solve runs for tens of seconds; the lean
+            // profiles' 10s default would kill it mid-flight. Raise the floor
             // rather than disarming — an explicit --watchdog-ms still wins.
             if (self.solveCaptchas()) default_ms = @max(default_ms, 30_000);
             const ms = opts.watchdog_ms orelse default_ms;
@@ -668,34 +683,39 @@ pub const pi_v8_flags = "--optimize-for-size --no-concurrent-recompilation";
 
 pub fn v8ProfileFlags(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .render, .mcp, .agent => if (self.resourceProfile() == .pi) pi_v8_flags else null,
+        inline .serve, .fetch, .render, .mcp, .agent => if (self.leanProfile()) pi_v8_flags else null,
         else => null,
     };
 }
 
 pub fn v8MaxHeapMb(self: *const Config) ?u32 {
     return switch (self.mode) {
+        // Keep 64 MiB for both lean profiles. Sweeping --v8-max-heap-mb down to
+        // 16 (see pi_v8_flags notes above) does not reduce peak RSS after
+        // --optimize-for-size — V8 still holds snapshot + isolate + code — and
+        // a lower growth cap OOMs common SPAs that a slot process is meant to
+        // host. Operators can still pass --v8-max-heap-mb explicitly.
         inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.v8_max_heap_mb orelse
-            if (self.resourceProfile() == .pi) 64 else null,
+            if (self.leanProfile()) 64 else null,
         else => unreachable,
     };
 }
 
 pub fn speculativePreloading(self: *const Config) bool {
-    return self.resourceProfile() != .pi;
+    return !self.leanProfile();
 }
 
 pub fn v8ThreadPoolSize(self: *const Config) u8 {
     return switch (self.mode) {
         inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.v8_thread_pool_size orelse
-            if (self.resourceProfile() == .pi) 1 else 0,
+            if (self.leanProfile()) 1 else 0,
         else => unreachable,
     };
 }
 
 pub fn v8IdleTasks(self: *const Config) bool {
     return switch (self.mode) {
-        inline .serve, .fetch, .render, .mcp, .agent => |opts| !opts.disable_v8_idle_tasks and self.resourceProfile() != .pi,
+        inline .serve, .fetch, .render, .mcp, .agent => |opts| !opts.disable_v8_idle_tasks and !self.leanProfile(),
         else => unreachable,
     };
 }
@@ -723,8 +743,10 @@ pub fn proxyBearerToken(self: *const Config) ?[:0]const u8 {
 
 pub fn httpMaxConcurrent(self: *const Config) u8 {
     return switch (self.mode) {
+        // A single live page still fans out many subresources; keep pi's
+        // network concurrency for slot rather than starving the one session.
         inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.http_max_concurrent orelse
-            if (self.resourceProfile() == .pi) 8 else 40,
+            if (self.leanProfile()) 8 else 40,
         else => unreachable,
     };
 }
@@ -732,7 +754,7 @@ pub fn httpMaxConcurrent(self: *const Config) u8 {
 pub fn httpMaxHostOpen(self: *const Config) u8 {
     return switch (self.mode) {
         inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.http_max_host_open orelse
-            if (self.resourceProfile() == .pi) 2 else 6,
+            if (self.leanProfile()) 2 else 6,
         else => unreachable,
     };
 }
@@ -760,7 +782,7 @@ pub fn httpMaxRedirects(_: *const Config) u8 {
 pub fn httpMaxResponseSize(self: *const Config) ?usize {
     return switch (self.mode) {
         inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.http_max_response_size orelse
-            if (self.resourceProfile() == .pi) 32 * 1024 * 1024 else null,
+            if (self.leanProfile()) 32 * 1024 * 1024 else null,
         else => unreachable,
     };
 }
@@ -768,7 +790,7 @@ pub fn httpMaxResponseSize(self: *const Config) ?usize {
 pub fn wsMaxConcurrent(self: *const Config) u8 {
     return switch (self.mode) {
         inline .serve, .fetch, .render, .mcp, .agent => |opts| opts.ws_max_concurrent orelse
-            if (self.resourceProfile() == .pi) 2 else 8,
+            if (self.leanProfile()) 2 else 8,
         else => unreachable,
     };
 }
@@ -984,16 +1006,33 @@ pub fn blockedUrlPatterns(self: *const Config) ?std.mem.SplitIterator(u8, .scala
 // let an operator choose a smaller cap for CPU-bound pages.
 const pi_max_sessions = 32;
 
+/// Dedicated one-session process: keep a second HTTP slot so a live WebSocket
+/// can coexist with ticket reissue, /healthz, or static client fetches. The
+/// ticket→WS handoff itself is sequential, but reconnect races and ops probes
+/// need headroom; with 1, those sockets are dropped without a response.
+const slot_max_connections = 2;
+
 pub fn maxConnections(self: *const Config) u16 {
     return switch (self.mode) {
-        .serve => |opts| opts.cdp_max_connections orelse
-            memoryCappedSessions(if (self.resourceProfile() == .pi) pi_max_sessions else 16),
+        .serve => |opts| opts.cdp_max_connections orelse switch (self.resourceProfile()) {
+            .slot => slot_max_connections,
+            .pi => memoryCappedSessions(pi_max_sessions),
+            .standard => memoryCappedSessions(16),
+        },
         .render => |opts| blk: {
-            const default: u16 = if (self.resourceProfile() == .pi) pi_max_sessions else 8;
+            const default: u16 = switch (self.resourceProfile()) {
+                .slot => slot_max_connections,
+                .pi => pi_max_sessions,
+                .standard => 8,
+            };
             break :blk @max(opts.max_connections orelse memoryCappedSessions(default), 1);
         },
         .mcp => |opts| blk: {
-            const default: u16 = if (self.resourceProfile() == .pi) pi_max_sessions else 16;
+            const default: u16 = switch (self.resourceProfile()) {
+                .slot => slot_max_connections,
+                .pi => pi_max_sessions,
+                .standard => 16,
+            };
             break :blk @max(opts.max_connections orelse memoryCappedSessions(default), 1);
         },
         .fetch, .agent => 0,
@@ -1015,16 +1054,28 @@ pub fn cdpWorkerStackSize(self: *const Config) usize {
     const min_stack: usize = 2 * 1024 * 1024;
     return switch (self.mode) {
         .serve => |opts| @max(opts.cdp_worker_stack_size orelse
-            if (self.resourceProfile() == .pi) min_stack else 4 * 1024 * 1024, min_stack),
+            if (self.leanProfile()) min_stack else 4 * 1024 * 1024, min_stack),
         else => unreachable,
     };
 }
 
 pub fn maxPendingConnections(self: *const Config) u31 {
     return switch (self.mode) {
-        .serve => |opts| opts.cdp_max_pending_connections orelse if (self.resourceProfile() == .pi) 16 else 128,
-        .render => if (self.resourceProfile() == .pi) 8 else 64,
-        .mcp => if (self.resourceProfile() == .pi) 16 else 128,
+        .serve => |opts| opts.cdp_max_pending_connections orelse switch (self.resourceProfile()) {
+            .slot => 2,
+            .pi => 16,
+            .standard => 128,
+        },
+        .render => switch (self.resourceProfile()) {
+            .slot => 2,
+            .pi => 8,
+            .standard => 64,
+        },
+        .mcp => switch (self.resourceProfile()) {
+            .slot => 2,
+            .pi => 16,
+            .standard => 128,
+        },
         else => unreachable,
     };
 }
@@ -1052,8 +1103,11 @@ pub fn renderMaxRequestSize(self: *const Config) usize {
 
 pub fn renderMaxResponseSize(self: *const Config) usize {
     return switch (self.mode) {
-        .render => |opts| opts.max_response_size orelse
-            if (self.resourceProfile() == .pi) 4 * 1024 * 1024 else 16 * 1024 * 1024,
+        .render => |opts| opts.max_response_size orelse switch (self.resourceProfile()) {
+            .slot => 2 * 1024 * 1024,
+            .pi => 4 * 1024 * 1024,
+            .standard => 16 * 1024 * 1024,
+        },
         else => unreachable,
     };
 }
@@ -1061,7 +1115,9 @@ pub fn renderMaxResponseSize(self: *const Config) usize {
 pub fn renderMaxWaitMs(self: *const Config) u32 {
     return switch (self.mode) {
         .render => |opts| blk: {
-            const default: u32 = if (self.resourceProfile() == .pi) 10_000 else 30_000;
+            // Keep pi/slot client wait budgets; do not raise idle timeouts for
+            // the lean single-slot profile.
+            const default: u32 = if (self.leanProfile()) 10_000 else 30_000;
             break :blk @max(opts.max_wait_ms orelse default, 1);
         },
         else => unreachable,
@@ -1075,11 +1131,14 @@ pub fn renderMaxWaitMs(self: *const Config) u32 {
 // Bounded by cores because a render is CPU-bound (parse + script), and by
 // memoryCappedSessions because an isolate is not free. Worker 0 is reserved
 // for the live endpoint, so the floor is 2 where we can afford it — with 1
-// worker an open live session makes every render 409.
+// worker an open live session makes every one-shot /v1/render answer 409.
+// The `slot` profile is that one-worker case on purpose: the process is
+// dedicated to one live virtual browser.
 pub fn renderWorkers(self: *const Config) u16 {
     return switch (self.mode) {
         .render => |opts| blk: {
             if (opts.workers) |w| break :blk @max(w, 1);
+            if (self.resourceProfile() == .slot) break :blk 1;
             const cores = std.math.lossyCast(u16, std.Thread.getCpuCount() catch 1);
             const cap: u16 = if (self.resourceProfile() == .pi) 2 else 4;
             break :blk @max(memoryCappedSessions(@min(cap, @max(cores, 1))), 1);
@@ -1091,7 +1150,7 @@ pub fn renderWorkers(self: *const Config) u16 {
 pub fn renderClientTimeoutMs(self: *const Config) u32 {
     return switch (self.mode) {
         .render => |opts| blk: {
-            const default: u32 = if (self.resourceProfile() == .pi) 15_000 else 30_000;
+            const default: u32 = if (self.leanProfile()) 15_000 else 30_000;
             break :blk @max(opts.client_timeout_ms orelse default, 1);
         },
         else => unreachable,
@@ -1105,7 +1164,11 @@ pub fn mcpMaxSessions(self: *const Config) u16 {
         .serve, .fetch, .render, .agent => null,
         else => unreachable,
     };
-    const default: u16 = if (profile == .pi) pi_max_sessions else 16;
+    const default: u16 = switch (profile) {
+        .slot => 1,
+        .pi => pi_max_sessions,
+        .standard => 16,
+    };
     return @max(configured orelse memoryCappedSessions(default), 1);
 }
 
@@ -1115,7 +1178,7 @@ pub fn mcpMaxResponseSize(self: *const Config) usize {
         .serve, .fetch, .render, .agent => null,
         else => unreachable,
     };
-    return configured orelse if (self.resourceProfile() == .pi) 4 * 1024 * 1024 else 16 * 1024 * 1024;
+    return configured orelse if (self.leanProfile()) 4 * 1024 * 1024 else 16 * 1024 * 1024;
 }
 
 pub fn mcpMaxRequestSize(self: *const Config) usize {
@@ -1124,13 +1187,13 @@ pub fn mcpMaxRequestSize(self: *const Config) usize {
         .serve, .fetch, .render, .agent => null,
         else => unreachable,
     };
-    return configured orelse if (self.resourceProfile() == .pi) 4 * 1024 * 1024 else 16 * 1024 * 1024;
+    return configured orelse if (self.leanProfile()) 4 * 1024 * 1024 else 16 * 1024 * 1024;
 }
 
 pub fn cdpMaxMessageSize(self: *const Config) u32 {
     return switch (self.mode) {
-        .serve => |opts| opts.cdp_max_message_size orelse if (self.resourceProfile() == .pi) 256 * 1024 else 1024 * 1024,
-        .mcp => if (self.resourceProfile() == .pi) 256 * 1024 else 1024 * 1024,
+        .serve => |opts| opts.cdp_max_message_size orelse if (self.leanProfile()) 256 * 1024 else 1024 * 1024,
+        .mcp => if (self.leanProfile()) 256 * 1024 else 1024 * 1024,
         else => unreachable,
     };
 }
@@ -1138,8 +1201,8 @@ pub fn cdpMaxMessageSize(self: *const Config) u32 {
 pub fn cdpMaxCapturedResponseSize(self: *const Config) ?usize {
     return switch (self.mode) {
         .serve => |opts| opts.cdp_max_captured_response_size orelse
-            if (self.resourceProfile() == .pi) 8 * 1024 * 1024 else null,
-        .mcp => if (self.resourceProfile() == .pi) 8 * 1024 * 1024 else null,
+            if (self.leanProfile()) 8 * 1024 * 1024 else null,
+        .mcp => if (self.leanProfile()) 8 * 1024 * 1024 else null,
         .fetch, .render, .agent => null,
         else => unreachable,
     };
@@ -1148,8 +1211,8 @@ pub fn cdpMaxCapturedResponseSize(self: *const Config) ?usize {
 pub fn cdpMaxCapturedResponses(self: *const Config) ?usize {
     return switch (self.mode) {
         .serve => |opts| opts.cdp_max_captured_responses orelse
-            if (self.resourceProfile() == .pi) 256 else null,
-        .mcp => if (self.resourceProfile() == .pi) 256 else null,
+            if (self.leanProfile()) 256 else null,
+        .mcp => if (self.leanProfile()) 256 else null,
         .fetch, .render, .agent => null,
         else => unreachable,
     };
@@ -1702,6 +1765,7 @@ test "Config: render handoff defaults are Pi-class and bounded" {
 
     try std.testing.expect(config.clientSideRendering());
     try std.testing.expectEqual(ResourceProfile.pi, config.resourceProfile());
+    try std.testing.expect(config.leanProfile());
     try std.testing.expectEqual(@as(?u32, 64), config.v8MaxHeapMb());
     try std.testing.expectEqual(@as(u16, pi_max_sessions), config.maxConnections());
     try std.testing.expectEqual(@as(u31, 8), config.maxPendingConnections());
@@ -1720,12 +1784,72 @@ test "Config: render handoff defaults are Pi-class and bounded" {
     config.mode.render.allow_private_networks = true;
     config.mode.render.auth_token = "0123456789abcdef";
     try std.testing.expectEqual(ResourceProfile.standard, config.resourceProfile());
+    try std.testing.expect(!config.leanProfile());
     try std.testing.expectEqual(@as(u16, 3), config.maxConnections());
     try std.testing.expectEqual(@as(usize, 1234), config.renderMaxResponseSize());
     try std.testing.expectEqual(@as(u32, 4321), config.renderMaxWaitMs());
     try std.testing.expectEqual(@as(u32, 7654), config.renderClientTimeoutMs());
     try std.testing.expect(!config.blockPrivateNetworks());
     try std.testing.expectEqualStrings("0123456789abcdef", config.renderAuthToken().?);
+}
+
+test "Config: slot resource profile is a lean single-live process" {
+    var config = try Config.init(std.testing.allocator, "test", .{ .render = .{
+        .resource_profile = .slot,
+    } });
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(ResourceProfile.slot, config.resourceProfile());
+    try std.testing.expect(config.leanProfile());
+    try std.testing.expectEqual(@as(?u32, 64), config.v8MaxHeapMb());
+    try std.testing.expectEqual(@as(u8, 1), config.v8ThreadPoolSize());
+    try std.testing.expect(!config.v8IdleTasks());
+    try std.testing.expect(!config.speculativePreloading());
+    try std.testing.expectEqualStrings(pi_v8_flags, config.v8ProfileFlags().?);
+    try std.testing.expectEqual(@as(u16, slot_max_connections), config.maxConnections());
+    try std.testing.expectEqual(@as(u31, 2), config.maxPendingConnections());
+    try std.testing.expectEqual(@as(u16, 1), config.renderWorkers());
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), config.renderMaxResponseSize());
+    // Idle/client budgets match pi — slot must not stretch them.
+    try std.testing.expectEqual(@as(u32, 10_000), config.renderMaxWaitMs());
+    try std.testing.expectEqual(@as(u32, 15_000), config.renderClientTimeoutMs());
+    try std.testing.expectEqual(@as(?u32, 10_000), config.watchdogMs());
+    try std.testing.expect(config.blockPrivateNetworks());
+
+    // Explicit overrides still win over the slot defaults.
+    config.mode.render.max_connections = 4;
+    config.mode.render.workers = 3;
+    config.mode.render.max_response_size = 8 * 1024 * 1024;
+    config.mode.render.v8_max_heap_mb = 96;
+    try std.testing.expectEqual(@as(u16, 4), config.maxConnections());
+    try std.testing.expectEqual(@as(u16, 3), config.renderWorkers());
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), config.renderMaxResponseSize());
+    try std.testing.expectEqual(@as(?u32, 96), config.v8MaxHeapMb());
+}
+
+test "Config: CLI parses render slot profile" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        const argv = [_][*:0]const u8{
+            "lightpanda",
+            "render",
+            "--resource-profile",
+            "slot",
+            "--max-connections",
+            "1",
+            "--workers",
+            "1",
+        };
+        var config = try parseArgs(std.testing.allocator, .{ .vector = &argv });
+        defer config.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(ResourceProfile.slot, config.resourceProfile());
+        try std.testing.expect(config.leanProfile());
+        try std.testing.expectEqual(@as(u16, 1), config.maxConnections());
+        try std.testing.expectEqual(@as(u16, 1), config.renderWorkers());
+        try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), config.renderMaxResponseSize());
+    }
 }
 
 test "Config: CLI parses pi profile and explicit resource limits" {

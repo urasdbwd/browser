@@ -90,13 +90,13 @@ pub fn init(allocator: Allocator, config: *const Config) !*App {
         app,
         config.command,
         config.interactive(),
-        config.resourceProfile() == .pi,
+        config.leanProfile(),
     );
     errdefer app.telemetry.deinit(allocator);
 
     app.arena_pool = ArenaPool.init(
         allocator,
-        if (config.resourceProfile() == .pi) ArenaPool.Config.pi else .{},
+        if (config.leanProfile()) ArenaPool.Config.pi else .{},
     );
     errdefer app.arena_pool.deinit();
 

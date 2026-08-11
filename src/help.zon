@@ -152,6 +152,12 @@
     \\and performs all CSS, layout, paint, image/font decoding and rasterization.
     \\This command defaults to the pi resource profile (one 64 MiB V8 heap).
     \\
+    \\For maximum concurrency, run one lean render process per live user/session
+    \\with --resource-profile slot (1 worker, 2 connections, 2 MiB snapshot cap).
+    \\Architecture stays one live session per process; do not share a slot process
+    \\across users. While that live session owns the browser, one-shot
+    \\POST /v1/render answers 409.
+    \\
     \\Endpoints:
     \\  POST /v1/render                JSON request, HTML snapshot response
     \\  POST /v1/live-ticket           single-use live WebSocket ticket
@@ -168,7 +174,7 @@
     \\          At least 16 bytes. Required when --host is not loopback.
     \\  --client-timeout-ms <INT>
     \\          Maximum time a client may block socket reads or writes. Defaults
-    \\          to 15000 with the pi profile or 30000 with standard.
+    \\          to 15000 with pi/slot or 30000 with standard.
     \\  --cors-origin <ORIGIN>
     \\          Exact browser origin allowed to call/import the render service, or
     \\          * to allow every origin. Browser cross-origin requests are rejected
@@ -177,18 +183,24 @@
     \\  --host <HOST>
     \\          Host to bind. Defaults to "127.0.0.1".
     \\  --max-connections <INT>
-    \\          Maximum simultaneous HTTP connections. Defaults to up to 32 with
-    \\          the pi profile (memory-capped), or 8 with standard. Minimum is 1.
+    \\          Maximum simultaneous HTTP connections. Defaults to 2 with slot,
+    \\          up to 32 with pi (memory-capped), or 8 with standard. Minimum is 1.
+    \\          Slot keeps 2 so a live WebSocket can coexist with ticket reissue
+    \\          or /healthz; use 1 only when you accept dropping those probes.
     \\  --max-request-size <INT>
     \\          Maximum JSON request size. Defaults to 16384 (16 KiB).
     \\  --max-response-size <INT>
-    \\          Maximum uncompressed DOM snapshot. Defaults to 4 MiB with the pi
-    \\          profile or 16 MiB with standard.
+    \\          Maximum uncompressed DOM snapshot. Defaults to 2 MiB with slot,
+    \\          4 MiB with pi, or 16 MiB with standard.
     \\  --max-wait-ms <INT>
     \\          Maximum navigation wait accepted from one request. Defaults to
-    \\          10000 with the pi profile or 30000 with standard.
+    \\          10000 with pi/slot or 30000 with standard.
     \\  --port <INT>
     \\          HTTP port. Defaults to 9223.
+    \\  --workers <INT>
+    \\          Render worker threads (each owns a V8 isolate). Defaults to 1 with
+    \\          slot, up to 2 with pi, or up to 4 with standard. With 1 worker, an
+    \\          open live session makes every one-shot /v1/render answer 409.
     ,
     .mcp =
     \\usage: {0s} mcp [OPTIONS] [COMMON_OPTIONS]
@@ -411,7 +423,7 @@
     \\          Defaults to false.
     \\  --disable-v8-idle-tasks
     \\          Disable V8 background idle work. This lowers background CPU use but can
-    \\          delay garbage collection. Implied by --resource-profile pi.
+    \\          delay garbage collection. Implied by --resource-profile pi or slot.
     \\  --disable-workers
     \\          Skip loading dedicated and shared Web Workers. Their constructors
     \\          still return objects, but no script fetch is initiated and their
@@ -432,14 +444,14 @@
     \\          Defaults to 0.
     \\  --http-max-concurrent <INT>
     \\          Maximum number of concurrent HTTP requests.
-    \\          Defaults to 40, or 8 with the pi resource profile.
+    \\          Defaults to 40, or 8 with the pi/slot resource profiles.
     \\  --http-max-host-open <INT>
     \\          Maximum open connections to a given host:port.
-    \\          Defaults to 6, or 2 with the pi resource profile.
+    \\          Defaults to 6, or 2 with the pi/slot resource profiles.
     \\  --http-max-response-size <INT>
     \\          Limits the acceptable response size for any request
     \\          e.g. XHR, fetch, script loading.
-    \\          Defaults to 1 GiB, or 32 MiB with the pi resource profile.
+    \\          Defaults to 1 GiB, or 32 MiB with the pi/slot resource profiles.
     \\  --http-proxy <URL>
     \\          HTTP proxy for all HTTP requests.
     \\          username:password may be included for basic auth.
@@ -476,10 +488,14 @@
     \\          It also passes V8 --optimize-for-size --no-concurrent-recompilation
     \\          (about 7% lower peak RSS). Any --v8-flags-unsafe you pass is applied
     \\          after these, so it overrides them.
+    \\          "slot" keeps those lean V8 settings but tightens process concurrency
+    \\          for one live virtual-browser process: 1 render worker, 2 HTTP
+    \\          connections and a 2 MiB snapshot cap. Prefer one slot process per
+    \\          live user/session when maximizing concurrency.
     \\          Iframe and Web Worker loading remain enabled; disable them explicitly
     \\          only when a workload does not need them.
-    \\          Allowed values: "standard", "pi".
-    \\          Defaults to "standard"; binaries built with
+    \\          Allowed values: "standard", "pi", "slot".
+    \\          Defaults to "standard" (render defaults to "pi"); binaries built with
     \\          -Dlow_resource_default=true default to "pi".
     \\  --storage-engine <ENGINE>
     \\          The storage engine to use.
@@ -525,17 +541,17 @@
     \\  --v8-max-heap-mb <INT>
     \\          Maximum V8 heap size in megabytes, per browser instance. Values
     \\          below ~16 are clamped by V8 and all behave the same.
-    \\          Defaults to the V8 default, or 64 MiB with the pi profile.
+    \\          Defaults to the V8 default, or 64 MiB with the pi/slot profiles.
     \\  --v8-thread-pool-size <INT>
     \\          Number of V8 background worker threads. 0 lets V8 use the CPU count.
-    \\          Defaults to 0, or 1 with --resource-profile pi.
+    \\          Defaults to 0, or 1 with --resource-profile pi or slot.
     \\  --watchdog-ms <INT>
     \\          Terminates JavaScript when the browser stalls — stays busy for
     \\          this long without returning to its network poll (e.g. a page
     \\          stuck in an endless script loop). In serve mode the CDP
     \\          connection is then closed. Unlike fetch's --terminate-ms, an idle
     \\          or normally-working page never trips this.
-    \\          Defaults to 30000, or 10000 with pi; disable by setting to 0.
+    \\          Defaults to 30000, or 10000 with pi/slot; disable by setting to 0.
     \\  --web-bot-auth-domain <DOMAIN>
     \\          Your domain, e.g. yourdomain.com.
     \\  --web-bot-auth-key-file <PATH>
@@ -544,6 +560,6 @@
     \\          The JWK thumbprint of your public key.
     \\  --ws-max-concurrent <INT>
     \\          Maximum number of concurrent WebSocket connections.
-    \\          Defaults to 8, or 2 with the pi resource profile.
+    \\          Defaults to 8, or 2 with the pi/slot resource profiles.
     ,
 }
